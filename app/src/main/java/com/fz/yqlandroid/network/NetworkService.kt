@@ -262,6 +262,290 @@ object NetworkService {
         }
     }
     
+    // ========== 用户资料 ==========
+
+    /**
+     * 获取用户资料（与iOS getUserProfile一致）
+     * GET /user/profile，Header: Authorization: Bearer {token}
+     */
+    suspend fun getUserProfile(jwtToken: String): Result<UserProfileResponse> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.User.PROFILE)
+
+            val httpRequest = Request.Builder()
+                .url(url)
+                .get()
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+
+            val response = client.newCall(httpRequest).execute()
+            val body = response.body?.string()
+
+            println("jfh [Profile] Status=${response.code}, Body=$body")
+
+            if (response.isSuccessful && body != null) {
+                Result.success(gson.fromJson(body, UserProfileResponse::class.java))
+            } else {
+                Result.failure(Exception(parseErrorMessage(body) ?: "获取用户资料失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            println("jfh [Profile] ❌ 异常: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ========== 修改密码（同时改登录密码 + 绑定码，与iOS changeAllPasswords一致） ==========
+
+    /**
+     * PUT /user/password/all
+     * body: { oldPassword, oldSecondaryPassword, newPassword, newSecondaryPassword }
+     */
+    suspend fun changeAllPasswords(
+        oldPassword: String,
+        oldSecondaryPassword: String,
+        newPassword: String,
+        newSecondaryPassword: String,
+        jwtToken: String
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.User.CHANGE_ALL_PASSWORDS)
+            val body = mapOf(
+                "oldPassword" to oldPassword,
+                "oldSecondaryPassword" to oldSecondaryPassword,
+                "newPassword" to newPassword,
+                "newSecondaryPassword" to newSecondaryPassword
+            )
+            val json = gson.toJson(body)
+
+            val httpRequest = Request.Builder()
+                .url(url)
+                .put(json.toRequestBody(JSON_MEDIA_TYPE))
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+
+            val response = client.newCall(httpRequest).execute()
+            val responseBody = response.body?.string()
+
+            println("jfh [ChangePwd] Status=${response.code}, Body=$responseBody")
+
+            if (response.isSuccessful && responseBody != null) {
+                val msg = try {
+                    gson.fromJson(responseBody, Map::class.java)["message"] as? String
+                } catch (_: Exception) { null }
+                Result.success(msg ?: "密码修改成功")
+            } else {
+                Result.failure(Exception(parseErrorMessage(responseBody) ?: "修改密码失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            println("jfh [ChangePwd] ❌ 异常: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ========== 注销账号（与iOS deleteAccount一致：POST + 绑定码） ==========
+
+    /**
+     * POST /user/account/delete（用 POST 而非 DELETE，避免 body 被 CDN 丢弃）
+     * body: { secondaryPassword }
+     */
+    suspend fun deleteAccount(secondaryPassword: String, jwtToken: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.User.DELETE_ACCOUNT)
+            val body = mapOf("secondaryPassword" to secondaryPassword)
+            val json = gson.toJson(body)
+
+            val httpRequest = Request.Builder()
+                .url(url)
+                .post(json.toRequestBody(JSON_MEDIA_TYPE))
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+
+            val response = client.newCall(httpRequest).execute()
+            val responseBody = response.body?.string()
+
+            println("jfh [DeleteAccount] Status=${response.code}, Body=$responseBody")
+
+            if (response.isSuccessful && responseBody != null) {
+                val msg = try {
+                    gson.fromJson(responseBody, Map::class.java)["message"] as? String
+                } catch (_: Exception) { null }
+                Result.success(msg ?: "注销成功")
+            } else {
+                Result.failure(Exception(parseErrorMessage(responseBody) ?: "注销失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            println("jfh [DeleteAccount] ❌ 异常: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ========== 已绑定列表 / 解绑（与iOS getBindingList / unbindDevice一致） ==========
+
+    /**
+     * GET /binding/list
+     */
+    suspend fun getBindingList(jwtToken: String): Result<BindingListResponse> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.Binding.LIST)
+
+            val httpRequest = Request.Builder()
+                .url(url)
+                .get()
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+
+            val response = client.newCall(httpRequest).execute()
+            val body = response.body?.string()
+
+            println("jfh [BindingList] Status=${response.code}, Body=$body")
+
+            if (response.isSuccessful && body != null) {
+                Result.success(gson.fromJson(body, BindingListResponse::class.java))
+            } else {
+                Result.failure(Exception(parseErrorMessage(body) ?: "获取绑定列表失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            println("jfh [BindingList] ❌ 异常: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * DELETE /binding/unbind/{bindingId}（与iOS一致：bindingId 在路径，body 带绑定码）
+     * body: { secondaryPassword }
+     */
+    suspend fun unbindDevice(bindingId: Int, secondaryPassword: String, jwtToken: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL("${APIConfig.Binding.UNBIND}/$bindingId")
+            val body = mapOf("secondaryPassword" to secondaryPassword)
+            val json = gson.toJson(body)
+
+            val httpRequest = Request.Builder()
+                .url(url)
+                .delete(json.toRequestBody(JSON_MEDIA_TYPE))
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+
+            val response = client.newCall(httpRequest).execute()
+            val responseBody = response.body?.string()
+
+            println("jfh [Unbind] Status=${response.code}, Body=$responseBody")
+
+            if (response.isSuccessful && responseBody != null) {
+                val msg = try {
+                    gson.fromJson(responseBody, Map::class.java)["message"] as? String
+                } catch (_: Exception) { null }
+                Result.success(msg ?: "解绑成功")
+            } else {
+                Result.failure(Exception(parseErrorMessage(responseBody) ?: "解绑失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            println("jfh [Unbind] ❌ 异常: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    // ========== 问题反馈（与iOS MessageView 一致） ==========
+
+    /**
+     * GET /message/config → { success, data: { maxLength }, message }
+     * 返回 maxLength，失败回退默认 200
+     */
+    suspend fun getMessageConfig(jwtToken: String): Int = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.Message.CONFIG)
+            val httpRequest = Request.Builder()
+                .url(url).get()
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+            val response = client.newCall(httpRequest).execute()
+            val body = response.body?.string()
+            if (response.isSuccessful && body != null) {
+                val resp = gson.fromJson(body, MessageConfigResponse::class.java)
+                resp.data?.maxLength ?: 200
+            } else 200
+        } catch (_: Exception) { 200 }
+    }
+
+    /**
+     * GET /message/list?userId=&page=&size= → { success, data: {content,totalElements,totalPages,currentPage}, message }
+     */
+    suspend fun getMessageList(userId: Int, page: Int, size: Int, jwtToken: String): Result<MessageListData> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL("${APIConfig.Message.LIST}?userId=$userId&page=$page&size=$size")
+            val httpRequest = Request.Builder()
+                .url(url).get()
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+            val response = client.newCall(httpRequest).execute()
+            val body = response.body?.string()
+
+            println("jfh [MessageList] Status=${response.code}, Body=$body")
+
+            if (response.isSuccessful && body != null) {
+                val resp = gson.fromJson(body, MessageListResponse::class.java)
+                Result.success(resp.data ?: MessageListData())
+            } else {
+                Result.failure(Exception(parseErrorMessage(body) ?: "获取问题反馈失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * POST /message/submit  body: { userId, content } → { success, message, data }
+     */
+    suspend fun submitMessage(userId: Int, content: String, jwtToken: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val url = APIConfig.fullURL(APIConfig.Message.SUBMIT)
+            val body = mapOf("userId" to userId, "content" to content)
+            val json = gson.toJson(body)
+            val httpRequest = Request.Builder()
+                .url(url).post(json.toRequestBody(JSON_MEDIA_TYPE))
+                .apply {
+                    APIConfig.defaultHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    if (jwtToken.isNotEmpty()) addHeader("Authorization", "Bearer $jwtToken")
+                }
+                .build()
+            val response = client.newCall(httpRequest).execute()
+            val responseBody = response.body?.string()
+
+            println("jfh [SubmitMessage] Status=${response.code}, Body=$responseBody")
+
+            if (response.isSuccessful && responseBody != null) {
+                val resp = gson.fromJson(responseBody, SubmitMessageResponse::class.java)
+                if (resp.success) Result.success(resp.message ?: "提交成功")
+                else Result.failure(Exception(resp.message ?: "提交失败"))
+            } else {
+                Result.failure(Exception(parseErrorMessage(responseBody) ?: "提交失败: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     // ========== 工具方法 ==========
     
     /**
@@ -411,4 +695,77 @@ data class VerifyDeviceResponse(
     val controlVerified: Boolean = false,
     val status: String = "",
     val message: String = ""
+)
+
+/**
+ * 用户资料响应（与iOS UserProfileResponse一致）
+ */
+data class UserProfileResponse(
+    val username: String = "",
+    val nickname: String? = null,
+    val avatar: String? = null,
+    val userType: String? = null,       // "采集端" / "控制端"
+    val membershipType: String? = null, // "试用" / "永久" / "月付"
+    val status: String? = null,         // "有效" / "已过期" / "已暂停"
+    val createdAt: String? = null       // 创建时间
+)
+
+/**
+ * 已绑定列表项（与iOS BindingItem一致）
+ */
+data class BindingItem(
+    val bindingId: Int = 0,
+    val controlUsername: String = "",
+    val controlNickname: String? = null,
+    val createdAt: String? = null
+)
+
+/**
+ * 已绑定列表响应（与iOS BindingListResponse一致）
+ */
+data class BindingListResponse(
+    val bindings: List<BindingItem> = emptyList(),
+    val count: Int = 0
+)
+
+// ========== 问题反馈模型（与iOS MessageView 一致） ==========
+
+data class MessageConfig(val maxLength: Int = 200)
+
+data class MessageConfigResponse(
+    val success: Boolean = false,
+    val data: MessageConfig? = null,
+    val message: String? = null
+)
+
+/**
+ * 单条问题反馈（与iOS MessageItem一致）
+ */
+data class MessageItem(
+    val id: Int = 0,
+    val content: String = "",
+    val status: Int = 0,          // 0待回复 1已回复 2已关闭
+    val statusName: String = "",
+    val replyContent: String? = null,
+    val replyAdminName: String? = null,
+    val replyAt: String? = null,
+    val createdAt: String = ""
+)
+
+data class MessageListData(
+    val content: List<MessageItem> = emptyList(),
+    val totalElements: Int = 0,
+    val totalPages: Int = 0,
+    val currentPage: Int = 0
+)
+
+data class MessageListResponse(
+    val success: Boolean = false,
+    val data: MessageListData? = null,
+    val message: String? = null
+)
+
+data class SubmitMessageResponse(
+    val success: Boolean = false,
+    val message: String? = null
 )

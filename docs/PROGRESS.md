@@ -1,8 +1,8 @@
 # Android 开发进度（对照 iOS）
 
-> 更新时间：2026-07-01（含本轮代码静态审查 + WebRTC API 核实 + 后台保活功能）  
+> 更新时间：2026-07-01（个人中心 Profile：扫一扫入口 + 已绑定列表/解绑已接线，见「十一」）  
 > Android 仓库：`yql-android` · iOS 对照：`srs_yql`（分支 `srs-yql-fz`）  
-> **本文档供下一个 AI / 开发者接力使用，请优先阅读「七、2026-07-01 本轮改动」与「九、2026-07-01 代码审查 & API 核实结论」**
+> **本文档供下一个 AI / 开发者接力使用，请优先阅读「十一、2026-07-01 Profile 扫一扫入口 + 已绑定列表接力（最新）」，再看「十」了解前序背景**
 
 ---
 
@@ -146,7 +146,7 @@
 | **fbldy 档位日志** | 切换档位时打印当前分辨率/档位前缀 `fbldy` | 中 | iOS 有类似日志 |
 | **B 类 GPU 滤镜** | captureColor、brightness/contrast/saturation/gamma、LUT（OpenGL ES 移植） | 低（发热敏感，暂缓） | iOS：`NV12MetalProcessor` + `NV12LUTProcessor` |
 | **注册 check-device** | 注册前检查设备 | 中 | iOS 有调用 |
-| **Profile / 绑定 / 激活 / 留言 / 头像** | 部分 REST 未完整落地 | 中 | iOS 完整 |
+| **Profile 个人中心对标 iOS** | 🟡 **进行中**（见「十」「十一」）：API/修改密码/注销/关于我们/问题反馈/资料展示/**扫一扫导航/已绑定列表页/解绑** 已完成；**头像上传、激活会员、扫码时释放推流相机** 待完成 | 🔴 高 | iOS：`ProfileView.swift` 完整 |
 | **P2P 推流** | 暂缓，优先 SRS 稳定 | 低 | iOS 已实现 |
 | **SRT 推流** | 暂缓 | 低 | iOS 已实现 |
 
@@ -162,6 +162,13 @@
 | `ColorTaggingVideoEncoderFactory.kt` | `NV12MetalProcessor` 色彩元数据部分 | 🆕 H264 VUI 包装 |
 | `H264VuiEditor.kt` | — | 🆕 SPS VUI 位级改写 |
 | `KeepAliveManager.kt` | `BackgroundAudioManager`(iOS) + `isIdleTimerDisabled` | 🆕 无声音频 + WakeLock 后台保活 |
+| `ProfileScreen.kt` | `ProfileView.swift` | 🟡 个人中心（对标进行中，见「十」） |
+| `ChangePasswordScreen.kt` | `ChangePasswordView.swift` | 🆕 修改密码（登录密码+绑定码） |
+| `MessageScreen.kt` | `MessageView.swift` | 🆕 问题反馈列表/发起/详情 |
+| `LocalWebViewScreen.kt` | `LocalWebView.swift` | 🆕 本地 HTML（关于我们） |
+| `QRScannerScreen.kt` | `DeviceBindingQRScannerView` + `BindingConfirmView` | ✅ 扫码绑定（登录流程 + **Profile 入口已接线**，见「十一」） |
+| `BindingListScreen.kt` | `BindingListView.swift` + `UnbindView.swift` | 🆕 已绑定控制端列表 + 解绑（对标进行中，见「十一」） |
+| `NetworkService.kt` | `APIService.swift` | REST API（Profile 相关 API 已补，见「十」） |
 | `WebSocketManager.kt` | `WebSocketManager.swift` | STOMP 长连接 |
 | `NetworkService.kt` | `APIService.swift` | REST API |
 | `APIConfig.kt` | `APIConfig.swift` | 配置 |
@@ -311,4 +318,181 @@ cd D:\sb\ios-android\yql-android   # Windows
 
 - 🔴 **编译验证**：Windows 无 Android SDK，本节仅静态核对，仍需在 Mac/Android Studio 跑 `./gradlew assembleDebug` 做最终确认。
 - 🔴 **真机发热测试** 与 **PC 颜色对比**：见「六、下一步建议」2、3 项，静态审查不可替代。
-- ⚪ 代码改动仍未 commit/push（本地 `D:\sb\ios-android\yql-android`）。
+- ✅ 发热/颜色/保活相关改动已 push（`f6cd955`）；**Profile 对标改动尚未 commit/push**（见「十」）。
+
+---
+
+## 十、2026-07-01 个人中心(Profile)对标 iOS 接力（下一棒必读）
+
+> **用户指令**：「我的页面还需要对照 iOS 一一实现，每一行点进去看 iOS 一一实现。」  
+> **iOS 对照文件**：`D:\sb\ios\srs\ProfileView.swift`（主列表）、`ChangePasswordView.swift`、`MessageView.swift`、`BindingListView.swift`、`LocalWebView.swift`、`ActivationView.swift`  
+> **Android 主文件**：`app/src/main/java/com/fz/yqlandroid/ui/screen/ProfileScreen.kt`  
+> **Git 状态**：本节改动均在本地未提交（`git status` 见下方文件清单）
+
+### 10.1 逐项对照表（Profile 每一行）
+
+| Profile 行 / 功能 | iOS 实现 | Android 现状 | 下一棒动作 |
+| --- | --- | --- | --- |
+| **头部：头像** | 可点击，`uploadAvatar` PUT multipart | ❌ 静态 `Person` 图标，无上传 | 加图片选择器 + `NetworkService.uploadAvatar()`（API 未写） |
+| **头部：昵称** | `userProfile.nickname ?? username` | ✅ `getUserProfile` 加载后展示 | — |
+| **头部：等级标签** | `activated` + `activation_level` → 试用/高清/超清/超高清/超高帧 | ✅ 从 `token_prefs` 读 `activated`/`activation_level` | — |
+| **注册时间** | `formatDate(userProfile.createdAt)` | ✅ 已接 API + `formatProfileDate()` | — |
+| **扫一扫** | `DeviceBindingQRScannerView` 全屏扫码 → 绑定确认 | 🟡 `QRScannerScreen` **已实现**（createBinding+verify），但 Profile **未接导航** | `AppNavigation` 加 `onNavigateToScan` → 复用 `QRScannerScreen`，`onBindSuccess` 应 `popBackStack` 回 Profile（勿跳 Streaming） |
+| **已绑定控制端** | iOS 有 `BindingListView`（列表+解绑） | 🟡 Profile 已加一行 UI + 回调 `onNavigateToBindingList`，**页面与导航均未建** | 新建 `BindingListScreen.kt`，接 `getBindingList`/`unbindDevice` |
+| **修改密码** | `ChangePasswordView` → PUT `/user/password/all` | ✅ `ChangePasswordScreen.kt` + 导航 | — |
+| **注销账号** | POST `/user/account/delete` + 绑定码 + 完整登出 | ✅ 对话框已接 `deleteAccount` API | 文案 iOS 用「绑定码」非「管理密码」（Android 已改绑定码） |
+| **版本号** | `CFBundleShortVersionString (CFBundleVersion)` | ✅ `PackageManager` 动态读取 | — |
+| **关于我们** | `LocalWebView(fileName: "privacy_policy")` | ✅ `LocalWebViewScreen` + assets 三份 HTML | — |
+| **问题反馈** | `MessageView` 列表/发起/详情 | ✅ `MessageScreen.kt` + 三 API | 可选：独立 Compose 页替代 AlertDialog，更接近 iOS UI |
+| **退出** | 停推流通知 + 断 WS + 清 token + 回登录 | ✅ 已有确认对话框 | Profile 退出时 iOS 还发 `StopPublishBeforeLogout`；Android 若从推流页进 Profile，退出前应通知推流停止（当前仅断 WS） |
+| **激活会员** | `ActivationView`（iOS Profile 内有 `activationRowView`，部分版本隐藏） | ❌ 未做 | 低优：需 `ActivationView.swift` + `/activation/*` API |
+| **头像上传 API** | PUT multipart `/user/profile` field `avatar` | ❌ NetworkService 未实现 | 见 10.3 |
+
+### 10.2 本棒已完成（代码已在本地，未 push）
+
+#### NetworkService 新增 API（`network/NetworkService.kt`）
+
+| 方法 | 端点 | 对标 iOS |
+| --- | --- | --- |
+| `getUserProfile(jwtToken)` | GET `/user/profile` | `getUserProfile` |
+| `changeAllPasswords(...)` | PUT `/user/password/all` | `changeAllPasswords` |
+| `deleteAccount(secondaryPassword, jwtToken)` | POST `/user/account/delete` | `deleteAccount` |
+| `getBindingList(jwtToken)` | GET `/binding/list` | `getBindingList` |
+| `unbindDevice(bindingId, secondaryPassword, jwtToken)` | **DELETE** `/binding/unbind/{bindingId}` body `{secondaryPassword}` | `unbindDevice`（注意路径带 id） |
+| `getMessageConfig(jwtToken)` | GET `/message/config` | `getMessageConfig` |
+| `getMessageList(userId, page, size, jwtToken)` | GET `/message/list?...` | `getMessageList` |
+| `submitMessage(userId, content, jwtToken)` | POST `/message/submit` | `submitMessage` |
+
+新增数据类：`UserProfileResponse`、`BindingItem`、`BindingListResponse`、`MessageItem`、`MessageListData` 等。
+
+#### 新增/修改 UI 与资源
+
+| 文件 | 状态 | 说明 |
+| --- | --- | --- |
+| `ui/screen/ProfileScreen.kt` | 修改 | 加载用户资料、等级/注册时间/版本号、注销 API、各行导航回调 |
+| `ui/screen/ChangePasswordScreen.kt` | **新增** | 三字段改密，成功后完整登出 |
+| `ui/screen/MessageScreen.kt` | **新增** | 问题反馈列表+发起+详情（Dialog 实现） |
+| `ui/screen/LocalWebViewScreen.kt` | **新增** | WebView 加载 assets HTML |
+| `navigation/AppNavigation.kt` | 修改 | 路由：`change_password`、`about_us`、`message`；**缺** scan/binding_list 接线 |
+| `assets/privacy_policy.html` 等 | **新增** | 从 iOS `D:\sb\ios\srs\` 复制三份 HTML |
+
+#### 已 push 的上一个 commit（与本节无关）
+
+- `f6cd955` — 发热优化 + 颜色管线 + `KeepAliveManager`（已在 `origin/main`）
+
+### 10.3 下一棒优先任务（建议顺序）
+
+1. **编译** `./gradlew assembleDebug` — 修复可能的编译错误：
+   - `ProfileScreen.kt` 使用 `Icons.Default.Link`，需确认 `material-icons-extended` 依赖是否存在；若无则改用 `Icons.Default.List` 或添加 extended 依赖。
+2. **接扫一扫导航**：`AppNavigation.kt` 中 Profile 传入 `onNavigateToScan` → `navigate(Screen.QRScanner.route)`；为 Profile 来源增加参数或独立 route，绑定成功 `popBackStack()` 而非 `navigate(Streaming)`。扫码前 iOS 会 `ReleaseCameraForScanner` 释放推流相机 — Android 需从 `StreamingScreen`/`WebRTCManager` 暂停预览或 sleep 相机（见 iOS `handleDeviceBindingAction`）。
+3. **新建 `BindingListScreen.kt`**（对标 `BindingListView.swift`）：
+   - 列表展示 `getBindingList`
+   - 点击解绑 → 输入绑定码 → `unbindDevice(bindingId, pwd, jwt)`
+   - 导航：`Screen.BindingList` + Profile `onNavigateToBindingList`
+4. **头像上传**（若要对齐 iOS）：`NetworkService.uploadAvatar` multipart + Profile 头像点击 ActionSheet（相册/相机）。
+5. **Profile 退出/注销时停止推流**：对标 iOS `StopPublishBeforeLogout` — 可在 `WebRTCManager` 或 SharedFlow/Event 通知 `StreamingScreen.stopPublish()`。
+6. **提交代码**：`git add` 本节全部文件 → commit → push（Windows push GitHub 若 reset，用 `git -c http.version=HTTP/1.1 push`）。
+
+### 10.4 关键代码位置
+
+```
+ProfileScreen.kt
+  ├── LaunchedEffect → NetworkService.getUserProfile
+  ├── levelText / levelColor ← token_prefs activated + activation_level
+  ├── formatProfileDate() ← 文件末尾私有函数
+  ├── 注销对话框 → NetworkService.deleteAccount
+  └── 导航回调：onNavigateToChangePassword / AboutUs / Message / Scan / BindingList
+
+AppNavigation.kt
+  ├── Screen.ChangePassword / AboutUs / Message
+  ├── composable(ChangePasswordScreen / LocalWebViewScreen / MessageScreen)
+  └── ⚠️ ProfileScreen 未传入 onNavigateToScan / onNavigateToBindingList
+
+QRScannerScreen.kt（已有，可复用）
+  └── createBinding → verifyDeviceBinding 完整流程
+
+iOS 参考路径（Windows）
+  D:\sb\ios\srs\ProfileView.swift
+  D:\sb\ios\srs\BindingListView.swift
+  D:\sb\ios\srs\ChangePasswordView.swift
+  D:\sb\ios\srs\MessageView.swift
+```
+
+### 10.5 已知风险 / 注意事项
+
+| 项 | 说明 |
+| --- | --- |
+| Message API 响应格式 | 与登录等扁平 JSON 不同，为 `{ success, data, message }` 包装；Android 已按 iOS 结构解析 |
+| 解绑 API | 必须用 **DELETE** `/binding/unbind/{bindingId}`，不是 POST body 带 bindingId |
+| userId | 问题反馈依赖 `token_prefs.user_id`（登录时 `LoginScreen` 已写入） |
+| 扫码与推流相机冲突 | 从 Profile 进扫码前须释放 `WebRTCManager` 相机（iOS 发通知 `ReleaseCameraForScanner`） |
+| 未编译验证 | 本节全部改动未跑 Gradle，下一棒务必先编译 |
+
+---
+
+## 十一、2026-07-01 Profile 扫一扫入口 + 已绑定列表/解绑接力（最新，下一棒必读）
+
+> 本节承接「十」的下一棒任务清单（10.3 第 2、3 项），在 Windows 环境（无 Android SDK，未跑 Gradle）完成，采用**静态实现 + 官方 API/依赖核对**。
+> **iOS 对照文件**：`D:\sb\ios\srs\BindingListView.swift`、`D:\sb\ios\srs\UnbindView.swift`、`D:\sb\ios\srs\ProfileView.swift`（`handleDeviceBindingAction` / `showingBindingList`）
+
+### 11.1 本棒已完成 ✅
+
+| 项 | 说明 | 文件 |
+| --- | --- | --- |
+| **扫一扫入口接线** | Profile「扫一扫」行此前有回调但导航未接。现 `AppNavigation` 给 `ProfileScreen` 传入 `onNavigateToScan`，导航到带来源参数的扫码路由 `qr_scanner?from=profile` | `navigation/AppNavigation.kt` |
+| **扫码来源区分** | 扫码 composable 改为 `qr_scanner?from={from}`（`NavType.StringType`，默认 `login`）。`from=login`（登录流程）绑定成功→跳 `Streaming`（保持原行为）；`from=profile`→`popBackStack()` **回到 Profile**（对标 iOS `fullScreenCover` dismiss 回 Profile）。返回键同理按来源区分 | `navigation/AppNavigation.kt` |
+| **已绑定列表页** | 新建 `BindingListScreen.kt`，对标 iOS `BindingListView`：加载中/错误(重试)/空/列表 四态、顶部刷新按钮、标题含数量「已绑定列表（N）」、账号脱敏(前2+**+后2)、绑定时间格式化(ISO→`yyyy-MM-dd HH:mm`) | `ui/screen/BindingListScreen.kt`（新） |
+| **解绑弹窗** | `BindingListScreen.kt` 内 `UnbindDialog`，对标 iOS `UnbindView`：展示设备名/绑定时间 + 橙色警告 + 绑定码输入(密文) → `NetworkService.unbindDevice(bindingId, 绑定码, jwt)`；成功后从列表移除该项 | 同上 |
+| **列表页导航** | 新增 `Screen.BindingList`("binding_list") 路由；Profile「已绑定控制端」行 `onNavigateToBindingList` → 导航到列表页 | `navigation/AppNavigation.kt` |
+| **图标依赖核实** | 「十」10.3 第1项担心的 `Icons.Default.Link` —— 已确认 `app/build.gradle.kts` L54 有 `material-icons-extended`，`Link`/`LinkOff`/`DesktopWindows`/`Refresh` 均可用，**无需改动** | `app/build.gradle.kts` |
+
+### 11.2 改动文件清单
+
+| 文件 | 操作 | 摘要 |
+| --- | --- | --- |
+| `ui/screen/BindingListScreen.kt` | **新增** | 已绑定列表 + 解绑弹窗（`BindingListScreen` / `BindingRow` / `UnbindDialog` / `maskUsername` / `formatBindingTime`） |
+| `navigation/AppNavigation.kt` | 修改 | import `BindingListScreen`/`NavType`/`navArgument`；新增 `Screen.BindingList`；Profile 接 `onNavigateToScan`/`onNavigateToBindingList`；扫码路由改带 `from` 参数并按来源分流；新增 binding_list composable |
+
+> 复用未改动：`QRScannerScreen.kt`（扫码+确认+createBinding+verifyDeviceBinding 全流程已具备，本棒仅从 Profile 复用它）、`NetworkService.getBindingList`/`unbindDevice`（「十」已实现）。
+
+### 11.3 静态核对结论
+
+- ✅ `BindingItem` 字段（`bindingId`/`controlUsername`/`controlNickname?`/`createdAt?`）与 `NetworkService.kt` 定义一致
+- ✅ `getBindingList(jwt): Result<BindingListResponse>`、`unbindDevice(bindingId, pwd, jwt): Result<String>` 调用签名匹配
+- ✅ 图标全部来自已声明的 material core / extended
+- ✅ `NavType`/`navArgument` 来自 navigation-compose 传递依赖 `androidx.navigation.*`
+- ✅ 登录流程 `navigate("qr_scanner")` 仍能匹配 `qr_scanner?from={from}`（用默认 `from=login`），原行为不变
+- ✅ Cursor lint 对两文件无报错
+
+### 11.4 仍未完成 / 交给下一棒
+
+| 项 | 优先级 | 说明 |
+| --- | --- | --- |
+| **编译验证** | 🔴 高 | Windows 无 Android SDK；需 Mac/Android Studio 跑 `./gradlew assembleDebug` 做最终确认（本棒仅静态实现） |
+| **扫码时释放推流相机** | 🔴 高 | 对标 iOS `ReleaseCameraForScanner`。从 Profile 进扫码时，`StreamingScreen` 的 `WebRTCManager`（页面内 `remember` 局部实例，仍在后台栈）可能占用相机，导致 CameraX 扫码抢占失败。方案：把 `WebRTCManager` 提升为全局/共享，或用 SharedFlow/事件在进扫码前 `stopPublish()`/暂停预览，返回后恢复。本棒未做 |
+| **头像上传** | 中 | `NetworkService.uploadAvatar` multipart PUT `/user/profile` field `avatar` + Profile 头像点击相册/相机（对标 iOS `uploadAvatar`）。未做 |
+| **激活会员** | 低 | iOS `ActivationView` + `/activation/*`。`APIConfig.Activation` 端点已占位，页面/API 未做 |
+| **真机验证** | 🔴 高 | 扫码入口跳转、绑定列表加载、解绑成功后列表移除、返回回到 Profile —— 需真机走查 |
+
+### 11.5 关键代码位置
+
+```
+BindingListScreen.kt
+  ├── loadBindings()                NetworkService.getBindingList → 四态
+  ├── BindingRow                    图标+脱敏名+绑定时间+解绑按钮+箭头
+  ├── UnbindDialog                  绑定码输入 → NetworkService.unbindDevice → 成功移除
+  ├── maskUsername()                前2 + ** + 后2（<=4 原样）
+  └── formatBindingTime()           ISO8601(多格式) → yyyy-MM-dd HH:mm
+
+AppNavigation.kt
+  ├── Screen.BindingList            "binding_list"
+  ├── ProfileScreen(onNavigateToScan = navigate("qr_scanner?from=profile"),
+  │                 onNavigateToBindingList = navigate(BindingList))
+  ├── composable("qr_scanner?from={from}")  fromProfile ? popBackStack() : 原登录跳转
+  └── composable(BindingList)       BindingListScreen(onNavigateBack = popBackStack)
+
+iOS 参考（Windows 本地）
+  D:\sb\ios\srs\BindingListView.swift   列表 + BindingRowView
+  D:\sb\ios\srs\UnbindView.swift        解绑确认
+  D:\sb\ios\srs\ProfileView.swift       handleDeviceBindingAction / showingBindingList
+```

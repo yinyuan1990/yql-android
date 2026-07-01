@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import com.fz.yqlandroid.manager.DeviceIDManager
 import com.fz.yqlandroid.manager.WebSocketManager
 import com.fz.yqlandroid.navigation.AppViewModel
+import kotlinx.coroutines.launch
 
 /**
  * 个人中心页面
@@ -45,20 +46,60 @@ import com.fz.yqlandroid.navigation.AppViewModel
 fun ProfileScreen(
     appViewModel: AppViewModel,
     onNavigateBack: () -> Unit,
+    onNavigateToChangePassword: () -> Unit = {},
+    onNavigateToAboutUs: () -> Unit = {},
+    onNavigateToMessage: () -> Unit = {},
+    onNavigateToScan: () -> Unit = {},
+    onNavigateToBindingList: () -> Unit = {},
     onLogout: () -> Unit
 ) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
     
     // 从SharedPreferences读取用户信息
     val tokenPrefs = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
     val username = tokenPrefs.getString("username", "") ?: ""
+    val jwtToken = tokenPrefs.getString("jwt_token", "") ?: ""
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
+    
+    // 🔥 用户资料（对标 iOS ProfileViewModel.loadUserProfile）
+    var userProfile by remember { mutableStateOf<com.fz.yqlandroid.network.UserProfileResponse?>(null) }
     
     // 对话框状态
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var deletePassword by remember { mutableStateOf("") }
+    var isDeleting by remember { mutableStateOf(false) }
+    var deleteError by remember { mutableStateOf<String?>(null) }
+    
+    // 版本号（动态读取，对标 iOS appVersionText）
+    val appVersionText = remember {
+        try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            val versionCode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P)
+                pInfo.longVersionCode else @Suppress("DEPRECATION") pInfo.versionCode.toLong()
+            "${pInfo.versionName} ($versionCode)"
+        } catch (_: Exception) { "1.0.0" }
+    }
+    
+    // 🔥 加载用户资料
+    LaunchedEffect(Unit) {
+        if (jwtToken.isNotEmpty()) {
+            com.fz.yqlandroid.network.NetworkService.getUserProfile(jwtToken)
+                .onSuccess { userProfile = it }
+        }
+    }
+    
+    // 🔥 等级显示（对标 iOS levelDisplayText：activated + activation_level）
+    val activated = tokenPrefs.getBoolean("activated", false)
+    val activationLevel = tokenPrefs.getInt("activation_level", 0)
+    val levelText = if (!activated) "试用用户" else when (activationLevel) {
+        4 -> "超高帧"; 3 -> "超高清"; 2 -> "超清"; 1 -> "高清"; else -> "试用用户"
+    }
+    val levelColor = if (!activated) Color(0xFF808080) else when (activationLevel) {
+        4 -> Color(0xFFFF6B00); 3 -> Color(0xFFFFD700); 2 -> Color(0xFF007AFF); 1 -> Color(0xFF34C759); else -> Color(0xFF808080)
+    }
     
     // 退出登录确认
     if (showLogoutDialog) {
@@ -95,30 +136,63 @@ fun ProfileScreen(
             title = { Text("注销账号") },
             text = {
                 Column {
-                    Text("注销后账号将无法恢复，所有数据将被删除。请输入管理密码确认注销。")
+                    Text("注销后账号将无法恢复，所有数据将被删除。请输入绑定码确认注销。")
                     Spacer(modifier = Modifier.height(16.dp))
                     OutlinedTextField(
                         value = deletePassword,
                         onValueChange = { deletePassword = it },
-                        label = { Text("管理密码") },
+                        label = { Text("绑定码") },
                         singleLine = true,
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        enabled = !isDeleting,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    if (deleteError != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(deleteError!!, color = Color.Red, fontSize = 13.sp)
+                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    // TODO: 调用注销API
-                    showDeleteDialog = false
-                    deletePassword = ""
-                }) {
-                    Text("确认注销", color = Color.Red)
+                TextButton(
+                    enabled = !isDeleting,
+                    onClick = {
+                        if (deletePassword.isEmpty()) {
+                            deleteError = "请输入绑定码"
+                            return@TextButton
+                        }
+                        isDeleting = true
+                        deleteError = null
+                        val pwd = deletePassword
+                        scope.launch {
+                            com.fz.yqlandroid.network.NetworkService.deleteAccount(pwd, jwtToken)
+                                .onSuccess {
+                                    // 🔥 完整登出流程（对标 iOS performDeleteAccount）
+                                    WebSocketManager.instance.disconnect()
+                                    tokenPrefs.edit().clear().apply()
+                                    context.getSharedPreferences("login_prefs", Context.MODE_PRIVATE)
+                                        .edit().remove("password").apply()
+                                    isDeleting = false
+                                    showDeleteDialog = false
+                                    deletePassword = ""
+                                    appViewModel.logout()
+                                    onLogout()
+                                }
+                                .onFailure {
+                                    isDeleting = false
+                                    deleteError = it.message ?: "注销失败，请重试"
+                                }
+                        }
+                    }
+                ) {
+                    Text(if (isDeleting) "注销中..." else "确认注销", color = Color.Red)
                 }
             },
             dismissButton = {
-                TextButton(onClick = {
+                TextButton(enabled = !isDeleting, onClick = {
                     showDeleteDialog = false
                     deletePassword = ""
+                    deleteError = null
                 }) {
                     Text("取消")
                 }
@@ -181,9 +255,11 @@ fun ProfileScreen(
                 Spacer(modifier = Modifier.width(12.dp))
                 
                 Column {
-                    // 昵称
+                    // 昵称（优先 nickname，回退 username）
                     Text(
-                        text = username.ifEmpty { "--" },
+                        text = userProfile?.nickname?.ifEmpty { null }
+                            ?: userProfile?.username?.ifEmpty { null }
+                            ?: username.ifEmpty { "--" },
                         fontSize = 20.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF1A1A1A)
@@ -191,11 +267,11 @@ fun ProfileScreen(
                     
                     Spacer(modifier = Modifier.height(6.dp))
                     
-                    // 等级标签
+                    // 等级标签（对标 iOS levelDisplayText / levelColor）
                     Row(
                         modifier = Modifier
                             .background(
-                                Color(0xFF808080).copy(alpha = 0.15f),
+                                levelColor.copy(alpha = 0.15f),
                                 RoundedCornerShape(10.dp)
                             )
                             .padding(horizontal = 8.dp, vertical = 3.dp),
@@ -205,11 +281,11 @@ fun ProfileScreen(
                             imageVector = Icons.Default.Person,
                             contentDescription = null,
                             modifier = Modifier.size(11.dp),
-                            tint = Color(0xFF808080)
+                            tint = levelColor
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "试用用户",
+                            text = levelText,
                             fontSize = 12.sp,
                             color = Color(0xFF1A1A1A)
                         )
@@ -228,7 +304,7 @@ fun ProfileScreen(
                 ProfileRow(
                     icon = Icons.Default.DateRange,
                     title = "注册时间",
-                    subtitle = "—",
+                    subtitle = formatProfileDate(userProfile?.createdAt),
                     onClick = { }
                 )
                 
@@ -241,7 +317,19 @@ fun ProfileScreen(
                     icon = Icons.Default.Search,
                     title = "扫一扫",
                     subtitle = "扫描控制端二维码进行绑定",
-                    onClick = { /* TODO: 扫码 */ }
+                    onClick = { onNavigateToScan() }
+                )
+                
+                HorizontalDivider(
+                    modifier = Modifier.padding(start = 60.dp),
+                    color = Color(0xFFF0F0F0)
+                )
+                
+                ProfileRow(
+                    icon = Icons.Default.Link,
+                    title = "已绑定控制端",
+                    subtitle = "查看并解绑已绑定的控制端",
+                    onClick = { onNavigateToBindingList() }
                 )
                 
                 HorizontalDivider(
@@ -252,7 +340,7 @@ fun ProfileScreen(
                 ProfileRow(
                     icon = Icons.Default.Lock,
                     title = "修改密码",
-                    onClick = { /* TODO: 修改密码 */ }
+                    onClick = { onNavigateToChangePassword() }
                 )
                 
                 HorizontalDivider(
@@ -278,7 +366,7 @@ fun ProfileScreen(
                 ProfileRow(
                     icon = Icons.Default.Info,
                     title = "版本号",
-                    subtitle = "试用版(1.0.0)",
+                    subtitle = appVersionText,
                     onClick = { }
                 )
                 
@@ -290,7 +378,7 @@ fun ProfileScreen(
                 ProfileRow(
                     icon = Icons.Default.Info,
                     title = "关于我们",
-                    onClick = { /* TODO: 关于我们 */ }
+                    onClick = { onNavigateToAboutUs() }
                 )
                 
                 HorizontalDivider(
@@ -301,7 +389,7 @@ fun ProfileScreen(
                 ProfileRow(
                     icon = Icons.Default.Email,
                     title = "问题反馈",
-                    onClick = { /* TODO: 问题反馈 */ }
+                    onClick = { onNavigateToMessage() }
                 )
             }
             
@@ -399,4 +487,27 @@ private fun ProfileRow(
             tint = Color(0xFF999999)
         )
     }
+}
+
+/**
+ * 格式化注册时间（对标 iOS ProfileView.formatDate）
+ * 输入 ISO8601（可能带毫秒/微秒），输出 "yyyy年MM月dd日 HH:mm:ss"
+ */
+private fun formatProfileDate(dateString: String?): String {
+    if (dateString.isNullOrEmpty()) return "—"
+    val patterns = listOf(
+        "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        "yyyy-MM-dd'T'HH:mm:ss",
+        "yyyy-MM-dd HH:mm:ss"
+    )
+    for (p in patterns) {
+        try {
+            val parser = java.text.SimpleDateFormat(p, java.util.Locale.getDefault())
+            val date = parser.parse(dateString) ?: continue
+            val out = java.text.SimpleDateFormat("yyyy年MM月dd日 HH:mm:ss", java.util.Locale.getDefault())
+            return out.format(date)
+        } catch (_: Exception) { /* try next */ }
+    }
+    return dateString
 }

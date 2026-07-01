@@ -16,6 +16,12 @@ import com.fz.yqlandroid.ui.screen.StreamingScreen
 import com.fz.yqlandroid.ui.screen.QRScannerScreen
 import com.fz.yqlandroid.ui.screen.RegisterScreen
 import com.fz.yqlandroid.ui.screen.ProfileScreen
+import com.fz.yqlandroid.ui.screen.ChangePasswordScreen
+import com.fz.yqlandroid.ui.screen.LocalWebViewScreen
+import com.fz.yqlandroid.ui.screen.MessageScreen
+import com.fz.yqlandroid.ui.screen.BindingListScreen
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
 
 /**
  * 导航路由定义
@@ -28,6 +34,10 @@ sealed class Screen(val route: String) {
     object Streaming : Screen("streaming")
     object QRScanner : Screen("qr_scanner")
     object Profile : Screen("profile")
+    object ChangePassword : Screen("change_password")
+    object AboutUs : Screen("about_us")
+    object Message : Screen("message")
+    object BindingList : Screen("binding_list")
 }
 
 /**
@@ -176,6 +186,22 @@ fun AppNavHost(
                 onNavigateBack = {
                     navController.popBackStack()
                 },
+                onNavigateToChangePassword = {
+                    navController.navigate(Screen.ChangePassword.route)
+                },
+                onNavigateToAboutUs = {
+                    navController.navigate(Screen.AboutUs.route)
+                },
+                onNavigateToMessage = {
+                    navController.navigate(Screen.Message.route)
+                },
+                onNavigateToScan = {
+                    // 🔥 从 Profile 进扫码：绑定成功后回到 Profile（而非跳 Streaming）
+                    navController.navigate("${Screen.QRScanner.route}?from=profile")
+                },
+                onNavigateToBindingList = {
+                    navController.navigate(Screen.BindingList.route)
+                },
                 onLogout = {
                     appViewModel.logout()
                     navController.navigate(Screen.Login.route) {
@@ -185,21 +211,78 @@ fun AppNavHost(
                 }
             )
         }
+
+        // 修改密码页
+        composable(Screen.ChangePassword.route) {
+            ChangePasswordScreen(
+                appViewModel = appViewModel,
+                onNavigateBack = {
+                    navController.popBackStack()
+                },
+                onLogout = {
+                    appViewModel.logout()
+                    navController.navigate(Screen.Login.route) {
+                        popUpTo(Screen.Streaming.route) { inclusive = true }
+                    }
+                }
+            )
+        }
+
+        // 关于我们（本地隐私政策 HTML，对标 iOS LocalWebView）
+        composable(Screen.AboutUs.route) {
+            LocalWebViewScreen(
+                title = "关于我们",
+                assetFileName = "privacy_policy.html",
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+
+        // 问题反馈页
+        composable(Screen.Message.route) {
+            MessageScreen(
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
         
-        // 扫码绑定页
-        composable(Screen.QRScanner.route) {
+        // 扫码绑定页（from=login 为登录流程默认跳 Streaming；from=profile 为个人中心入口，成功后回 Profile）
+        composable(
+            route = "${Screen.QRScanner.route}?from={from}",
+            arguments = listOf(navArgument("from") {
+                type = NavType.StringType
+                defaultValue = "login"
+            })
+        ) { backStackEntry ->
+            val from = backStackEntry.arguments?.getString("from") ?: "login"
+            val fromProfile = from == "profile"
             QRScannerScreen(
                 appViewModel = appViewModel,
                 onNavigateBack = {
-                    navController.navigate(Screen.Login.route) {
-                        popUpTo(Screen.QRScanner.route) { inclusive = true }
+                    if (fromProfile) {
+                        // 🔥 从 Profile 进入：返回上一页（Profile）
+                        navController.popBackStack()
+                    } else {
+                        navController.navigate(Screen.Login.route) {
+                            popUpTo(Screen.QRScanner.route) { inclusive = true }
+                        }
                     }
                 },
                 onBindSuccess = {
-                    navController.navigate(Screen.Streaming.route) {
-                        popUpTo(Screen.QRScanner.route) { inclusive = true }
+                    if (fromProfile) {
+                        // 🔥 从 Profile 进入：绑定成功后回到 Profile
+                        navController.popBackStack()
+                    } else {
+                        navController.navigate(Screen.Streaming.route) {
+                            popUpTo(Screen.QRScanner.route) { inclusive = true }
+                        }
                     }
                 }
+            )
+        }
+
+        // 已绑定控制端列表页（对标 iOS BindingListView + UnbindView）
+        composable(Screen.BindingList.route) {
+            BindingListScreen(
+                onNavigateBack = { navController.popBackStack() }
             )
         }
     }
