@@ -123,6 +123,12 @@ class WebRTCManager(private val context: Context) {
     // 关键帧定时器
     private var keyframeJob: Job? = null
     private var statsJob: Job? = null
+
+    // 🌡️ 设备热状态管理（对标 iOS thermalState 主动降档）
+    private val thermalManager = ThermalManager(context)
+    // 当前热档位对采集/推流的约束：fps 上限 + 码率缩放系数（1.0=不降）
+    private var thermalFpsCap: Int = Int.MAX_VALUE
+    private var thermalBitrateScale: Double = 1.0
     
     // MARK: - 初始化
     
@@ -153,11 +159,13 @@ class WebRTCManager(private val context: Context) {
                 .createInitializationOptions()
         )
         
-        val encoderFactory = DefaultVideoEncoderFactory(
+        val baseEncoderFactory = DefaultVideoEncoderFactory(
             eglBase!!.eglBaseContext,
             true,  // 启用硬件编码
             true   // 启用H264高Profile
         )
+        // 🎨 颜色管线对标 iOS：包一层，仅在关键帧给 H264 SPS 补 BT.709+full-range 的 VUI
+        val encoderFactory = ColorTaggingVideoEncoderFactory(baseEncoderFactory)
         val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
         
         peerConnectionFactory = PeerConnectionFactory.builder()
@@ -165,8 +173,61 @@ class WebRTCManager(private val context: Context) {
             .setVideoDecoderFactory(decoderFactory)
             .createPeerConnectionFactory()
         
+        // 🌡️ 启动设备热状态监听（对标 iOS thermalState），升温时自动降帧降码
+        thermalManager.onLevelChanged = { level -> applyThermalPolicy(level) }
+        thermalManager.start()
+
         isInitialized = true
         Log.d(TAG, "✅ WebRTC初始化完成")
+    }
+
+    // MARK: - 🌡️ 热控降档（对标 iOS thermalState 处理）
+
+    /**
+     * 根据设备热档位调整采集/推流参数，抑制发热。
+     * - fps 上限：降低采集与推流帧率（采集降帧同时减轻 ISP/传感器发热）
+     * - 码率缩放：降低编码码率，减少编码器/调制解调器发热
+     * 档位越高约束越强；回落到 NOMINAL 时恢复档位原始参数。
+     */
+    private fun applyThermalPolicy(level: ThermalManager.Level) {
+        val preset = currentLadder[currentProfile]
+        val baseFps = preset?.fps ?: currentFps
+        val baseMaxKbps = preset?.maxKbps ?: currentBitrateKbps
+
+        when (level) {
+            ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
+            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalBitrateScale = 0.8 }
+            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalBitrateScale = 0.6 }
+            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalBitrateScale = 0.4 }
+        }
+
+        val targetFps = minOf(baseFps, thermalFpsCap)
+        val targetKbps = maxOf(300, (baseMaxKbps * thermalBitrateScale).toInt())
+        Log.d(TAG, "🌡️ [热控] $level → fps≤$targetFps, 码率≤${targetKbps}kbps (base ${baseFps}fps/${baseMaxKbps}kbps)")
+
+        // 1) 编码参数（帧率 + 码率）立即生效，平滑无重建
+        currentFps = targetFps
+        currentBitrateKbps = targetKbps
+        currentMinBitrateKbps = maxOf(200, (targetKbps * 0.6).toInt())
+        videoSender?.let { sender ->
+            val params = sender.parameters
+            if (params.encodings.isNotEmpty()) {
+                params.encodings[0].maxFramerate = targetFps
+                params.encodings[0].maxBitrateBps = targetKbps * 1000
+                params.encodings[0].minBitrateBps = currentMinBitrateKbps * 1000
+                sender.parameters = params
+            }
+        }
+
+        // 2) 采集帧率降档（重建会话）——真正减轻传感器/ISP 发热；仅在明显变化时执行
+        if (isPreviewRunning) {
+            val capFps = minOf(baseFps, thermalFpsCap)
+            try {
+                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, capFps)
+            } catch (e: Exception) {
+                Log.e(TAG, "热控降采集帧率失败: ${e.message}")
+            }
+        }
     }
     
     // MARK: - 🔥 动态查询摄像头能力
@@ -255,8 +316,12 @@ class WebRTCManager(private val context: Context) {
         val maxFps = if (front) frontMaxFps else backMaxFps
         
         val safeFps60 = minOf(60, maxFps)
-        // 🔥 超高帧FPS：后置尽量高帧，前置保守（受设备上限约束）
-        val ultraFps = if (!front) minOf(240, maxFps) else minOf(120, maxFps)
+        // 🔥 发热优化：采集帧率不超过推流帧率上限(maxPushFps=60)。
+        //    此前 ultra 档按设备能力采集到 240/120fps，但推流最高只有 60fps，
+        //    多出的帧在 ISP/传感器/纹理管线里“空转”后被直接丢弃，是 Android 端主要发热来源之一。
+        //    采集帧率与推流上限对齐后，画质/流畅度无损（推流仍是 60fps），但 SoC 功耗显著下降。
+        //    注：慢门/快门(cjfps)由 SENSOR_EXPOSURE_TIME 单独控制，不依赖高采集帧率。
+        val ultraFps = minOf(60, maxFps)
         
         // 每档独立按 iOS 目标分辨率就近选取设备实际采集分辨率（直接采集，scaleDown=1.0）
         fun nearest(profile: LadderProfile): Size {
@@ -710,9 +775,11 @@ class WebRTCManager(private val context: Context) {
         if (params.encodings.isEmpty()) return
         
         // 🔥 与iOS一致：使用 min~max 码率区间（允许WebRTC向下自适应），并锁定分辨率靠降帧对抗拥塞
-        params.encodings[0].maxBitrateBps = currentBitrateKbps * 1000
-        params.encodings[0].minBitrateBps = currentMinBitrateKbps * 1000
-        params.encodings[0].maxFramerate = minOf(currentFps, currentLadder[currentProfile]?.maxPushFps ?: 60)
+        // 🌡️ 叠加热控约束：码率乘缩放系数、帧率不超过热档位上限
+        val thermalMaxKbps = maxOf(300, (currentBitrateKbps * thermalBitrateScale).toInt())
+        params.encodings[0].maxBitrateBps = thermalMaxKbps * 1000
+        params.encodings[0].minBitrateBps = minOf(currentMinBitrateKbps, thermalMaxKbps) * 1000
+        params.encodings[0].maxFramerate = minOf(currentFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
         
         // scaleDown：从采集分辨率缩放到目标输出（与iOS一致）
         val preset = currentLadder[currentProfile]
@@ -815,7 +882,8 @@ class WebRTCManager(private val context: Context) {
         if (lossRateHistory.size > 3) lossRateHistory.removeAt(0)
         val avgLoss = lossRateHistory.average()
         
-        val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
+        // 🌡️ 自适应升帧上限同时受热控约束，避免降温前又升回高帧
+        val maxFps = minOf(currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
         
         // 网络状态判断（RTT + 丢包率，不用码率）
         val isRttBad = rttMs > rttDownThreshold && rttMs > 0
@@ -1222,7 +1290,8 @@ class WebRTCManager(private val context: Context) {
     fun setTargetFps(backendFps: Int) {
         val pushFps = backendFps / 4
         val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
-        val targetFps = minOf(pushFps, maxFps)
+        // 🌡️ 热控上限一并生效
+        val targetFps = minOf(pushFps, maxFps, thermalFpsCap)
         currentFps = targetFps
         
         // 更新编码参数
@@ -1257,6 +1326,7 @@ class WebRTCManager(private val context: Context) {
     
     fun destroy() {
         scope.cancel()
+        try { thermalManager.stop() } catch (_: Exception) {}
         stopPublish()
         stopPreview()
         

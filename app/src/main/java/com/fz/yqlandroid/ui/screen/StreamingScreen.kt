@@ -58,6 +58,19 @@ fun StreamingScreen(
     
     // WebRTC管理器
     val webRTCManager = remember { WebRTCManager(context) }
+
+    // 🔊 后台保活（对标 iOS BackgroundAudioManager）：无声音频 + WakeLock，防止息屏后推流被冻结
+    val keepAliveManager = remember { com.fz.yqlandroid.manager.KeepAliveManager(context) }
+
+    // 🖥️ 前台常亮（对标 iOS isIdleTimerDisabled）：进入推流页时禁止自动息屏，离开时恢复
+    DisposableEffect(Unit) {
+        val activity = context as? android.app.Activity
+        activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            keepAliveManager.stop()
+        }
+    }
     
     // UI状态
     var showControls by remember { mutableStateOf(true) }
@@ -119,13 +132,20 @@ fun StreamingScreen(
         WebSocketManager.instance.onSpecialMessage = { type, messageDict ->
             webRTCManager.handleSpecialMessage(type, messageDict)
             when (type) {
-                "shuimian" -> isStreaming = false
-                "gongzuo" -> isStreaming = true
+                "shuimian" -> {
+                    isStreaming = false
+                    keepAliveManager.stop()   // 🔊 睡眠：停止保活
+                }
+                "gongzuo" -> {
+                    isStreaming = true
+                    keepAliveManager.start()  // 🔊 唤醒工作：恢复保活
+                }
                 "TryDisconnect" -> {
                     val needDisconnect = messageDict["needDisconnect"] as? Boolean ?: false
                     if (needDisconnect) {
                         // 强制退出推流
                         webRTCManager.stopPublish()
+                        keepAliveManager.stop()  // 🔊 断开推流：停止保活
                         isStreaming = false
                     }
                 }
@@ -214,6 +234,7 @@ fun StreamingScreen(
             if (!isStreaming) {
                 println("jfh [Streaming] 🚀 开始自动推流: IP=$streamPushIp, key=$permanentToken")
                 webRTCManager.startPublish(streamPushIp, "tenantA", permanentToken)  // 🔥 app与iOS一致
+                keepAliveManager.start()  // 🔊 推流即启动后台保活，防止息屏后被冻结
                 isStreaming = true
             } else {
                 println("jfh [Streaming] ⏭️ 已在推流中，跳过")
@@ -294,6 +315,7 @@ fun StreamingScreen(
                     IconButton(
                         onClick = {
                             if (isStreaming) webRTCManager.stopPublish()
+                            keepAliveManager.stop()  // 🔊 退出推流页：停止保活
                             WebSocketManager.instance.disconnect()
                             onLogout()
                         },
