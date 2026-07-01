@@ -443,6 +443,8 @@ class WebRTCManager(private val context: Context) {
             try {
                 videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, currentFps)
                 Log.d(TAG, "🔧 采集格式切换 → ${currentWidth}x${currentHeight}@${currentFps}fps")
+                // 🔥 会话重建后重放硬件参数（曝光/对焦/变焦/快门/白平衡）
+                scope.launch { delay(300); applyCameraParams() }
             } catch (e: Exception) {
                 Log.e(TAG, "切换采集格式失败: ${e.message}")
             }
@@ -1126,6 +1128,8 @@ class WebRTCManager(private val context: Context) {
                 Log.d(TAG, "🔄 切换到${if (isFront) "前置" else "后置"}摄像头")
                 
                 scope.launch {
+                    // 🔥 原生采集器切换后，反射注入的曝光/对焦/变焦/快门/白平衡需重放（新会话）
+                    delay(300); applyCameraParams()
                     delay(100); forceKeyframe()
                     delay(100); forceKeyframe()
                 }
@@ -1140,13 +1144,18 @@ class WebRTCManager(private val context: Context) {
     // MARK: - 辅助方法
     
     private fun createCameraCapturer(useFront: Boolean): CameraVideoCapturer {
-        // 🔥 使用自定义 Camera2 采集器（暴露 CaptureRequest，支持曝光/白平衡/快门/变焦/对焦）
-        return Camera2ControlCapturer(context, useFront)
+        // 🔥 使用 WebRTC 原生 Camera2 采集器（低发热，走 WebRTC 优化纹理管线）。
+        //    曝光/对焦/变焦/快门/白平衡改由 Camera2ParamApplier 反射原生 session 按需注入（见 docs 十五）。
+        val enumerator = Camera2Enumerator(context)
+        val names = enumerator.deviceNames
+        // 选择目标朝向的摄像头；找不到则回退第一个
+        val target = names.firstOrNull { name ->
+            if (useFront) enumerator.isFrontFacing(name) else enumerator.isBackFacing(name)
+        } ?: names.firstOrNull()
+        ?: throw IllegalStateException("找不到可用摄像头")
+        Log.d(TAG, "🎥 原生采集器: camera=$target front=$useFront")
+        return enumerator.createCapturer(target, null)
     }
-    
-    /** 当前采集器的硬件控制入口 */
-    private val controlCapturer: Camera2ControlCapturer?
-        get() = videoCapturer as? Camera2ControlCapturer
     
     // MARK: - 🔥 后端配置下发处理（与iOS applyThinRemoteConfig一致）
     
@@ -1260,7 +1269,7 @@ class WebRTCManager(private val context: Context) {
      * 修复：此前启动只应用了 type/direction，导致 cjfps(快门)/zoom/focus/brightness/bitrate/fps
      * 这些“滤镜/图像参数”在启动时没有挂上。现在这里逐项下发到硬件与编码器。
      *
-     * 需在 startPreview() 之后调用（controlCapturer 已就绪；采集器内部对下发状态有缓存+重放兜底）。
+     * 需在 startPreview() 之后调用（原生 session 就绪后，Camera2ParamApplier 才能反射注入）。
      */
     fun applyInitialConfig(config: ThinRemoteConfig) {
         Log.d(TAG, "📋 [初始配置] 应用全部初始参数: type=${config.type}, dir=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, bitrate=${config.bitrate}, focus=${config.focus}, brightness=${config.brightness}")
@@ -1333,77 +1342,91 @@ class WebRTCManager(private val context: Context) {
         }
     }
     
-    // MARK: - 🔥 相机控制方法（Camera2 API）
-    
-    /**
-     * 设置变焦 (1.0 ~ maxZoom)
-     */
-    fun setZoom(zoom: Float) {
-        _currentZoom = zoom.coerceIn(1.0f, 10.0f)
-        controlCapturer?.setZoom(_currentZoom)   // 🔥 真正下发到硬件
-        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x")
-    }
-    
+    // MARK: - 🔥 相机控制方法（原生采集器 + Camera2ParamApplier 反射按需注入，低发热）
+
+    // 硬件控制缓存状态（切档/切摄像头后可重放）
     private var _currentZoom: Float = 1.0f
     val currentZoom: Float get() = _currentZoom
-    
-    /**
-     * 设置对焦距离 (0.0 ~ 1.0)
-     * 0.0 = 最近, 1.0 = 无穷远
-     */
-    fun setFocus(distance: Float) {
-        _currentFocus = distance.coerceIn(0f, 1f)
-        controlCapturer?.setFocus(_currentFocus)   // 🔥 真正下发到硬件（AF OFF + LENS_FOCUS_DISTANCE）
-        Log.d(TAG, "🎯 对焦距离: $_currentFocus")
-    }
-    
     private var _currentFocus: Float = 0.5f
     val currentFocus: Float get() = _currentFocus
-    
+    private var _currentShutterSpeed: Int = 240
+    val currentShutterSpeed: Int get() = _currentShutterSpeed
+    private var _shutterEnabled: Boolean = false     // 是否启用手动快门(cjfps)；false=自动曝光
+    private var _currentExposure: Float = 0f
+    val currentExposure: Float get() = _currentExposure
+    private var _currentWhiteBalance: Int = 50
+    val currentWhiteBalance: Int get() = _currentWhiteBalance
+    private var _whiteBalanceLocked: Boolean = false
+    private var _whiteBalanceManual: Boolean = false // 是否手动色温
+
     /**
-     * 设置快门速度（通过采集帧率间接控制）
-     * 与iOS cjfps 一致: 60~600
-     * 值越大 = 快门越快 = 曝光越短 = 画面越暗
+     * 🔥 把当前缓存的全部硬件参数一次性反射注入原生 session（不常驻、不每帧）。
+     * 供各 setter 与切档/切摄像头后重放调用。
+     */
+    fun applyCameraParams() {
+        val params = Camera2ParamApplier.Params(
+            exposureEv = if (_shutterEnabled) null else _currentExposure,
+            focus = _currentFocus,
+            zoom = _currentZoom,
+            shutterCjfps = if (_shutterEnabled) _currentShutterSpeed else null,
+            manualIso = null,
+            whiteBalanceSlider = if (_whiteBalanceManual) _currentWhiteBalance else null,
+            whiteBalanceLocked = _whiteBalanceLocked
+        )
+        Camera2ParamApplier.apply(videoCapturer, params)
+    }
+
+    /** 设置变焦 (1.0 ~ maxZoom) */
+    fun setZoom(zoom: Float) {
+        _currentZoom = zoom.coerceIn(1.0f, 10.0f)
+        applyCameraParams()
+        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x")
+    }
+
+    /** 设置对焦距离 (0.0 ~ 1.0)；0.5=连续自动对焦，其余=手动 */
+    fun setFocus(distance: Float) {
+        _currentFocus = distance.coerceIn(0f, 1f)
+        applyCameraParams()
+        Log.d(TAG, "🎯 对焦距离: $_currentFocus")
+    }
+
+    /**
+     * 设置快门速度（cjfps 60~600，保留手动快门能力）。
+     * 值越大 = 快门越快 = 曝光越短。启用后走 AE OFF + SENSOR_EXPOSURE_TIME=1/cjfps。
      */
     fun setShutterSpeed(cjfps: Int) {
         _currentShutterSpeed = cjfps.coerceIn(60, 600)
-        controlCapturer?.setShutter(_currentShutterSpeed)   // 🔥 真正下发：AE OFF + SENSOR_EXPOSURE_TIME=1/cjfps
-        Log.d(TAG, "📸 快门: 1/${_currentShutterSpeed}s")
+        _shutterEnabled = true
+        applyCameraParams()
+        Log.d(TAG, "📸 快门: 1/${_currentShutterSpeed}s (手动快门)")
     }
-    
-    private var _currentShutterSpeed: Int = 240
-    val currentShutterSpeed: Int get() = _currentShutterSpeed
-    
+
     /**
-     * 🔥 曝光（自动AE下的曝光补偿EV，与iOS test_brightness/exposure一致）
-     * 后端可能下发 EV 值（如 -2~+2）或亮度百分比，这里按 EV 处理。
+     * 🔥 曝光（自动AE下的曝光补偿EV）。设置曝光=切回自动曝光模式（关闭手动快门）。
      */
     fun setExposure(ev: Float) {
         _currentExposure = ev
-        controlCapturer?.setExposureEv(ev)
-        Log.d(TAG, "☀️ 曝光补偿: EV=$ev")
+        _shutterEnabled = false   // 曝光补偿仅在自动AE下有效
+        applyCameraParams()
+        Log.d(TAG, "☀️ 曝光补偿: EV=$ev (自动曝光)")
     }
-    
-    private var _currentExposure: Float = 0f
-    val currentExposure: Float get() = _currentExposure
-    
+
     /**
-     * 🔥 白平衡（与iOS applyWhiteBalance / white_balance一致）
-     * @param slider null=锁定当前白平衡(applyWhiteBalanceOnce)，否则0~100手动色温(0冷100暖)
+     * 🔥 白平衡：slider=null → 锁定当前白平衡；否则 0~100 手动色温(0冷100暖)。
      */
     fun setWhiteBalance(slider: Int?) {
         if (slider == null) {
-            controlCapturer?.lockWhiteBalance(true)
+            _whiteBalanceLocked = true
+            _whiteBalanceManual = false
             Log.d(TAG, "⚪️ 白平衡: 锁定当前")
         } else {
             _currentWhiteBalance = slider.coerceIn(0, 100)
-            controlCapturer?.setWhiteBalanceSlider(_currentWhiteBalance)
+            _whiteBalanceManual = true
+            _whiteBalanceLocked = true
             Log.d(TAG, "⚪️ 白平衡: 手动色温 $_currentWhiteBalance/100")
         }
+        applyCameraParams()
     }
-    
-    private var _currentWhiteBalance: Int = 50
-    val currentWhiteBalance: Int get() = _currentWhiteBalance
     
     /**
      * 设置目标推送FPS
@@ -1435,6 +1458,8 @@ class WebRTCManager(private val context: Context) {
         if (isPreviewRunning && fpsChanged) {
             try {
                 videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, targetFps)
+                // 🔥 会话重建后重放硬件参数
+                scope.launch { delay(300); applyCameraParams() }
             } catch (e: Exception) {
                 Log.e(TAG, "同步采集帧率失败: ${e.message}")
             }

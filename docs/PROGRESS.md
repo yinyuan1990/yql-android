@@ -666,3 +666,124 @@ StreamingScreen.kt
 - ⚠️ **brightness 语义**：当前把 brightness 当 AE 曝光补偿(EV)。若后端 brightness 实为 0~100 亮度百分比而非 EV，需要在 `setExposure` 前做量纲换算（对照后端定义）。
 - ⚠️ **cjfps 量纲**：后端 cjfps 直接作为快门 1/cjfps 秒(60~600)，与 iOS 一致；`setShutterSpeed` 内 `coerceIn(60,600)`。
 - 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。
+
+---
+
+## 十五、发热重构：自定义采集器 → 原生采集器 + 反射控制层（✅ 已实施，保留 cjfps 快门）
+
+> **用户反馈**：「发热严重，是不是自定义采集的原因？看下同类产品怎么做的：`E:\yql\y60373\AndroidStudio\app` 不发热。」
+> **用户确认**：按「原生采集器 + 反射控制层 + 保留 cjfps 快门」实施（见 15.6）。
+> **状态**：✅ 已实施（代码已写，待真机验证发热与反射兼容性）。实施要点见 15.7。
+
+### 15.1 对比结论：发热主因 = 自定义采集器
+
+| 维度 | 本项目（发热） | 参考产品 y60373（不发热） |
+| --- | --- | --- |
+| 采集器 | **自定义 `Camera2ControlCapturer`**：自建 HandlerThread + SurfaceTexture 循环 + 自己的 `setRepeatingRequest`，绕过 WebRTC 优化管线 | **WebRTC 原生 `Camera2Enumerator.createCapturer()`**（`CameraActivity.createCameraCapturer` L896） |
+| 参数控制(曝光/对焦/变焦) | 采集器内部**常驻**持有 `CaptureRequest.Builder`，每次会话都 `applyAllControlsLocked` | **反射**拿原生 session 的 `captureSession/cameraDevice/cameraCharacteristics/cameraThreadHandler/surface`，**按需**临时 `setRepeatingRequest` 一次（`applyCamera2Params` L660-746） |
+| 分辨率/帧率 | `changeCaptureFormat` → 自定义 `reopenSession()` | `videoCapturer.changeCaptureFormat()`（原生实现，L587） |
+| 手动快门(cjfps) | AE OFF + `SENSOR_EXPOSURE_TIME` + 手动 ISO（**常驻手动曝光**，ISP/传感器负载高，发热大） | **无手动快门**，只用 AE 补偿(`CONTROL_AE_EXPOSURE_COMPENSATION`) + AE_ON |
+
+**判断**：自定义采集管线（尤其常驻手动曝光/快门）是 Android 端发热主因。参考产品用**原生采集器（WebRTC 高效纹理管线）+ 反射按需改参数**，既能曝光/对焦/变焦，又低发热。
+
+### 15.2 参考产品关键做法（可直接借鉴）
+
+1. **原生采集器**：`Camera2Enumerator(context).createCapturer(cameraId, null)`，`startCapture(w,h,fps)` 即可，纹理路径由 WebRTC 内部高效处理。
+2. **按需参数注入**（`applyCamera2Params(exposure, focus, zoom)`）：
+   - 反射链：`videoCapturer.getClass().superclass.getDeclaredField("currentSession")` → session 的 `captureSession/cameraDevice/cameraCharacteristics/cameraThreadHandler/surface`；
+   - 新建 `TEMPLATE_RECORD`(3) request，`addTarget(surface)`，设置 AE 补偿/AF/CROP_REGION，`setRepeatingRequest` **一次**；
+   - **只在用户拖动/后端下发时触发**，不常驻、不每帧。
+3. **曝光**：`CONTROL_AE_MODE=ON` + `CONTROL_AE_EXPOSURE_COMPENSATION`（**不做手动快门**）——这是关键低发热点。
+4. **对焦**：0.5=连续自动对焦(`AF_MODE=3`)，否则 `AF_MODE=OFF` + `LENS_FOCUS_DISTANCE`。
+5. **变焦**：`SCALER_CROP_REGION` 裁剪。
+6. **切分辨率/切摄像头**：都走原生 `changeCaptureFormat` / `switchCamera(handler, cameraId)`。
+
+### 15.3 改造方案（下一棒实施）
+
+| 步骤 | 改动 | 影响文件 |
+| --- | --- | --- |
+| 1. 采集器换原生 | `createCameraCapturer()` 改用 `Camera2Enumerator.createCapturer()`（前/后置按 `isFrontFacing/isBackFacing` 选 id）；删除/停用 `Camera2ControlCapturer` | `WebRTCManager.kt` `createCameraCapturer()`；`Camera2ControlCapturer.kt`（停用） |
+| 2. 新增反射控制层 | 新建 `Camera2ParamApplier`（对标参考 `applyCamera2Params`）：反射取原生 session 字段 + 临时 `setRepeatingRequest`。曝光走 AE 补偿、对焦、变焦 | 新文件 `Camera2ParamApplier.kt` |
+| 3. setter 改接反射层 | `setZoom/setFocus/setExposure` 改为调用反射层。**`setShutterSpeed(cjfps)` 保留**：反射通道同样能下发 `SENSOR_EXPOSURE_TIME`+AE_OFF+ISO，快门功能不因换原生而丢失（详见 15.6）。仅在“需要极限低发热”时才可选择弱化 | `WebRTCManager.kt` |
+| 4. 白平衡 | 参考产品无白平衡控制；本项目如需保留，也改为反射层按需注入（避免常驻 AWB OFF） | `WebRTCManager.kt` / `Camera2ParamApplier.kt` |
+| 5. 颜色管线保留 | `ColorTaggingVideoEncoderFactory`（VUI）与运动关键帧不受影响，继续保留 | 无 |
+
+### 15.4 风险 / 注意
+
+| 项 | 说明 |
+| --- | --- |
+| **反射字段名依赖库实现** | 参考用 `currentSession/captureSession/cameraDevice/cameraCharacteristics/cameraThreadHandler/surface`。本项目用 `io.getstream:stream-webrtc-android:1.1.1`，字段名大概率一致（同源 chromium webrtc），但**需真机反射验证**，失败要有兜底（try/catch 忽略，不崩溃） |
+| **cjfps 快门可保留（澄清）** | 换原生采集器**不会让快门失效**：快门是通过 `CaptureRequest` 的 `SENSOR_EXPOSURE_TIME` 下发的，反射控制层同样能写。参考产品只是“选择不做快门”，不是原生做不了。推荐路线=原生采集器+反射层**保留 cjfps 快门**（详见 15.6） |
+| **切档/切摄像头/参数重放** | 原生采集器切换后，反射注入的曝光/对焦/变焦需**重新触发一次**（参考产品在 `switchCamera` 回调、`quality` 变更后重新 `changeCaptureFormat` / 重注参数） |
+| **发热验证** | 必须真机对比改前/改后温度，确认原生采集确实降温 |
+| **编译** | Windows 无 SDK，需 Mac/Android Studio 验证反射 + 编译 |
+
+### 15.5 参考文件（Windows 本地）
+
+```
+参考产品(不发热)：
+  E:\yql\y60373\AndroidStudio\app\src\main\java\com\example\skylinkApp\CameraActivity.java
+    ├── createCameraCapturer()  L896   原生 Camera2Enumerator.createCapturer
+    ├── initWebRTC()            L591   原生采集器 startCapture
+    └── applyCamera2Params()    L660   反射按需 setRepeatingRequest（曝光/对焦/变焦）
+
+本项目(发热)：
+  app/src/main/java/com/fz/yqlandroid/manager/Camera2ControlCapturer.kt  自定义采集器(拟停用)
+  app/src/main/java/com/fz/yqlandroid/manager/WebRTCManager.kt           createCameraCapturer/参数setter
+```
+
+### 15.6 澄清：换原生采集器后快门(cjfps)会不会失效？—— 不会
+
+**结论：不会失效。** 换原生采集器只是换“帧从传感器搬到编码器”的采集管线，**快门是另一回事**：
+
+- 快门 = `CaptureRequest` 里写 `CONTROL_AE_MODE=OFF` + `SENSOR_EXPOSURE_TIME=1/cjfps` + 手动 ISO。
+- 原生 `Camera2Capturer` 内部同样有 `captureSession/cameraDevice/surface`，**反射控制层照样能新建 request 写这些字段并 `setRepeatingRequest`**，快门正常生效。
+- 参考产品 y60373 **只是产品上没做快门**（它只写 AE 补偿），并不是“原生采集器做不了快门”。
+
+**两种发热来源要分开看**：
+
+| 发热来源 | 是否去除 | 说明 |
+| --- | --- | --- |
+| ① 自建采集管线低效（主因） | ✅ 换原生即去除 | 这是本次降发热的**核心收益**，与快门无关 |
+| ② 常驻手动快门(SENSOR_EXPOSURE_TIME) 负载 | 可留可去 | 属于**产品功能**，去掉能再省一点，但不是主因 |
+
+**推荐路线（既降发热又保快门）**：
+1. 采集器换 WebRTC 原生（拿到①的主要降温收益）；
+2. 反射控制层**保留 cjfps 快门**（`SENSOR_EXPOSURE_TIME`），曝光/对焦/变焦一并走反射；
+3. 反射只在“触发时下发一次”，不常驻每帧，比旧自定义采集器的“每次会话重放全套控制”更省。
+
+即：**快门保留，发热仍显著下降**（因为主因①被消除）。只有在极端追求最低发热时，才考虑弱化②的手动快门。
+
+### 15.7 实施记录（✅ 已完成）
+
+| 改动 | 说明 | 文件 |
+| --- | --- | --- |
+| **采集器换原生** | `createCameraCapturer()` 改用 `Camera2Enumerator(context).createCapturer(name, null)`，按 `isFrontFacing/isBackFacing` 选前后置，找不到回退第一个 | `WebRTCManager.kt` |
+| **删除自定义采集器** | `Camera2ControlCapturer.kt` 已删除（无引用） | 删除 |
+| **新增反射控制层** | `Camera2ParamApplier`：反射原生 `Camera2Session` 的 `currentSession→captureSession/cameraDevice/cameraCharacteristics/cameraThreadHandler/surface`，新建 `TEMPLATE_RECORD` 请求一次 `setRepeatingRequest` 注入曝光/对焦/变焦/**快门(SENSOR_EXPOSURE_TIME)**/白平衡。异常全兜底不崩溃 | `Camera2ParamApplier.kt`（新） |
+| **setter 改接反射层** | `setZoom/setFocus/setExposure/setShutterSpeed/setWhiteBalance` 只更新缓存字段并调用 `applyCameraParams()`（把全部缓存状态一次性注入）。`setShutterSpeed` **保留手动快门**(`_shutterEnabled=true`)；`setExposure` 切回自动AE(`_shutterEnabled=false`) | `WebRTCManager.kt` |
+| **会话重建后重放** | 切摄像头(`switchCamera`回调)、切档/改fps 触发 `changeCaptureFormat` 重开会话后，`delay(300)` 再 `applyCameraParams()` 重放硬件参数 | `WebRTCManager.kt` |
+| **颜色管线/运动关键帧保留** | `ColorTaggingVideoEncoderFactory`（VUI）+ 运动自适应关键帧不受影响 | 无 |
+
+**关键代码位置**：
+
+```
+Camera2ParamApplier.kt
+  └── apply(capturer, Params)   反射取原生 session → 一次 setRepeatingRequest
+        ├── applyExposureAndShutter  cjfps→AE OFF+SENSOR_EXPOSURE_TIME+ISO / 否则 AE+EV
+        ├── applyFocus / applyZoom / applyWhiteBalance
+
+WebRTCManager.kt
+  ├── createCameraCapturer()   Camera2Enumerator.createCapturer（原生）
+  ├── applyCameraParams()      组装缓存状态 → Camera2ParamApplier.apply
+  ├── setZoom/Focus/Exposure/ShutterSpeed/WhiteBalance → applyCameraParams()
+  └── switchCamera / applyProfile / setTargetFps 会话重建后 delay(300)+applyCameraParams()
+```
+
+### 15.8 待真机验证（🔴 下一棒）
+
+- 🔴 **发热对比**：改前/改后长时间推流机身温度，确认原生采集显著降温。
+- 🔴 **反射兼容性**：`stream-webrtc-android:1.1.1` 的 `Camera2Session` 字段名是否与反射一致（日志看 `Camera2ParamApplier ✅ 参数已注入` 还是 `⚠️ 反射注入失败`）。失败已兜底(不崩溃)，但曝光/对焦/变焦/快门会不生效——若失败需按实际字段名调整。
+- 🔴 **快门效果**：cjfps 下发后画面亮度/运动模糊是否随快门变化（验证 `SENSOR_EXPOSURE_TIME` 生效）。
+- ⚠️ **参数重放时机**：会话重建后用 `delay(300)` 等新 session 就绪；个别慢机型可能需要加大延时。
+- 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认（反射无编译期检查，尤需真机跑）。
