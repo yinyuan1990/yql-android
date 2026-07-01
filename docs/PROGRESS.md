@@ -65,7 +65,9 @@
 | P4K (4:3) | 1920×1440 | 4500–7500 |
 | ULTRA (16:9) | 1280×720 | 3300–5500 |
 
-实现文件：`WebRTCManager.kt` → `findBestResolution()` / `applyProfile()`
+**🆕 选档策略：60fps 优先（2026-07-01，见「十二」）**：每档在就近选分辨率时，**优先选能跑 60fps 的分辨率**，只有当该比例下没有任何 60fps 分辨率时才退回 30fps。避免此前「选到最接近但只支持 30fps 的分辨率、旁边能跑 60fps 的近似分辨率被忽略」的问题。
+
+实现文件：`WebRTCManager.kt` → `queryCameraCapabilities()`（逐分辨率算最大fps）/ `findBestResolution()`（帧率优先就近）/ `calculateLadder()` / `applyProfile()`
 
 ### 2.5 自定义 Camera2 采集器
 
@@ -496,3 +498,49 @@ iOS 参考（Windows 本地）
   D:\sb\ios\srs\UnbindView.swift        解绑确认
   D:\sb\ios\srs\ProfileView.swift       handleDeviceBindingAction / showingBindingList
 ```
+
+---
+
+## 十二、2026-07-01 采集帧率选档策略：60fps 优先（下一棒必读）
+
+> **用户反馈**：「Android 采集 fps 按 60fps 的标准 —— 相同分辨率的时候 60 的优先。目前都选到了 30fps；还是分辨率接近最优先，应改为先选采集 60 的，没有 60 才是 30。」
+
+### 12.1 问题根因
+
+此前的选档逻辑有两处缺陷：
+
+1. **能力探测只记录整机一个 `maxFps`**：`queryCameraCapabilities()` 仅取 `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` 的整机最大帧率，**没有记录每个分辨率各自能跑多少 fps**。
+2. **选分辨率时完全不看帧率**：`findBestResolution()` 只按「面积最接近目标」挑分辨率。于是当「最接近的分辨率恰好只支持 30fps、而稍有差异的近似分辨率能跑 60fps」时，会错误地选到 30fps 的那个。
+
+结果：多档实际采集帧率掉到 30fps。
+
+### 12.2 修复方案（已实现）
+
+| 环节 | 改动 | 说明 |
+| --- | --- | --- |
+| **逐分辨率算帧率** | `queryCameraCapabilities()` 新增 `backSizeMaxFps`/`frontSizeMaxFps`（`Map<Size,Int>`） | 用 `SCALER_STREAM_CONFIGURATION_MAP.getOutputMinFrameDuration(format, size)` 计算每个分辨率的最大帧率 `fps = 1e9 / minFrameDuration`，再与整机 AE 上界取 min |
+| **帧率优先就近选** | `findBestResolution()` 新增 `sizeMaxFps` + `desiredFps=60` 参数 | **两级策略**：① 先在「能达到 60fps 的分辨率」里选面积最接近的；② 只有当该比例下没有任何 60fps 分辨率时，才在全体候选里选面积最接近（此时可能 30fps）。比例正确性仍优先于帧率（不会为 60fps 把 16:9 档换成 4:3） |
+| **每档取实际帧率** | `calculateLadder()` 每档 `fps = min(60, 该分辨率支持fps, 整机maxFps)` | 替换原来统一的 `safeFps60`。日志同时打印「该分辨率上限 Nfps」便于真机核对 |
+
+### 12.3 改动文件
+
+| 文件 | 操作 | 摘要 |
+| --- | --- | --- |
+| `manager/WebRTCManager.kt` | 修改 | 新增 `backSizeMaxFps`/`frontSizeMaxFps` 缓存；`queryCameraCapabilities()` 逐分辨率算 fps；`findBestResolution()` 帧率优先两级选档；`calculateLadder()` 每档按分辨率实际 fps 赋值 + 日志增强 |
+| `docs/PROGRESS.md` | 修改 | 本节 + 2.4 节说明 |
+
+### 12.4 关键代码位置
+
+```
+WebRTCManager.kt
+  ├── backSizeMaxFps / frontSizeMaxFps        每分辨率→最大fps 缓存
+  ├── queryCameraCapabilities()  ~L245        getOutputMinFrameDuration 逐分辨率算 fps
+  ├── findBestResolution(..., sizeMaxFps, desiredFps=60)  ~L285  60fps 优先两级就近
+  └── calculateLadder()          ~L346        nearest()传fps图; fpsFor(size)=min(60,分辨率fps,maxFps)
+```
+
+### 12.5 待验证（下一棒 / 真机）
+
+- 🔴 **真机确认**：Galaxy S25 等推流，看日志 `实采WxH @Nfps(该分辨率上限Mfps)` —— 各档是否已优先落到 60fps；仅在设备该比例确无 60fps 分辨率时才为 30fps。
+- ⚠️ 个别机型 `getOutputMinFrameDuration` 返回的理论帧率可能高于实际可达（已与 AE 上界取 min 兜底）；若某档申请 60 但采集实际达不到，可在真机日志进一步收紧。
+- 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。

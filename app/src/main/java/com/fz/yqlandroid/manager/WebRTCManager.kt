@@ -104,6 +104,10 @@ class WebRTCManager(private val context: Context) {
     private var frontCameraFormats: List<Size> = emptyList()
     private var backMaxFps: Int = 30
     private var frontMaxFps: Int = 30
+    // 🔥 每个分辨率各自支持的最大采集帧率（key=分辨率, value=该分辨率下的最高fps）
+    //    用于“相同/接近分辨率时 60fps 优先”的选档策略：只有当没有 60fps 选项时才退回 30fps。
+    private var backSizeMaxFps: Map<Size, Int> = emptyMap()
+    private var frontSizeMaxFps: Map<Size, Int> = emptyMap()
     
     // 预览渲染器
     private var localRenderer: SurfaceViewRenderer? = null
@@ -242,27 +246,42 @@ class WebRTCManager(private val context: Context) {
                 val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
                 
                 // 获取支持的分辨率列表
-                val sizes = map.getOutputSizes(android.graphics.ImageFormat.YUV_420_888)
+                val imageFormat = android.graphics.ImageFormat.YUV_420_888
+                val sizes = map.getOutputSizes(imageFormat)
                     ?.toList()
                     ?.sortedByDescending { it.width * it.height }
                     ?: emptyList()
                 
-                // 获取最大FPS
+                // 摄像头整机最大FPS（AE 帧率区间上界）
                 val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                val maxFps = fpsRanges?.maxOfOrNull { it.upper } ?: 30
+                val aeMaxFps = fpsRanges?.maxOfOrNull { it.upper } ?: 30
+                
+                // 🔥 逐分辨率计算“该分辨率支持的最大帧率”：
+                //    fps = 1e9 / getOutputMinFrameDuration(nanos)。再与 AE 区间上界取 min，避免超过传感器实际可达帧率。
+                val sizeMaxFps = HashMap<Size, Int>()
+                for (s in sizes) {
+                    val perSize = try {
+                        val minDurNs = map.getOutputMinFrameDuration(imageFormat, s)
+                        if (minDurNs > 0) (1_000_000_000.0 / minDurNs).toInt() else aeMaxFps
+                    } catch (_: Exception) { aeMaxFps }
+                    // 与整机 AE 上界取 min（部分机型 minFrameDuration 给出的理论值高于实际可用 AE 帧率）
+                    sizeMaxFps[s] = minOf(perSize, aeMaxFps).coerceAtLeast(1)
+                }
                 
                 when (facing) {
                     CameraCharacteristics.LENS_FACING_BACK -> {
                         backCameraFormats = sizes
-                        backMaxFps = maxFps
-                        Log.d(TAG, "📷 后置摄像头: ${sizes.size}种分辨率, 最大${maxFps}fps")
-                        sizes.take(5).forEach { Log.d(TAG, "   ${it.width}x${it.height}") }
+                        backMaxFps = aeMaxFps
+                        backSizeMaxFps = sizeMaxFps
+                        Log.d(TAG, "📷 后置摄像头: ${sizes.size}种分辨率, 整机最大${aeMaxFps}fps")
+                        sizes.take(8).forEach { Log.d(TAG, "   ${it.width}x${it.height} @最大${sizeMaxFps[it]}fps") }
                     }
                     CameraCharacteristics.LENS_FACING_FRONT -> {
                         frontCameraFormats = sizes
-                        frontMaxFps = maxFps
-                        Log.d(TAG, "📷 前置摄像头: ${sizes.size}种分辨率, 最大${maxFps}fps")
-                        sizes.take(5).forEach { Log.d(TAG, "   ${it.width}x${it.height}") }
+                        frontMaxFps = aeMaxFps
+                        frontSizeMaxFps = sizeMaxFps
+                        Log.d(TAG, "📷 前置摄像头: ${sizes.size}种分辨率, 整机最大${aeMaxFps}fps")
+                        sizes.take(8).forEach { Log.d(TAG, "   ${it.width}x${it.height} @最大${sizeMaxFps[it]}fps") }
                     }
                 }
             }
@@ -274,12 +293,19 @@ class WebRTCManager(private val context: Context) {
     /**
      * 🔥 从摄像头支持列表中选择最接近目标的分辨率
      * 避免请求不支持的分辨率导致崩溃
+     *
+     * 选档策略（用户要求：相同/接近分辨率时高帧率优先）：
+     *   1. 先在“能达到 desiredFps（默认 60）的分辨率”里，选面积最接近目标的；
+     *   2. 只有当没有任何分辨率支持 desiredFps 时，才在全体候选里选面积最接近的（此时可能只有 30fps）。
+     * 这样避免了“选到最接近但只支持 30fps 的分辨率、而旁边有个能跑 60fps 的近似分辨率被忽略”的问题。
      */
     private fun findBestResolution(
         formats: List<Size>,
         targetWidth: Int,
         targetHeight: Int,
-        aspectRatio: Double? = null  // null=不限，16/9=16:9，4/3=4:3
+        aspectRatio: Double? = null,  // null=不限，16/9=16:9，4/3=4:3
+        sizeMaxFps: Map<Size, Int> = emptyMap(),
+        desiredFps: Int = 60
     ): Size {
         if (formats.isEmpty()) return Size(targetWidth, targetHeight)
         
@@ -293,11 +319,17 @@ class WebRTCManager(private val context: Context) {
             formats
         }
         
-        // 选择最接近目标面积的分辨率
         val targetArea = targetWidth * targetHeight
-        return candidates.minByOrNull {
-            Math.abs(it.width * it.height - targetArea)
-        } ?: Size(targetWidth, targetHeight)
+        val nearestByArea: (List<Size>) -> Size? = { list ->
+            list.minByOrNull { Math.abs(it.width * it.height - targetArea) }
+        }
+        
+        // 🔥 第一优先级：能跑 desiredFps 的分辨率里，选面积最接近目标的
+        val highFpsCandidates = candidates.filter { (sizeMaxFps[it] ?: 30) >= desiredFps }
+        nearestByArea(highFpsCandidates)?.let { return it }
+        
+        // 回退：没有任何分辨率支持 desiredFps，则在全体候选里选面积最接近的
+        return nearestByArea(candidates) ?: Size(targetWidth, targetHeight)
     }
     
     // MARK: - 🔥 动态计算档位配置
@@ -314,45 +346,53 @@ class WebRTCManager(private val context: Context) {
     private fun calculateLadder(front: Boolean) {
         val formats = if (front) frontCameraFormats else backCameraFormats
         val maxFps = if (front) frontMaxFps else backMaxFps
+        val sizeMaxFps = if (front) frontSizeMaxFps else backSizeMaxFps
         
-        val safeFps60 = minOf(60, maxFps)
-        // 🔥 发热优化：采集帧率不超过推流帧率上限(maxPushFps=60)。
-        //    此前 ultra 档按设备能力采集到 240/120fps，但推流最高只有 60fps，
-        //    多出的帧在 ISP/传感器/纹理管线里“空转”后被直接丢弃，是 Android 端主要发热来源之一。
-        //    采集帧率与推流上限对齐后，画质/流畅度无损（推流仍是 60fps），但 SoC 功耗显著下降。
+        // 🔥 采集目标帧率：60fps 标准。每档实际采集帧率 = min(60, 该分辨率支持的最大fps, 整机maxFps)。
+        //    发热优化：采集帧率不超过推流帧率上限(maxPushFps=60)。此前 ultra 档按设备能力采集到 240/120fps，
+        //    但推流最高只有 60fps，多出的帧在 ISP/传感器/纹理管线里“空转”后被直接丢弃，是 Android 端主要发热来源之一。
         //    注：慢门/快门(cjfps)由 SENSOR_EXPOSURE_TIME 单独控制，不依赖高采集帧率。
-        val ultraFps = minOf(60, maxFps)
+        val desiredFps = 60
         
         // 每档独立按 iOS 目标分辨率就近选取设备实际采集分辨率（直接采集，scaleDown=1.0）
+        // 🔥 选档时“60fps 优先”：优先在能跑 60fps 的分辨率里就近选，没有 60 才退回 30。
         fun nearest(profile: LadderProfile): Size {
             val (tw, th, is169) = iosTargets[profile]!!
-            return findBestResolution(formats, tw, th, if (is169) 16.0 / 9.0 else 4.0 / 3.0)
+            return findBestResolution(
+                formats, tw, th,
+                if (is169) 16.0 / 9.0 else 4.0 / 3.0,
+                sizeMaxFps, desiredFps
+            )
         }
+        // 🔥 该分辨率实际可用采集帧率：min(60, 分辨率支持fps, 整机maxFps)
+        fun fpsFor(size: Size): Int =
+            minOf(desiredFps, sizeMaxFps[size] ?: maxFps, maxFps).coerceAtLeast(1)
+        
         val p4kCap = nearest(LadderProfile.P4K)
         val highCap = nearest(LadderProfile.HIGH)
         val stdCap = nearest(LadderProfile.STANDARD)
         val ultraCap = nearest(LadderProfile.ULTRA)
         
-        // 🔥 4档预设：width/height=就近采集分辨率，scaleDown=1.0（直接采集到目标，不缩放）
+        // 🔥 4档预设：width/height=就近采集分辨率，fps=该分辨率实际可用帧率(60优先)，scaleDown=1.0（直接采集不缩放）
         currentLadder = mapOf(
             LadderProfile.P4K to LadderPreset(
                 width = p4kCap.width, height = p4kCap.height,
-                fps = safeFps60, maxKbps = 7500, minKbps = 4500,
+                fps = fpsFor(p4kCap), maxKbps = 7500, minKbps = 4500,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.HIGH to LadderPreset(
                 width = highCap.width, height = highCap.height,
-                fps = safeFps60, maxKbps = 5500, minKbps = 3300,
+                fps = fpsFor(highCap), maxKbps = 5500, minKbps = 3300,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.STANDARD to LadderPreset(
                 width = stdCap.width, height = stdCap.height,
-                fps = safeFps60, maxKbps = 4500, minKbps = 2700,
+                fps = fpsFor(stdCap), maxKbps = 4500, minKbps = 2700,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.ULTRA to LadderPreset(
                 width = ultraCap.width, height = ultraCap.height,
-                fps = ultraFps, maxKbps = 5500, minKbps = 3300,
+                fps = fpsFor(ultraCap), maxKbps = 5500, minKbps = 3300,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = true
             )
         )
@@ -362,11 +402,12 @@ class WebRTCManager(private val context: Context) {
         
         val cameraType = if (front) "前置" else "后置"
         Log.d(TAG, "═══════════════════════════════════════════")
-        Log.d(TAG, "📐 $cameraType 4档（iOS目标 → 设备就近采集，设备最大FPS=$maxFps）：")
+        Log.d(TAG, "📐 $cameraType 4档（iOS目标 → 设备就近采集[60fps优先]，整机最大FPS=$maxFps）：")
         currentLadder.forEach { (profile, preset) ->
             val (tw, th, is169) = iosTargets[profile]!!
             val ratio = if (is169) "16:9" else "4:3"
-            Log.d(TAG, "   ${profileName(profile)}[$ratio] iOS目标${tw}x${th} → 实采${preset.width}x${preset.height} @${preset.fps}fps → ${preset.minKbps}-${preset.maxKbps}kbps")
+            val capMax = sizeMaxFps[Size(preset.width, preset.height)] ?: maxFps
+            Log.d(TAG, "   ${profileName(profile)}[$ratio] iOS目标${tw}x${th} → 实采${preset.width}x${preset.height} @${preset.fps}fps(该分辨率上限${capMax}fps) → ${preset.minKbps}-${preset.maxKbps}kbps")
         }
         Log.d(TAG, "═══════════════════════════════════════════")
     }
