@@ -53,6 +53,13 @@ class WebRTCManager(private val context: Context) {
         private const val TAG = "WebRTCManager"
         private const val VIDEO_TRACK_ID = "video0"
         private const val STREAM_ID = "s0"
+
+        // 🔥 关键帧节奏参数
+        private const val NORMAL_KEYFRAME_MS = 1000L          // 平稳时：1s 一次
+        private const val FAST_KEYFRAME_MIN_MS = 100L         // 快速窗口下限：0.1s（用户要求 0.1~0.5s）
+        private const val FAST_KEYFRAME_MAX_MS = 500L         // 快速窗口上限：0.5s
+        private const val FAST_KEYFRAME_STEADY_MS = 300L      // 快速窗口稳态节拍：0.3s（范围中值）
+        private const val FAST_KEYFRAME_WINDOW_MS = 1200L     // 单次运动突增后维持快速节奏的时长
     }
     
     // WebRTC 核心组件
@@ -169,7 +176,10 @@ class WebRTCManager(private val context: Context) {
             true   // 启用H264高Profile
         )
         // 🎨 颜色管线对标 iOS：包一层，仅在关键帧给 H264 SPS 补 BT.709+full-range 的 VUI
-        val encoderFactory = ColorTaggingVideoEncoderFactory(baseEncoderFactory)
+        // 🔥 同时接入“运动突增”回调：大范围拖动导致 P 帧字节数突增时，进入快速关键帧窗口（0.1~0.5s）修复花屏
+        val encoderFactory = ColorTaggingVideoEncoderFactory(baseEncoderFactory) {
+            onEncoderMotionSurge()
+        }
         val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
         
         peerConnectionFactory = PeerConnectionFactory.builder()
@@ -846,16 +856,48 @@ class WebRTCManager(private val context: Context) {
     
     // MARK: - 关键帧
     
+    // 🔥 关键帧节奏：平稳时 1s 一次；检测到大范围运动(拖动)时进入“快速关键帧窗口”，
+    //    间隔缩短到 [FAST_KEYFRAME_MIN_MS, FAST_KEYFRAME_MAX_MS]（0.1~0.5s），修复花屏后自动恢复。
+    @Volatile private var fastKeyframeUntilMs: Long = 0L   // 快速窗口截止时间戳(ms)
+    @Volatile private var lastKeyframeAtMs: Long = 0L      // 上次发关键帧时间戳(ms)
+
     private fun startKeyframeTimer() {
         keyframeJob?.cancel()
+        fastKeyframeUntilMs = 0L
+        lastKeyframeAtMs = 0L
         keyframeJob = scope.launch {
             while (isActive) {
-                delay(1000)
-                forceKeyframe()
+                val now = System.currentTimeMillis()
+                val inFastWindow = now < fastKeyframeUntilMs
+                // 快速窗口内用较短间隔(稳态节拍钳制在 0.1~0.5s 内，配合突增即时触发)，
+                // 平稳时 1s。轮询步进用最小间隔，保证快速窗口的时间精度。
+                val targetInterval = if (inFastWindow)
+                    FAST_KEYFRAME_STEADY_MS.coerceIn(FAST_KEYFRAME_MIN_MS, FAST_KEYFRAME_MAX_MS)
+                else NORMAL_KEYFRAME_MS
+                if (now - lastKeyframeAtMs >= targetInterval) {
+                    forceKeyframe()
+                    lastKeyframeAtMs = now
+                }
+                delay(if (inFastWindow) FAST_KEYFRAME_MIN_MS else NORMAL_KEYFRAME_MS)
             }
         }
     }
-    
+
+    /**
+     * 🔥 编码器检测到运动突增（大范围拖动）时调用：立即补一帧关键帧并开启快速关键帧窗口。
+     * 由编码线程回调，这里只做轻量标记 + 一次 forceKeyframe，不阻塞。
+     */
+    private fun onEncoderMotionSurge() {
+        val now = System.currentTimeMillis()
+        fastKeyframeUntilMs = now + FAST_KEYFRAME_WINDOW_MS
+        // 距上次关键帧已超过快速下限则立刻补一帧（避免与定时器重复过密）。
+        // 本方法由编码线程回调，故补帧切到 scope 执行，避免在编码线程直接改 sender.parameters。
+        if (now - lastKeyframeAtMs >= FAST_KEYFRAME_MIN_MS) {
+            lastKeyframeAtMs = now
+            scope.launch { forceKeyframe() }
+        }
+    }
+
     fun forceKeyframe() {
         val sender = videoSender ?: return
         val params = sender.parameters

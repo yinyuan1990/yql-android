@@ -544,3 +544,72 @@ WebRTCManager.kt
 - 🔴 **真机确认**：Galaxy S25 等推流，看日志 `实采WxH @Nfps(该分辨率上限Mfps)` —— 各档是否已优先落到 60fps；仅在设备该比例确无 60fps 分辨率时才为 30fps。
 - ⚠️ 个别机型 `getOutputMinFrameDuration` 返回的理论帧率可能高于实际可达（已与 AE 上界取 min 兜底）；若某档申请 60 但采集实际达不到，可在真机日志进一步收紧。
 - 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。
+
+---
+
+## 十三、2026-07-01 运动自适应关键帧：大范围拖动花屏修复（下一棒必读）
+
+> **用户反馈**：「Android 在大范围拖动过程中花屏，增加关键帧的发送 0.1 到 0.5 秒。」
+
+### 13.1 问题与思路
+
+大范围拖动 = 画面剧烈运动 → 帧间预测(P 帧)残差大，一旦丢包/参考帧受损，解码端在下一个关键帧到来前会持续花屏。此前关键帧固定 **1s 一次**，运动期间恢复太慢。
+
+诉求：运动期间把关键帧间隔缩短到 **0.1~0.5s**。为兼顾**低发热原则**（平稳时不该白发关键帧），采用**运动自适应**：只有检测到大范围运动时才加密关键帧，平稳时仍 1s。
+
+### 13.2 实现方案（已完成）
+
+**运动检测**复用已有的 `ColorTaggingVideoEncoderFactory`（已包住编码回调），**零额外像素处理、低发热**：
+
+| 环节 | 说明 | 文件 |
+| --- | --- | --- |
+| **P 帧字节数突增检测** | 编码回调里对 **P 帧(Delta)** 字节数维护指数滑动基线(EMA)；当某 P 帧字节数 > 基线 × `SURGE_RATIO`(2.2) 时判为大范围运动，触发 `onMotionSurge` 回调。关键帧本身字节大，不参与判断。带 120ms 节流避免每帧回调 | `ColorTaggingVideoEncoderFactory.kt` → `H264ColorTagEncoder.detectMotionSurge()` |
+| **快速关键帧窗口** | `WebRTCManager` 收到突增：① 立即补一帧关键帧；② 开启 `FAST_KEYFRAME_WINDOW_MS`(1.2s) 快速窗口。窗口内关键帧节拍缩短到 **0.1~0.5s**（稳态节拍 0.3s，钳制在 [MIN=100ms, MAX=500ms])，窗口过后自动恢复 1s | `WebRTCManager.kt` → `onEncoderMotionSurge()` / `startKeyframeTimer()` |
+| **线程安全** | 突增回调在编码线程，补帧切到 `scope`(IO) 执行，避免在编码线程直接改 `sender.parameters` | `WebRTCManager.kt` |
+
+**关键帧参数**（`WebRTCManager` companion）：
+
+```
+NORMAL_KEYFRAME_MS       = 1000  平稳节拍
+FAST_KEYFRAME_MIN_MS     = 100   快速下限 0.1s
+FAST_KEYFRAME_MAX_MS     = 500   快速上限 0.5s
+FAST_KEYFRAME_STEADY_MS  = 300   快速窗口稳态节拍(范围中值)
+FAST_KEYFRAME_WINDOW_MS  = 1200  单次突增维持快速节奏时长
+```
+
+**运动检测参数**（`H264ColorTagEncoder` companion）：
+
+```
+SURGE_RATIO            = 2.2   P帧字节 > 基线×2.2 判为运动
+EMA_ALPHA              = 0.2   基线平滑系数
+SURGE_MIN_INTERVAL_NS  = 120ms 突增回调节流
+```
+
+### 13.3 改动文件
+
+| 文件 | 操作 | 摘要 |
+| --- | --- | --- |
+| `manager/ColorTaggingVideoEncoderFactory.kt` | 修改 | 工厂新增 `onMotionSurge` 回调参数；`H264ColorTagEncoder` 加 P 帧字节数 EMA 基线突增检测(`detectMotionSurge`) + 节流 |
+| `manager/WebRTCManager.kt` | 修改 | `initialize()` 构造工厂时传入 `onEncoderMotionSurge`；关键帧定时器改为动态节拍(平稳 1s / 快速 0.1~0.5s)；新增 `onEncoderMotionSurge()` 与关键帧节奏常量 |
+| `docs/PROGRESS.md` | 修改 | 本节 |
+
+### 13.4 关键代码位置
+
+```
+ColorTaggingVideoEncoderFactory.kt
+  ├── ColorTaggingVideoEncoderFactory(delegate, onMotionSurge)
+  └── H264ColorTagEncoder.detectMotionSurge()   P帧EMA基线 + 突增回调(节流)
+
+WebRTCManager.kt
+  ├── companion: NORMAL/FAST_KEYFRAME_* 常量
+  ├── initialize()  ~L172   ColorTaggingVideoEncoderFactory{ onEncoderMotionSurge() }
+  ├── startKeyframeTimer()   动态节拍：inFastWindow ? 0.1~0.5s : 1s
+  └── onEncoderMotionSurge() 立即补帧 + 开 1.2s 快速窗口(scope 执行)
+```
+
+### 13.5 待验证 / 可调项（下一棒 / 真机）
+
+- 🔴 **真机确认**：大范围拖动时看是否明显减少花屏、恢复更快；日志可加 tag 观察 `onEncoderMotionSurge` 触发频率。
+- ⚠️ **灵敏度调参**：若误触发过多（普通轻微运动也进快速窗口）→ 调高 `SURGE_RATIO`；若拖动仍偶发花屏 → 调低 `SURGE_RATIO` 或延长 `FAST_KEYFRAME_WINDOW_MS`、缩短稳态节拍。
+- ⚠️ **发热权衡**：快速窗口只在运动时短暂开启，稳态仍 1s，对发热影响有限；若持续大运动场景发热敏感，可上调 `FAST_KEYFRAME_STEADY_MS`。
+- 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。
