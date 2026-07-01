@@ -54,12 +54,8 @@ class WebRTCManager(private val context: Context) {
         private const val VIDEO_TRACK_ID = "video0"
         private const val STREAM_ID = "s0"
 
-        // 🔥 关键帧节奏参数
-        private const val NORMAL_KEYFRAME_MS = 1000L          // 平稳时：1s 一次
-        private const val FAST_KEYFRAME_MIN_MS = 100L         // 快速窗口下限：0.1s（用户要求 0.1~0.5s）
-        private const val FAST_KEYFRAME_MAX_MS = 500L         // 快速窗口上限：0.5s
-        private const val FAST_KEYFRAME_STEADY_MS = 300L      // 快速窗口稳态节拍：0.3s（范围中值）
-        private const val FAST_KEYFRAME_WINDOW_MS = 1200L     // 单次运动突增后维持快速节奏的时长
+        // 🔥 关键帧节奏参数（2026-07-02 起仅按需触发，周期/快速窗口策略已删，见「关键帧」小节）
+        private const val REQUEST_KEYFRAME_MIN_INTERVAL_MS = 1000L  // 观看端 request_keyframe 节流
     }
     
     // WebRTC 核心组件
@@ -604,8 +600,10 @@ class WebRTCManager(private val context: Context) {
                             onConnectionStateChanged?.invoke("推流中")
                         }
                         
-                        // Step 8: 启动定时器
-                        startKeyframeTimer()
+                        // Step 8: 启动统计定时器
+                        // 🔥 2026-07-02 卡顿根因修复：不再启动周期关键帧定时器（原每 1s 强刷一个 IDR）。
+                        //    libwebrtc 会自动响应观看端 RTCP PLI 出关键帧，SRS gop_cache 负责新进观众；
+                        //    周期大 IDR + 运动突增 0.3s 连发会瞬间打满上行 → 后续帧攒批 → PC 端 mediaGap 尖峰（nh.txt 坐实）。
                         startStats()
                         
                         println("jfh [推流] ✅✅✅ 推流成功! ✅✅✅")
@@ -858,49 +856,18 @@ class WebRTCManager(private val context: Context) {
     
     // MARK: - 关键帧
     
-    // 🔥 关键帧节奏：平稳时 1s 一次；检测到大范围运动(拖动)时进入“快速关键帧窗口”，
-    //    间隔缩短到 [FAST_KEYFRAME_MIN_MS, FAST_KEYFRAME_MAX_MS]（0.1~0.5s），修复花屏后自动恢复。
-    @Volatile private var fastKeyframeUntilMs: Long = 0L   // 快速窗口截止时间戳(ms)
-    @Volatile private var lastKeyframeAtMs: Long = 0L      // 上次发关键帧时间戳(ms)
-
-    private fun startKeyframeTimer() {
-        keyframeJob?.cancel()
-        fastKeyframeUntilMs = 0L
-        lastKeyframeAtMs = 0L
-        keyframeJob = scope.launch {
-            while (isActive) {
-                val now = System.currentTimeMillis()
-                val inFastWindow = now < fastKeyframeUntilMs
-                // 快速窗口内用较短间隔(稳态节拍钳制在 0.1~0.5s 内，配合突增即时触发)，
-                // 平稳时 1s。轮询步进用最小间隔，保证快速窗口的时间精度。
-                val targetInterval = if (inFastWindow)
-                    FAST_KEYFRAME_STEADY_MS.coerceIn(FAST_KEYFRAME_MIN_MS, FAST_KEYFRAME_MAX_MS)
-                else NORMAL_KEYFRAME_MS
-                if (now - lastKeyframeAtMs >= targetInterval) {
-                    forceKeyframe()
-                    lastKeyframeAtMs = now
-                }
-                delay(if (inFastWindow) FAST_KEYFRAME_MIN_MS else NORMAL_KEYFRAME_MS)
-            }
-        }
-    }
+    // 🔥 2026-07-02 卡顿根因修复：删除「平稳 1s 一个 IDR + 运动突增 0.1~0.5s 连发」的周期关键帧策略。
+    //    该策略正是「每 5~15 秒卡 1~2 秒」的根因：大 IDR（P 帧 5~10 倍大）风暴瞬间打满上行
+    //    → 发送端攒帧 → 批量到达（PC nh.txt 中 gap≈mediaGap 的 PRESENT GAP 尖峰）。
+    //    关键帧改为纯按需：libwebrtc 自动响应观看端 RTCP PLI；PC WS 兜底走 applyRemoteConfig("request_keyframe")。
+    @Volatile private var fastKeyframeUntilMs: Long = 0L   // 已停用（保留供 meidui 日志 fastKF 字段，恒 false）
+    @Volatile private var lastKeyframeAtMs: Long = 0L      // 上次按需关键帧时间戳(ms)，用于 WS 请求节流
 
     /**
-     * 🔥 编码器检测到运动突增（大范围拖动）时调用：立即补一帧关键帧并开启快速关键帧窗口。
-     * 由编码线程回调，这里只做轻量标记 + 一次 forceKeyframe，不阻塞。
+     * 🔥 编码器检测到运动突增：仅记日志观测频率，不再触发快速关键帧窗口（已证实为攒帧元凶）。
      */
     private fun onEncoderMotionSurge() {
-        val now = System.currentTimeMillis()
-        // ⭐ [meidui 诊断] 运动突增→进入快速关键帧窗口（0.1-0.5s一个大IDR）。若卡顿时刻这行频繁出现，
-        //   高度指向"快速关键帧堵上行→攒帧"这条链。
-        Log.d("meidui", "MOTION_SURGE 进入快速关键帧窗口 ${FAST_KEYFRAME_WINDOW_MS}ms")
-        fastKeyframeUntilMs = now + FAST_KEYFRAME_WINDOW_MS
-        // 距上次关键帧已超过快速下限则立刻补一帧（避免与定时器重复过密）。
-        // 本方法由编码线程回调，故补帧切到 scope 执行，避免在编码线程直接改 sender.parameters。
-        if (now - lastKeyframeAtMs >= FAST_KEYFRAME_MIN_MS) {
-            lastKeyframeAtMs = now
-            scope.launch { forceKeyframe() }
-        }
+        Log.d("meidui", "MOTION_SURGE（快速关键帧窗口已停用，仅观测）")
     }
 
     fun forceKeyframe() {
@@ -1304,6 +1271,19 @@ class WebRTCManager(private val context: Context) {
             "applyWhiteBalance" -> {
                 val wb = (config["testWhiteBalance"] as? Number)
                 setWhiteBalance(wb?.toInt())   // 无值=锁定当前白平衡
+            }
+            
+            // 🔥 观看端(PC)兜底关键帧请求（CONFIG_UPDATE ptype=request_keyframe，与 iOS P0-1 一致）
+            //    这是周期 IDR 删除后的唯一应用层补帧入口，1s 节流防风暴。
+            "request_keyframe" -> {
+                val now = System.currentTimeMillis()
+                if (now - lastKeyframeAtMs >= REQUEST_KEYFRAME_MIN_INTERVAL_MS) {
+                    lastKeyframeAtMs = now
+                    forceKeyframe()
+                    Log.d(TAG, "🔑 [按需关键帧] 响应观看端 request_keyframe")
+                } else {
+                    Log.d(TAG, "⏭️ [按需关键帧] 距上次不足 ${REQUEST_KEYFRAME_MIN_INTERVAL_MS}ms，节流跳过")
+                }
             }
             
             else -> Log.w(TAG, "⚠️ 未知 ptype=$ptype，忽略")
