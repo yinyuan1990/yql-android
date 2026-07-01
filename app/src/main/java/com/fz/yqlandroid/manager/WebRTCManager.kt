@@ -891,6 +891,9 @@ class WebRTCManager(private val context: Context) {
      */
     private fun onEncoderMotionSurge() {
         val now = System.currentTimeMillis()
+        // ⭐ [meidui 诊断] 运动突增→进入快速关键帧窗口（0.1-0.5s一个大IDR）。若卡顿时刻这行频繁出现，
+        //   高度指向"快速关键帧堵上行→攒帧"这条链。
+        Log.d("meidui", "MOTION_SURGE 进入快速关键帧窗口 ${FAST_KEYFRAME_WINDOW_MS}ms")
         fastKeyframeUntilMs = now + FAST_KEYFRAME_WINDOW_MS
         // 距上次关键帧已超过快速下限则立刻补一帧（避免与定时器重复过密）。
         // 本方法由编码线程回调，故补帧切到 scope 执行，避免在编码线程直接改 sender.parameters。
@@ -1040,10 +1043,16 @@ class WebRTCManager(private val context: Context) {
     private var lastPacketsSent: Long = 0
     private var lastPacketsLost: Long = 0
     private var lastStatsTime: Long = 0
+    // ⭐ [meidui 诊断] 发送侧攒帧排查：编码/发送帧增量 + 上次日志时刻（每秒打一次）
+    private var lastFramesEncoded: Long = 0
+    private var lastFramesSent: Long = 0
+    private var lastMeiduiLogMs: Long = 0
+    private var lastNackCount: Long = 0
     
     private fun startStats() {
         statsJob?.cancel()
         lastBytesSent = 0; lastPacketsSent = 0; lastPacketsLost = 0; lastStatsTime = 0
+        lastFramesEncoded = 0; lastFramesSent = 0; lastMeiduiLogMs = 0; lastNackCount = 0
         
         statsJob = scope.launch {
             while (isActive) {
@@ -1054,12 +1063,23 @@ class WebRTCManager(private val context: Context) {
                     var packetsSent: Long = 0
                     var packetsLost: Long = 0
                     var roundTripTime: Double = 0.0
+                    // ⭐ [meidui 诊断] 发送侧攒帧关键字段
+                    var framesEncoded: Long = 0     // 累计编码帧数
+                    var framesSent: Long = 0        // 累计发送帧数
+                    var nackCount: Long = 0         // 收到的 NACK（对端要求重传）次数
+                    var qualityLimit = "-"          // 质量受限原因：none/bandwidth/cpu（=WebRTC 为什么降质）
+                    var totalPacketSendDelay = 0.0  // 累计发包排队延迟（秒）——攒帧时会飙升
                     
                     report.statsMap.values.forEach { stats ->
                         if (stats.type == "outbound-rtp") {
                             (stats.members["bytesSent"] as? Number)?.let { bytesSent = it.toLong() }
                             (stats.members["framesPerSecond"] as? Number)?.let { fps = it.toInt() }
                             (stats.members["packetsSent"] as? Number)?.let { packetsSent = it.toLong() }
+                            (stats.members["framesEncoded"] as? Number)?.let { framesEncoded = it.toLong() }
+                            (stats.members["framesSent"] as? Number)?.let { framesSent = it.toLong() }
+                            (stats.members["nackCount"] as? Number)?.let { nackCount = it.toLong() }
+                            (stats.members["totalPacketSendDelay"] as? Number)?.let { totalPacketSendDelay = it.toDouble() }
+                            (stats.members["qualityLimitationReason"] as? String)?.let { qualityLimit = it }
                         }
                         if (stats.type == "remote-inbound-rtp") {
                             (stats.members["packetsLost"] as? Number)?.let { packetsLost = it.toLong() }
@@ -1083,6 +1103,33 @@ class WebRTCManager(private val context: Context) {
                         val timeDelta = (System.currentTimeMillis() - lastStatsTime).toDouble() / 1000.0
                         if (timeDelta > 0) {
                             WebSocketManager.publishingKbps = ((bytesDelta * 8) / (timeDelta * 1000)).toInt()
+                        }
+                    }
+                    
+                    // ⭐ [meidui 诊断] 每秒打一行发送侧节奏：encFps=每秒编码帧、sentFps=每秒发送帧。
+                    //   若 sentFps 周期性掉到 0 再暴涨 = 发送端攒帧批量发（坐实卡顿源）；
+                    //   sendDelay 飙升 + qLimit=bandwidth = 上行带宽不足；nack 增量高 = 对端在要重传。
+                    run {
+                        val nowMs = System.currentTimeMillis()
+                        if (lastMeiduiLogMs > 0 && nowMs - lastMeiduiLogMs >= 1000) {
+                            val dt = (nowMs - lastMeiduiLogMs).toDouble() / 1000.0
+                            val encFps = if (dt > 0) ((framesEncoded - lastFramesEncoded) / dt).toInt() else 0
+                            val sentFps = if (dt > 0) ((framesSent - lastFramesSent) / dt).toInt() else 0
+                            val nackDelta = nackCount - lastNackCount
+                            val kbps = WebSocketManager.publishingKbps
+                            Log.d("meidui", "encFps=$encFps sentFps=$sentFps kbps=$kbps fpsStat=$fps " +
+                                    "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
+                                    "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
+                                    "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs}")
+                            lastFramesEncoded = framesEncoded
+                            lastFramesSent = framesSent
+                            lastNackCount = nackCount
+                            lastMeiduiLogMs = nowMs
+                        } else if (lastMeiduiLogMs == 0L) {
+                            lastFramesEncoded = framesEncoded
+                            lastFramesSent = framesSent
+                            lastNackCount = nackCount
+                            lastMeiduiLogMs = nowMs
                         }
                     }
                     
