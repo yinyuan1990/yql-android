@@ -1228,13 +1228,14 @@ class WebRTCManager(private val context: Context) {
                 }
             }
             
-            // 🔥 曝光（与iOS test_brightness/exposure一致）: EV 补偿
-            "exposure", "test_brightness" -> {
+            // 🔥 曝光/亮度（与iOS test_brightness/exposure/brightness一致）: EV 补偿
+            //    后端/UI 可能以 "brightness" 下发亮度调节，这里与曝光统一走 AE 补偿。
+            "exposure", "test_brightness", "brightness" -> {
                 val ev = (config["exposure"] as? Number)
                     ?: (config["testBrightness"] as? Number)
                     ?: (config["brightness"] as? Number)
                 if (ev != null) setExposure(ev.toFloat())
-                else Log.w(TAG, "⚠️ ptype=$ptype 缺少曝光值，忽略")
+                else Log.w(TAG, "⚠️ ptype=$ptype 缺少曝光/亮度值，忽略")
             }
             
             // 🔥 白平衡（与iOS white_balance/applyWhiteBalance一致）
@@ -1252,7 +1253,45 @@ class WebRTCManager(private val context: Context) {
             else -> Log.w(TAG, "⚠️ 未知 ptype=$ptype，忽略")
         }
     }
-    
+
+    /**
+     * 🔥 启动时一次性应用全部初始配置（对标 iOS applyThinRemoteConfigInit）
+     *
+     * 修复：此前启动只应用了 type/direction，导致 cjfps(快门)/zoom/focus/brightness/bitrate/fps
+     * 这些“滤镜/图像参数”在启动时没有挂上。现在这里逐项下发到硬件与编码器。
+     *
+     * 需在 startPreview() 之后调用（controlCapturer 已就绪；采集器内部对下发状态有缓存+重放兜底）。
+     */
+    fun applyInitialConfig(config: ThinRemoteConfig) {
+        Log.d(TAG, "📋 [初始配置] 应用全部初始参数: type=${config.type}, dir=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, bitrate=${config.bitrate}, focus=${config.focus}, brightness=${config.brightness}")
+
+        // 1) 档位（会更新采集分辨率/编码参数）
+        applyRemoteConfig(mapOf("ptype" to "type", "type" to config.type))
+
+        // 2) 摄像头方向
+        if (config.direction == "1" && !isFrontCamera) {
+            applyRemoteConfig(mapOf("ptype" to "direction", "direction" to "1"))
+        }
+
+        // 3) 变焦
+        applyRemoteConfig(mapOf("ptype" to "zoom", "zoom" to config.zoom))
+
+        // 4) 快门(cjfps) —— 用户反馈“启动时没挂上”，这里补齐
+        config.cjfps?.let { applyRemoteConfig(mapOf("ptype" to "cjfps", "cjfps" to it)) }
+
+        // 5) 对焦
+        config.focus?.let { applyRemoteConfig(mapOf("ptype" to "focus", "focus" to it)) }
+
+        // 6) 亮度/曝光
+        config.brightness?.let { applyRemoteConfig(mapOf("ptype" to "brightness", "brightness" to it)) }
+
+        // 7) 码率/清晰度百分比
+        config.bitrate?.let { applyRemoteConfig(mapOf("ptype" to "bitrate", "bitrate" to it)) }
+
+        // 8) 推送FPS
+        config.fps?.let { applyRemoteConfig(mapOf("ptype" to "fps", "fps" to it)) }
+    }
+
     /**
      * 处理特殊消息类型
      */
@@ -1374,18 +1413,34 @@ class WebRTCManager(private val context: Context) {
         val pushFps = backendFps / 4
         val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
         // 🌡️ 热控上限一并生效
-        val targetFps = minOf(pushFps, maxFps, thermalFpsCap)
+        val targetFps = minOf(pushFps, maxFps, thermalFpsCap).coerceAtLeast(1)
+        val fpsChanged = (targetFps != currentFps)
         currentFps = targetFps
-        
-        // 更新编码参数
-        val sender = videoSender ?: return
-        val params = sender.parameters
-        if (params.encodings.isNotEmpty()) {
-            params.encodings[0].maxFramerate = targetFps
-            sender.parameters = params
+
+        // 1) 更新编码器目标帧率（videoSender 可能在预览未推流时为 null，此时不 return，
+        //    仍继续更新采集侧，保证“fps 不反应”问题在预览阶段也能生效）
+        val sender = videoSender
+        if (sender != null) {
+            val params = sender.parameters
+            if (params.encodings.isNotEmpty()) {
+                params.encodings[0].maxFramerate = targetFps
+                sender.parameters = params
+            }
+        } else {
+            Log.d(TAG, "🎬 [FPS] videoSender 尚未就绪(预览中)，仅更新采集帧率")
         }
-        
-        Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 实际${targetFps}fps")
+
+        // 2) 🔥 同步采集侧帧率（此前只改编码器 maxFramerate，采集帧率不变 → 表现为“fps 不反应”）。
+        //    仅在帧率确有变化时下发 changeCaptureFormat（其内部会重开会话），避免相同值反复重开相机造成闪烁。
+        if (isPreviewRunning && fpsChanged) {
+            try {
+                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, targetFps)
+            } catch (e: Exception) {
+                Log.e(TAG, "同步采集帧率失败: ${e.message}")
+            }
+        }
+
+        Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 实际${targetFps}fps(采集+编码已同步, changed=$fpsChanged)")
     }
     
     /**

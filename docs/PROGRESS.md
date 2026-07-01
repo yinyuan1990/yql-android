@@ -613,3 +613,56 @@ WebRTCManager.kt
 - ⚠️ **灵敏度调参**：若误触发过多（普通轻微运动也进快速窗口）→ 调高 `SURGE_RATIO`；若拖动仍偶发花屏 → 调低 `SURGE_RATIO` 或延长 `FAST_KEYFRAME_WINDOW_MS`、缩短稳态节拍。
 - ⚠️ **发热权衡**：快速窗口只在运动时短暂开启，稳态仍 1s，对发热影响有限；若持续大运动场景发热敏感，可上调 `FAST_KEYFRAME_STEADY_MS`。
 - 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。
+
+---
+
+## 十四、2026-07-01 修复：滤镜参数不生效 / fps 不反应 / cjfps 启动没挂上（下一棒必读）
+
+> **用户反馈**：「滤镜参数没有作用；fps 也不反应；cjfps 快门启动的时候没挂上。」
+
+### 14.1 三个根因
+
+| 现象 | 根因 | 文件 |
+| --- | --- | --- |
+| **cjfps 启动没挂上 / 滤镜参数初始不生效** | 启动初始化只应用了 `type`+`direction`，**cjfps/zoom/focus/brightness/bitrate/fps 从未在启动时下发**（旧代码拼了 `profileMap` 却没用它） | `StreamingScreen.kt` 初始化 `LaunchedEffect` |
+| **brightness 实时下发被忽略** | `applyRemoteConfig` 的 `when` 只匹配 `exposure`/`test_brightness`，后端/UI 用 `brightness` 时落到 `else`(未知 ptype) | `WebRTCManager.applyRemoteConfig()` |
+| **fps 不反应** | `setTargetFps` ① `videoSender==null`(预览未推流) 时直接 `return`；② 只改编码器 `maxFramerate`，**从不改采集侧帧率** → 采集帧率恒定，表现为“fps 不反应” | `WebRTCManager.setTargetFps()` |
+
+> 说明：`Camera2ControlCapturer` 本身对 zoom/cjfps/focus/wb 等有“下发即缓存、重开会话时重放”的兜底，能力正确；问题出在**上层从未把初始值下发给它**，以及 fps 只走了编码器一侧。
+
+### 14.2 修复（已实现，对标 iOS applyThinRemoteConfigInit）
+
+| 修复 | 说明 | 文件 |
+| --- | --- | --- |
+| **新增 `applyInitialConfig(config)`** | 启动时一次性把 **type/direction/zoom/cjfps/focus/brightness/bitrate/fps** 全部逐项 `applyRemoteConfig` 下发（对标 iOS `applyThinRemoteConfigInit`）。cjfps 快门在此补齐 | `WebRTCManager.kt` |
+| **StreamingScreen 改用 `applyInitialConfig`** | 删除“拼了不用”的 `profileMap` 与只应用 type+direction 的旧逻辑；预览就绪(delay 800ms)后调用 `applyInitialConfig(config)` 全量应用 | `StreamingScreen.kt` |
+| **`brightness` ptype 接入** | `applyRemoteConfig` 的曝光分支扩展为 `"exposure","test_brightness","brightness"`，统一走 AE 曝光补偿 | `WebRTCManager.kt` |
+| **`setTargetFps` 双端同步** | ① `videoSender==null` 不再 `return`，改为仅提示并继续；② 新增 `changeCaptureFormat(w,h,targetFps)` 同步**采集侧**帧率；③ 仅在帧率确有变化时下发，避免相同值反复重开相机闪烁 | `WebRTCManager.kt` |
+
+### 14.3 改动文件
+
+| 文件 | 操作 | 摘要 |
+| --- | --- | --- |
+| `manager/WebRTCManager.kt` | 修改 | 新增 `applyInitialConfig()`；`applyRemoteConfig` 支持 `brightness`；`setTargetFps` 同步采集侧帧率+去除 null 早退+变更保护 |
+| `ui/screen/StreamingScreen.kt` | 修改 | 初始化改为预览就绪后 `applyInitialConfig(config)` 全量应用 |
+| `docs/PROGRESS.md` | 修改 | 本节 |
+
+### 14.4 关键代码位置
+
+```
+WebRTCManager.kt
+  ├── applyInitialConfig(config)   逐项下发 type/dir/zoom/cjfps/focus/brightness/bitrate/fps
+  ├── applyRemoteConfig()  "exposure","test_brightness","brightness" → setExposure
+  └── setTargetFps()       编码器 maxFramerate + changeCaptureFormat(采集侧) + 变更保护
+
+StreamingScreen.kt
+  └── 初始化 LaunchedEffect: delay(800) → webRTCManager.applyInitialConfig(config)
+```
+
+### 14.5 待验证 / 注意（下一棒 / 真机）
+
+- 🔴 **真机确认**：启动后 cjfps(快门)/zoom/focus/亮度是否已生效；后端实时下发 brightness、fps 是否即时反应。
+- ⚠️ **fps 采集侧重开代价**：`setTargetFps` 变化时会 `changeCaptureFormat`→重开相机会话（短暂黑帧）。已加“仅变化才下发”保护；若后端 fps 抖动频繁，可改为节流或只调编码器。
+- ⚠️ **brightness 语义**：当前把 brightness 当 AE 曝光补偿(EV)。若后端 brightness 实为 0~100 亮度百分比而非 EV，需要在 `setExposure` 前做量纲换算（对照后端定义）。
+- ⚠️ **cjfps 量纲**：后端 cjfps 直接作为快门 1/cjfps 秒(60~600)，与 iOS 一致；`setShutterSpeed` 内 `coerceIn(60,600)`。
+- 🔴 **编译**：Windows 无 SDK，需 Mac/Android Studio `./gradlew assembleDebug` 确认。

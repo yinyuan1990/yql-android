@@ -189,25 +189,14 @@ fun StreamingScreen(
             else -> "高清"
         }
         
-        // 应用初始配置到WebRTC（档位、摄像头方向等）
-        val profileMap = mapOf<String, Any>(
-            "ptype" to "type",
-            "type" to config.type,
-            "direction" to config.direction,
-            "zoom" to config.zoom,
-            "fps" to (config.fps ?: 120),
-            "cjfps" to (config.cjfps ?: 240),
-            "bitrate" to (config.bitrate ?: 100),
-            "focus" to (config.focus ?: 0.6f)
-        )
-        // 先应用档位
-        webRTCManager.applyRemoteConfig(mapOf("ptype" to "type", "type" to config.type, "fps" to (config.fps ?: 120)))
-        // 再应用摄像头方向
-        if (config.direction == "1") {
-            webRTCManager.applyRemoteConfig(mapOf("ptype" to "direction", "direction" to "1"))
-        }
-        
-        Log.d("StreamingScreen", "📋 初始配置已加载: type=${config.type}, direction=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}")
+        // 🔥 应用全部初始配置到WebRTC（对标 iOS applyThinRemoteConfigInit）：
+        //    档位/方向/变焦/快门(cjfps)/对焦/亮度/码率/FPS 一次性挂上。
+        //    此前只应用了 type+direction，导致 cjfps 等“滤镜/图像参数”启动时没生效。
+        //    延迟到预览就绪后应用，确保 controlCapturer 已创建（采集器对下发状态另有缓存+重放兜底）。
+        kotlinx.coroutines.delay(800)
+        webRTCManager.applyInitialConfig(config)
+
+        Log.d("StreamingScreen", "📋 初始配置已加载并全量应用: type=${config.type}, direction=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, focus=${config.focus}, brightness=${config.brightness}, bitrate=${config.bitrate}")
     }
     
     // 自动推流
