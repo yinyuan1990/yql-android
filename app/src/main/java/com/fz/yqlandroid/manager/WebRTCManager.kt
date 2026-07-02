@@ -1032,28 +1032,36 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
     }
     
-    // MARK: - 🔥 v2.1 自适应FPS（与iOS完全一致的算法）
+    // MARK: - 🔥 自适应FPS（2026-07-02 对齐 iOS 现行算法：档位阶梯切换 + 上限=后端下发目标）
     
     private var adaptiveFpsEnabled: Boolean = true
     private var adaptiveFps: Int = 30
     
-    // 参数（与iOS一致）
-    private val minAdaptiveFps: Int = 10          // 最低10fps
+    // ⭐ 后端/PC 下发的推送 FPS 目标（= iOS targetOutputFPS）。
+    //   【关键约束：自适应升帧上限 = 这个值】——网络好也只升回「当前设定的 fps」，
+    //   绝不超过 PC 设的目标（此前 Android 上限用 maxPushFps=60，PC 设 20fps 后
+    //   自适应能自己爬回 60，把后端指令顶掉，与 iOS 不一致）。
+    @Volatile private var targetOutputFps: Int = 30
+    
+    // 参数（与 iOS 现行值一致）
+    private val minAdaptiveFps: Int = 10          // setTargetFps 下限保护
     private val lossRateDownThreshold: Double = 0.03  // 3秒均值>3%降帧
     private val lossRateUpThreshold: Double = 0.005   // 3秒均值<0.5%升帧
     private val rttDownThreshold: Int = 300       // RTT>300ms差
-    private val rttUpThreshold: Int = 150         // RTT<150ms好
-    private val downgradeHoldSec: Int = 3         // 连续3秒差→降
-    private val upgradeHoldSec: Int = 8           // 连续8秒好→升
-    private val cooldownMs: Long = 3000           // 冷却3秒
-    private val fpsDownStep: Int = 5              // 降5fps
-    private val fpsUpStep: Int = 2                // 升2fps
+    private val rttUpThreshold: Int = 100         // RTT<100ms好（iOS=100，原Android=150）
+    private val downgradeHoldSec: Int = 1         // 连续1秒差→降（快速响应，iOS 同值）
+    private val upgradeHoldSec: Int = 3           // 连续3秒好→升（iOS 同值）
+    private val cooldownAfterDownMs: Long = 1000  // 降帧后冷却1秒（iOS 同值）
+    private val cooldownAfterUpMs: Long = 2000    // 升帧后冷却2秒（iOS 同值）
+    // ⭐ 帧率档位表（iOS §21.5 加密阶梯）：直接切档不逐步微调，每步降幅≤1/3，弱网过渡平滑
+    private val fpsLadder: IntArray = intArrayOf(60, 45, 30, 24, 20, 15)
     
     // 状态
     private val lossRateHistory = mutableListOf<Double>()
     private var highLossCounter: Int = 0
     private var lowLossCounter: Int = 0
     private var lastFpsChangeTime: Long = 0
+    private var lastFpsDirectionDown: Boolean = true  // 上次变更方向（决定冷却时长）
     private var lastAdaptiveProcessTime: Long = 0
     private var lastRemoteFpsTime: Long = 0
     private var lastNotifiedFps: Int = 0
@@ -1071,17 +1079,19 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // 后端指令生效中，暂停
         if (now - lastRemoteFpsTime < 1000) return
         
-        // 冷却期检查
-        if (now - lastFpsChangeTime < cooldownMs) return
+        // 冷却期检查（iOS：降帧后冷却1秒 / 升帧后冷却2秒）
+        val cooldown = if (lastFpsDirectionDown) cooldownAfterDownMs else cooldownAfterUpMs
+        if (now - lastFpsChangeTime < cooldown) return
         
         // 3秒移动平均丢包率
         lossRateHistory.add(instantLossRate)
         if (lossRateHistory.size > 3) lossRateHistory.removeAt(0)
         val avgLoss = lossRateHistory.average()
         
-        // 🌡️ 自适应升帧上限同时受热控约束，避免降温前又升回高帧
-        val maxFps = minOf(currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
-        // 上限被收紧（热控/切档）时先静默对齐基准：编码器帧率已由收紧方写入，
+        // ⭐ 升帧上限 = 后端下发目标 fps（iOS maxFps=targetOutputFPS，即「当前设定的 fps」），
+        //   再叠加档位推流上限与热控约束——网络再好也只升回设定值，不顶掉后端指令
+        val maxFps = minOf(targetOutputFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        // 上限被收紧（热控/切档/后端调低）时先静默对齐基准：编码器帧率已由收紧方写入，
         // 这里只同步 adaptiveFps，防止升帧分支打出「30→20fps」的假升帧
         if (adaptiveFps > maxFps) adaptiveFps = maxFps
         
@@ -1104,11 +1114,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             highLossCounter++
             lowLossCounter = 0
             if (highLossCounter >= downgradeHoldSec) {
-                val newFps = maxOf(minAdaptiveFps, adaptiveFps - fpsDownStep)
+                // ⭐ iOS 阶梯降帧：切到下一档（60→45→30→24→20→15），不再 -5 逐步微调
+                val newFps = fpsLadder.firstOrNull { it < adaptiveFps } ?: fpsLadder.last()
                 if (newFps != adaptiveFps) {
                     adaptiveFps = newFps
                     fpsChanged = true
                     lastFpsChangeTime = now
+                    lastFpsDirectionDown = true
                     Log.d(TAG, "⬇️ [降帧] $oldFps→${adaptiveFps}fps (RTT=${rttMs}ms 丢包=${String.format("%.1f", avgLoss * 100)}%)")
                     Log.d("meidui", "⚠️ fps修改源=自适应降帧 $oldFps→${adaptiveFps}fps")
                 }
@@ -1118,13 +1130,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             lowLossCounter++
             highLossCounter = 0
             if (lowLossCounter >= upgradeHoldSec) {
-                val newFps = minOf(maxFps, adaptiveFps + fpsUpStep)
-                if (newFps != adaptiveFps) {
+                // ⭐ iOS 阶梯升帧：切到上一档，且【封顶 maxFps=后端下发目标】（网络好也不超过设定值）
+                val newFps = minOf(maxFps, fpsLadder.lastOrNull { it > adaptiveFps } ?: fpsLadder.first())
+                if (newFps != adaptiveFps && newFps > adaptiveFps) {
                     adaptiveFps = newFps
                     fpsChanged = true
                     lastFpsChangeTime = now
-                    Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps, RTT=${rttMs}ms)")
-                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps")
+                    lastFpsDirectionDown = false
+                    Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps=后端目标, RTT=${rttMs}ms)")
+                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps (上限$maxFps)")
                 }
                 lowLossCounter = 0
             }
@@ -1715,6 +1729,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun setTargetFps(backendFps: Int) {
         val pushFps = backendFps / 4
         val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
+        // ⭐ 记录后端目标（= iOS targetOutputFPS）：自适应升帧的封顶值。
+        //   不含热控（热控是动态约束，在升帧上限处另行叠加，降温后自动放开）
+        targetOutputFps = minOf(pushFps, maxFps).coerceAtLeast(minAdaptiveFps)
         // 🌡️ 热控上限一并生效
         val targetFps = minOf(pushFps, maxFps, thermalFpsCap).coerceAtLeast(1)
         val fpsChanged = (targetFps != currentFps)
