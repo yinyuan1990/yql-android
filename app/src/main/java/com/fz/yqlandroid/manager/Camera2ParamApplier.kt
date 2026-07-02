@@ -6,6 +6,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.RggbChannelVector
 import android.os.Build
 import android.os.Handler
@@ -46,6 +48,28 @@ object Camera2ParamApplier {
         val targetFps: Int? = null         // 🔥 钉死 AE 帧率区间 [fps,fps]，防低光自动砍半(30→15)
     )
 
+    // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
+    //    exp=实际曝光时间 frameDur=实际帧间隔(33ms=30fps/66ms=15fps) aeRange=生效AE区间 iso=增益。
+    private var diagFrameCount = 0L
+    private val diagCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            if (diagFrameCount++ % 150 != 0L) return
+            try {
+                val expMs = (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: -1L) / 1_000_000.0
+                val durMs = (result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: -1L) / 1_000_000.0
+                val aeRange = request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
+                val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: -1
+                val aeMode = result.get(CaptureResult.CONTROL_AE_MODE) ?: -1
+                Log.d("meidui", "cam exp=${"%.1f".format(expMs)}ms frameDur=${"%.1f".format(durMs)}ms" +
+                        " (≈${if (durMs > 0) (1000.0 / durMs).toInt() else -1}fps) aeRange=$aeRange iso=$iso aeMode=$aeMode")
+            } catch (_: Throwable) { /* 诊断绝不影响推流 */ }
+        }
+    }
+
     /**
      * 反射取原生 session 句柄并应用参数（一次 setRepeatingRequest）。
      * @return true=已下发；false=反射失败/会话未就绪（已安全忽略）
@@ -80,8 +104,10 @@ object Camera2ParamApplier {
             applyZoom(builder, characteristics, p)
             applyWhiteBalance(builder, characteristics, p)
 
-            // 3) 一次性下发（不常驻循环）
-            captureSession.setRepeatingRequest(builder.build(), null, handler)
+            // 3) 一次性下发（不常驻循环）。
+            //    ⭐ [meidui 诊断] 挂 CaptureCallback 打印硬件真实曝光/帧间隔/AE区间：
+            //    frameDur≈66ms=相机自己降到15fps（低光AE）；≈33ms=相机正常30fps、问题在采集之后。
+            captureSession.setRepeatingRequest(builder.build(), diagCallback, handler)
             Log.d(TAG, "✅ 参数已注入(原生session): ev=${p.exposureEv} focus=${p.focus} zoom=${p.zoom} cjfps=${p.shutterCjfps} wb=${p.whiteBalanceSlider}/${p.whiteBalanceLocked}")
             true
         } catch (e: Throwable) {
@@ -140,7 +166,8 @@ object Camera2ParamApplier {
                 .maxWithOrNull(compareBy({ it.lower }, { -it.upper }))
             if (best != null) {
                 b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(best.lower, best.upper))
-                Log.d(TAG, "🎞️ AE帧率区间钉死: 目标${fps}fps → [${best.lower},${best.upper}]")
+                Log.d("meidui", "🎞️ AE帧率区间钉死: 目标${fps}fps → [${best.lower},${best.upper}] " +
+                        "(可用: ${ranges.joinToString()})")
             }
         } catch (e: Exception) {
             Log.w(TAG, "fpsRange 写入失败: ${e.message}")

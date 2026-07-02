@@ -214,6 +214,7 @@ class WebRTCManager(private val context: Context) {
         val targetFps = minOf(baseFps, thermalFpsCap)
         val targetKbps = maxOf(300, (baseMaxKbps * thermalBitrateScale).toInt())
         Log.d(TAG, "🌡️ [热控] $level → fps≤$targetFps, 码率≤${targetKbps}kbps (base ${baseFps}fps/${baseMaxKbps}kbps)")
+        Log.d("meidui", "⚠️ fps修改源=热控 $level → fps≤$targetFps")
 
         // 1) 编码参数（帧率 + 码率）立即生效，平滑无重建
         currentFps = targetFps
@@ -489,7 +490,18 @@ class WebRTCManager(private val context: Context) {
                 "CaptureThread",
                 eglBase!!.eglBaseContext
             )
-            capturer.initialize(surfaceTextureHelper, context, videoSource!!.capturerObserver)
+            // ⭐ [meidui 诊断] 包一层 CapturerObserver 统计「相机实际吐帧率」(capFps)：
+            //    capFps=15 且 encFps=15 → 相机侧降帧（低光AE/HAL）；capFps=30 且 encFps=15 → 帧在采集之后被丢（适配器/编码器）
+            val realObserver = videoSource!!.capturerObserver
+            val countingObserver = object : CapturerObserver {
+                override fun onCapturerStarted(success: Boolean) = realObserver.onCapturerStarted(success)
+                override fun onCapturerStopped() = realObserver.onCapturerStopped()
+                override fun onFrameCaptured(frame: VideoFrame) {
+                    capFrameCount++
+                    realObserver.onFrameCaptured(frame)
+                }
+            }
+            capturer.initialize(surfaceTextureHelper, context, countingObserver)
             capturer.startCapture(currentWidth, currentHeight, currentFps)
             
             localVideoTrack = peerConnectionFactory!!.createVideoTrack(VIDEO_TRACK_ID, videoSource)
@@ -969,6 +981,7 @@ class WebRTCManager(private val context: Context) {
                     fpsChanged = true
                     lastFpsChangeTime = now
                     Log.d(TAG, "⬇️ [降帧] $oldFps→${adaptiveFps}fps (RTT=${rttMs}ms 丢包=${String.format("%.1f", avgLoss * 100)}%)")
+                    Log.d("meidui", "⚠️ fps修改源=自适应降帧 $oldFps→${adaptiveFps}fps")
                 }
                 highLossCounter = 0
             }
@@ -982,6 +995,7 @@ class WebRTCManager(private val context: Context) {
                     fpsChanged = true
                     lastFpsChangeTime = now
                     Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps, RTT=${rttMs}ms)")
+                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps")
                 }
                 lowLossCounter = 0
             }
@@ -1019,11 +1033,15 @@ class WebRTCManager(private val context: Context) {
     private var lastFramesSent: Long = 0
     private var lastMeiduiLogMs: Long = 0
     private var lastNackCount: Long = 0
+    // ⭐ [meidui 诊断] 相机实际吐帧计数（CountingObserver 在采集线程递增，统计线程读增量）
+    @Volatile private var capFrameCount: Long = 0
+    private var lastCapFrameCount: Long = 0
     
     private fun startStats() {
         statsJob?.cancel()
         lastBytesSent = 0; lastPacketsSent = 0; lastPacketsLost = 0; lastStatsTime = 0
         lastFramesEncoded = 0; lastFramesSent = 0; lastMeiduiLogMs = 0; lastNackCount = 0
+        lastCapFrameCount = capFrameCount
         
         statsJob = scope.launch {
             while (isActive) {
@@ -1086,9 +1104,17 @@ class WebRTCManager(private val context: Context) {
                             val dt = (nowMs - lastMeiduiLogMs).toDouble() / 1000.0
                             val encFps = if (dt > 0) ((framesEncoded - lastFramesEncoded) / dt).toInt() else 0
                             val sentFps = if (dt > 0) ((framesSent - lastFramesSent) / dt).toInt() else 0
+                            // ⭐ capFps=相机实际吐帧率；encMaxFps=编码器当前帧率上限（谁把它改成15一眼可见）
+                            val capNow = capFrameCount
+                            val capFps = if (dt > 0) ((capNow - lastCapFrameCount) / dt).toInt() else 0
+                            lastCapFrameCount = capNow
+                            val encMaxFps = try {
+                                videoSender?.parameters?.encodings?.firstOrNull()?.maxFramerate ?: -1
+                            } catch (_: Exception) { -1 }
                             val nackDelta = nackCount - lastNackCount
                             val kbps = WebSocketManager.publishingKbps
-                            Log.d("meidui", "encFps=$encFps sentFps=$sentFps kbps=$kbps fpsStat=$fps " +
+                            Log.d("meidui", "capFps=$capFps encFps=$encFps sentFps=$sentFps encMaxFps=$encMaxFps " +
+                                    "kbps=$kbps fpsStat=$fps " +
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
                                     "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
                                     "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs}")
@@ -1499,6 +1525,7 @@ class WebRTCManager(private val context: Context) {
         }
 
         Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 实际${targetFps}fps(采集+编码已同步, changed=$fpsChanged)")
+        Log.d("meidui", "⚠️ fps修改源=后端set_fps 后端${backendFps}→实际${targetFps}fps")
     }
     
     /**
