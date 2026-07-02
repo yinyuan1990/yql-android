@@ -48,16 +48,27 @@ fun StreamingScreen(
 ) {
     val context = LocalContext.current
     
-    // 权限（Android 13+ 需要通知权限，否则前台服务保活通知不显示）
+    // 权限（⚠️ 只放相机/麦克风——预览用 allPermissionsGranted 做门槛，
+    //   通知权限绝不能混进来：用户拒绝通知会连预览一起挡掉「预览画面出不来」）
     val permissionsState = rememberMultiplePermissionsState(
-        permissions = buildList {
-            add(Manifest.permission.CAMERA)
-            add(Manifest.permission.RECORD_AUDIO)
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
+        permissions = listOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
     )
+    // 通知权限独立申请（Android 13+，仅影响前台服务保活通知是否显示，不挡预览/推流）
+    val notifPermissionState = if (android.os.Build.VERSION.SDK_INT >= 33) {
+        com.google.accompanist.permissions.rememberPermissionState(
+            Manifest.permission.POST_NOTIFICATIONS
+        )
+    } else null
+    LaunchedEffect(Unit) {
+        if (notifPermissionState != null && !notifPermissionState.status.let {
+                it is com.google.accompanist.permissions.PermissionStatus.Granted
+            }) {
+            notifPermissionState.launchPermissionRequest()
+        }
+    }
     
     // WebRTC管理器
     val webRTCManager = remember { WebRTCManager(context) }
