@@ -296,13 +296,11 @@ class P2PManager(private val context: Context) {
             return
         }
 
-        val servers = loadIceServers().ifEmpty {
-            Log.w(TAG, "⚠️ 后端未下发 iceServers，使用公共 STUN 兜底")
-            listOf(
-                PeerConnection.IceServer.builder("stun:stun.miwifi.com:3478").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun.qq.com:3478").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
-            )
+        // ⚠️ 不加公共 STUN 兜底：ICE 节点一律用后端登录下发的自有 STUN/TURN（coturn）。
+        //   后端没下发就空列表（同局域网 host 候选仍可直连），绝不连第三方免费节点。
+        val servers = loadIceServers()
+        if (servers.isEmpty()) {
+            Log.w(TAG, "⚠️ 后端未下发 iceServers，无 STUN/TURN（仅局域网 host 候选可直连）")
         }
         val turnCount = servers.count { it.urls.any { u -> u.startsWith("turn:") } }
         Log.d(TAG, "🔔 ICE 服务器 ${servers.size} 个 (TURN=$turnCount)")
