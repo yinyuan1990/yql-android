@@ -92,6 +92,23 @@ class P2PManager(private val context: Context) {
 
     val viewerCount: Int get() = synchronized(viewerSessions) { viewerSessions.size }
 
+    /** ⭐ [meidui 诊断] 各观看会话 ICE 状态一览（P2P 推送 fps=0 排查用） */
+    fun sessionStatesSummary(): String = synchronized(viewerSessions) {
+        if (viewerSessions.isEmpty()) "无观看会话(等PC发WEBRTC_REQUEST)"
+        else viewerSessions.entries.joinToString(", ") { "${it.key}=${it.value.iceConnectionState()}" }
+    }
+
+    /** ⭐ [meidui 诊断] 首个已连接会话的视频 Sender（P2P 模式读编码器帧率上限/active 用，与统计源同序） */
+    val firstConnectedSender: RtpSender?
+        get() = synchronized(viewerSessions) {
+            viewerSessions.entries.sortedBy { it.key }
+                .firstOrNull {
+                    val s = it.value.iceConnectionState()
+                    s == PeerConnection.IceConnectionState.CONNECTED ||
+                            s == PeerConnection.IceConnectionState.COMPLETED
+                }?.let { viewerSenders[it.key] }
+        }
+
     // MARK: - 生命周期
 
     fun start() {

@@ -1161,6 +1161,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ [meidui 诊断] 相机实际吐帧计数（CountingObserver 在采集线程递增，统计线程读增量）
     @Volatile private var capFrameCount: Long = 0
     private var lastCapFrameCount: Long = 0
+    // ⭐ [meidui 诊断] P2P 推送 fps=0 排查：统计源为空的节流日志时刻
+    private var lastP2PDiagLogMs: Long = 0
     
     private fun startStats() {
         statsJob?.cancel()
@@ -1176,6 +1178,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 val statsPC = if (currentConnMode == ConnMode.P2P)
                     p2pManager.connectedViewerPeerConnections.firstOrNull()
                 else peerConnection
+                // ⭐ [meidui 诊断] P2P 推送 fps=0 排查①：统计源为空 → 整个 stats 回调不会执行，
+                //   publishingFps 永远停在 0。每秒打一行会话状态，区分「没PC来看/ICE没连上」vs「连上了但fps读不到」。
+                if (statsPC == null) {
+                    val nowMs = System.currentTimeMillis()
+                    if (currentConnMode == ConnMode.P2P && nowMs - lastP2PDiagLogMs >= 1000) {
+                        lastP2PDiagLogMs = nowMs
+                        Log.d("meidui", "⚠️ [P2P fps诊断] 统计源为空(publishingFps将保持0): " +
+                                "会话=${p2pManager.sessionStatesSummary()}, " +
+                                "videoTrack=${localVideoTrack != null}, capturing=$isPreviewRunning")
+                    }
+                }
                 statsPC?.getStats { report ->
                     var bytesSent: Long = 0
                     var fps = 0
@@ -1188,6 +1201,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     var nackCount: Long = 0         // 收到的 NACK（对端要求重传）次数
                     var qualityLimit = "-"          // 质量受限原因：none/bandwidth/cpu（=WebRTC 为什么降质）
                     var totalPacketSendDelay = 0.0  // 累计发包排队延迟（秒）——攒帧时会飙升
+                    // ⭐ [meidui 诊断] P2P fps=0 排查②：区分「stats里根本没视频outbound-rtp」vs「有但无fps字段」
+                    var sawVideoOutbound = false
+                    var hasFpsField = false
                     
                     // ⭐ candidate-pair 的 RTT（ICE 层 STUN 自带测量，不依赖对端 RTCP RR）。
                     //   remote-inbound-rtp 的 roundTripTime 依赖对端发 Receiver Report，P2P 场景可能恒 0 →
@@ -1195,8 +1211,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     var icePairRtt = 0.0
                     report.statsMap.values.forEach { stats ->
                         if (stats.type == "outbound-rtp") {
+                            sawVideoOutbound = true
                             (stats.members["bytesSent"] as? Number)?.let { bytesSent = it.toLong() }
-                            (stats.members["framesPerSecond"] as? Number)?.let { fps = it.toInt() }
+                            (stats.members["framesPerSecond"] as? Number)?.let { fps = it.toInt(); hasFpsField = true }
                             (stats.members["packetsSent"] as? Number)?.let { packetsSent = it.toLong() }
                             (stats.members["framesEncoded"] as? Number)?.let { framesEncoded = it.toLong() }
                             (stats.members["framesSent"] as? Number)?.let { framesSent = it.toLong() }
@@ -1251,8 +1268,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             val capNow = capFrameCount
                             val capFps = if (dt > 0) ((capNow - lastCapFrameCount) / dt).toInt() else 0
                             lastCapFrameCount = capNow
+                            // ⭐ P2P 模式 videoSender(SRS专用) 恒 null，改读首个已连接 P2P 会话的 sender
+                            val statSender = if (currentConnMode == ConnMode.P2P)
+                                p2pManager.firstConnectedSender else videoSender
+                            var encActive = true
                             val encMaxFps = try {
-                                videoSender?.parameters?.encodings?.firstOrNull()?.maxFramerate ?: -1
+                                val enc = statSender?.parameters?.encodings?.firstOrNull()
+                                enc?.active?.let { encActive = it }
+                                enc?.maxFramerate ?: -1
                             } catch (_: Exception) { -1 }
                             val nackDelta = nackCount - lastNackCount
                             val kbps = WebSocketManager.publishingKbps
@@ -1261,6 +1284,21 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
                                     "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
                                     "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs}")
+                            // ⭐ [meidui 诊断] P2P 推送 fps=0 定性：一行说清卡在哪一层
+                            if (currentConnMode == ConnMode.P2P && fps == 0) {
+                                val reason = when {
+                                    !sawVideoOutbound -> "stats里无outbound-rtp(视频轨没协商进该会话?)"
+                                    !hasFpsField -> "outbound-rtp缺framesPerSecond字段(起流<1s或编码器还没出过帧)"
+                                    !encActive -> "encoding.active=false(编码被关停)"
+                                    capFps == 0 -> "相机没吐帧(capFps=0, 查采集/预览)"
+                                    encFps == 0 -> "相机有帧但编码器0输出(capFps=$capFps, 查编码器/降档)"
+                                    sentFps == 0 -> "编码正常但没发出去(encFps=$encFps, 查ICE/上行)"
+                                    else -> "framesPerSecond=0但enc/sent正常(统计字段延迟, 可忽略)"
+                                }
+                                Log.d("meidui", "⚠️ [P2P fps诊断] 推送fps=0: $reason " +
+                                        "sender=${statSender != null} encMaxFps=$encMaxFps " +
+                                        "会话=${p2pManager.sessionStatesSummary()}")
+                            }
                             lastFramesEncoded = framesEncoded
                             lastFramesSent = framesSent
                             lastNackCount = nackCount
