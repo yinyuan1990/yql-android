@@ -215,7 +215,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      */
     private fun applyThermalPolicy(level: ThermalManager.Level) {
         val preset = currentLadder[currentProfile]
-        val baseFps = preset?.fps ?: currentFps
+        // ⭐ 推送基准 = min(档位采集fps, 档位推流上限, 后端目标 targetOutputFps)：
+        //    此前直接用 preset.fps(采集60) → 热状态一变化(含回落NOMINAL)推送被拉回60，
+        //    后端 set_fps=15 的目标被顶掉，「采集60·推15」解耦失效
+        val basePushFps = minOf(preset?.fps ?: currentFps, preset?.maxPushFps ?: 60, targetOutputFps)
         val baseMaxKbps = preset?.maxKbps ?: currentBitrateKbps
 
         when (level) {
@@ -225,9 +228,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalBitrateScale = 0.4 }
         }
 
-        val targetFps = minOf(baseFps, thermalFpsCap)
+        val targetFps = minOf(basePushFps, thermalFpsCap).coerceAtLeast(1)
         val targetKbps = maxOf(300, (baseMaxKbps * thermalBitrateScale).toInt())
-        Log.d(TAG, "🌡️ [热控] $level → fps≤$targetFps, 码率≤${targetKbps}kbps (base ${baseFps}fps/${baseMaxKbps}kbps)")
+        Log.d(TAG, "🌡️ [热控] $level → 推送fps≤$targetFps, 码率≤${targetKbps}kbps (推送基准${basePushFps}fps=min(档位,后端目标)/${baseMaxKbps}kbps, 采集另见ensureCaptureFps)")
         Log.d("meidui", "⚠️ fps修改源=热控 $level → fps≤$targetFps")
 
         // 1) 编码参数（帧率 + 码率）立即生效，平滑无重建
@@ -251,15 +254,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
         }
 
-        // 2) 采集帧率降档（重建会话）——真正减轻传感器/ISP 发热；仅在明显变化时执行
-        if (isPreviewRunning) {
-            val capFps = minOf(baseFps, thermalFpsCap)
-            try {
-                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, capFps)
-            } catch (e: Exception) {
-                Log.e(TAG, "热控降采集帧率失败: ${e.message}")
-            }
-        }
+        // 2) 采集帧率降档（重建会话）——真正减轻传感器/ISP 发热；仅在与已应用值不同时执行
+        //    （降温回 NOMINAL 时同样经此恢复到档位采集帧率，如 60）
+        ensureCaptureFps("热控$level")
     }
     
     // MARK: - 🔥 动态查询摄像头能力
@@ -456,20 +453,28 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         // 🌡️ 档位重置帧率也要受热控上限约束（否则热控降到20后一次切档/切摄像头就弹回30，
         //    相机满帧跑 → 降温失败升级 CRITICAL，见 2026-07-01 20:25 日志「目标30fps → [30,30]」）
-        currentFps = minOf(preset.fps, if (isFrontCamera) frontMaxFps else backMaxFps, thermalFpsCap)
+        // ⭐ 并叠加后端推送目标 targetOutputFps（对齐 iOS：targetOutputFPS 跨档位持久，切档不把
+        //    推送弹回60；采集帧率与此解耦，仍按档位帧率跑，见 captureFps()）
+        currentFps = minOf(preset.fps, if (isFrontCamera) frontMaxFps else backMaxFps, thermalFpsCap, targetOutputFps)
         currentBitrateKbps = preset.maxKbps
         currentMinBitrateKbps = preset.minKbps
         
         // 🔥 若正在采集且采集分辨率变化，就近切换采集格式（重建会话）
+        // ⭐ 采集帧率用 captureFps()（档位帧率+热控），与推送目标解耦（对齐 iOS 采集60·推30）
         if (isPreviewRunning && captureChanged) {
             try {
-                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, currentFps)
-                Log.d(TAG, "🔧 采集格式切换 → ${currentWidth}x${currentHeight}@${currentFps}fps")
+                val capFps = captureFps()
+                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, capFps)
+                appliedCaptureFps = capFps
+                Log.d(TAG, "🔧 采集格式切换 → ${currentWidth}x${currentHeight}@${capFps}fps")
                 // 🔥 会话重建后重放硬件参数（曝光/对焦/变焦/快门/白平衡）
                 scope.launch { delay(300); applyCameraParams() }
             } catch (e: Exception) {
                 Log.e(TAG, "切换采集格式失败: ${e.message}")
             }
+        } else if (isPreviewRunning) {
+            // ⭐ 分辨率没变但档位采集帧率可能变了（如两档同分辨率不同fps）：仅在值不同才重开会话
+            ensureCaptureFps("切档${profileName(profile)}")
         }
         
         Log.d(TAG, "🎯 档位切换: ${profileName(profile)} → 采集${currentWidth}x${currentHeight}@${currentFps}fps, 码率${currentMinBitrateKbps}-${currentBitrateKbps}kbps, scale=${"%.2f".format(preset.scaleDown)}")
@@ -508,7 +513,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         videoSource = peerConnectionFactory!!.createVideoSource(false)
         videoCapturer = createCameraCapturer(isFrontCamera)
-        Log.d(TAG, "🎬 startPreview: capturer=${videoCapturer?.javaClass?.simpleName}, 目标采集=${currentWidth}x${currentHeight}@${currentFps}, front=$isFrontCamera")
+        Log.d(TAG, "🎬 startPreview: capturer=${videoCapturer?.javaClass?.simpleName}, 目标采集=${currentWidth}x${currentHeight}@${captureFps()}(推送目标${currentFps}), front=$isFrontCamera")
         
         videoCapturer?.let { capturer ->
             val surfaceTextureHelper = SurfaceTextureHelper.create(
@@ -527,7 +532,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             capturer.initialize(surfaceTextureHelper, context, countingObserver)
-            capturer.startCapture(currentWidth, currentHeight, currentFps)
+            // ⭐ 采集帧率与推送解耦（对齐 iOS）：相机按档位帧率采集（通常60），推送由编码器节流
+            val capFps = captureFps()
+            capturer.startCapture(currentWidth, currentHeight, capFps)
+            appliedCaptureFps = capFps
             
             localVideoTrack = peerConnectionFactory!!.createVideoTrack(VIDEO_TRACK_ID, videoSource)
             localVideoTrack?.setEnabled(true)
@@ -537,7 +545,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
             
             isPreviewRunning = true
-            Log.d(TAG, "✅ 预览已启动: ${currentWidth}x${currentHeight}@${currentFps}fps (${profileName(currentProfile)})")
+            Log.d(TAG, "✅ 预览已启动: 采集${currentWidth}x${currentHeight}@${appliedCaptureFps}fps · 推送目标${currentFps}fps (${profileName(currentProfile)})")
             
             // 🔥 采集会话就绪后注入一次硬件参数：核心是钉死 AE 帧率区间 [fps,fps]，
             //    否则暗光下相机自动把帧率砍半（30→15，logcat/应用层完全无感知）
@@ -559,6 +567,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         videoSource = null
         
         isPreviewRunning = false
+        appliedCaptureFps = 0   // 采集会话已销毁，清基线（防下次 ensureCaptureFps 误判「已应用」）
     }
     
     // MARK: - 推流
@@ -603,7 +612,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         println("jfh [推流] 🚀 开始推流")
         println("jfh [推流]    SRS地址: webrtc://$srsIP/$app/$streamKey")
         println("jfh [推流]    档位: ${profileName(currentProfile)}")
-        println("jfh [推流]    采集: ${currentWidth}x${currentHeight}@${currentFps}fps")
+        println("jfh [推流]    采集: ${currentWidth}x${currentHeight}@${captureFps()}fps · 推送目标${currentFps}fps")
         println("jfh [推流]    码率: ${currentBitrateKbps}kbps")
         println("jfh [推流]    预览状态: isPreviewRunning=$isPreviewRunning")
         println("jfh [推流] ═══════════════════════════════════════")
@@ -698,7 +707,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private fun startP2PPublish() {
         println("jfh [P2P] ═══════════════════════════════════════")
         println("jfh [P2P] 🚀 启动 P2P 直连模式（不连 SRS，等待 PC 观看请求）")
-        println("jfh [P2P]    档位: ${profileName(currentProfile)}, 采集: ${currentWidth}x${currentHeight}@${currentFps}fps")
+        println("jfh [P2P]    档位: ${profileName(currentProfile)}, 采集: ${currentWidth}x${currentHeight}@${captureFps()}fps · 推送目标${currentFps}fps")
         println("jfh [P2P] ═══════════════════════════════════════")
         onConnectionStateChanged?.invoke("P2P 等待观看端...")
         
@@ -1435,6 +1444,40 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ 相机被系统断开标记（后台被收回/被其它应用抢占/HAL错误）。回前台时据此自动恢复采集。
     @Volatile private var cameraDead = false
 
+    // MARK: - ⭐ 采集帧率与推送帧率解耦（2026-07-02 对齐 iOS：采集60 · 推30）
+    //
+    // iOS 结构：相机恒按档位帧率（通常60）采集，FrameThrottler 把推送均匀节流到 targetSendFps，
+    // 预览始终吃满采集帧率 → 显示「采集60 · 推30」。
+    // Android 此前 setTargetFps 会把采集一起 changeCaptureFormat 降到推送值 → 「采集30 · 推30」，
+    // 预览也跟着掉帧，与 iOS 不一致。现改为：
+    //   - 采集帧率 = 档位采集帧率（已含镜头能力上限）+ 热控上限，与推送目标无关；
+    //   - 推送帧率 = 编码器 maxFramerate（后端 set_fps/自适应控制），由 libwebrtc 在编码前丢帧
+    //     （作用等价 iOS 的 FrameThrottler，预览 sink 在丢帧之前、仍满帧）。
+
+    /** 当前应达到的采集帧率：档位采集 fps（选档时已含该镜头能力上限）+ 热控约束，与推送目标解耦 */
+    private fun captureFps(): Int {
+        val presetFps = currentLadder[currentProfile]?.fps ?: currentFps
+        return minOf(presetFps, thermalFpsCap).coerceAtLeast(1)
+    }
+
+    /** 最近一次实际下发给相机的采集帧率（changeCaptureFormat 会重开会话，相同值不重复下发防闪烁） */
+    @Volatile private var appliedCaptureFps: Int = 0
+
+    /** 确保相机跑在 captureFps()：仅在与已应用值不同时才重开采集会话，并重放硬件参数 */
+    private fun ensureCaptureFps(reason: String) {
+        if (!isPreviewRunning) return
+        val target = captureFps()
+        if (appliedCaptureFps == target) return
+        try {
+            videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, target)
+            appliedCaptureFps = target
+            scope.launch { delay(300); applyCameraParams() }
+            Log.d(TAG, "🎥 [采集帧率] $reason → ${target}fps（与推送解耦，推送目标=${currentFps}fps）")
+        } catch (e: Exception) {
+            Log.e(TAG, "采集帧率调整失败($reason): ${e.message}")
+        }
+    }
+
     private fun createCameraCapturer(useFront: Boolean): CameraVideoCapturer {
         // 🔥 使用 WebRTC 原生 Camera2 采集器（低发热，走 WebRTC 优化纹理管线）。
         //    曝光/对焦/变焦/快门/白平衡改由 Camera2ParamApplier 反射原生 session 按需注入（见 docs 十五）。
@@ -1574,7 +1617,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             } else {
                 // 同一 capturer 重开相机（CameraCapturer.startCapture 内部会重新 openCamera）
                 try { videoCapturer?.stopCapture() } catch (_: Exception) {}
-                videoCapturer?.startCapture(currentWidth, currentHeight, currentFps)
+                val capFps = captureFps()
+                videoCapturer?.startCapture(currentWidth, currentHeight, capFps)
+                appliedCaptureFps = capFps
             }
             cameraDead = false
             scope.launch {
@@ -1830,7 +1875,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             whiteBalanceSlider = if (_whiteBalanceManual) _currentWhiteBalance else null,
             whiteBalanceLocked = _whiteBalanceLocked,
             // 🔥 钉死 AE 帧率区间，防低光时相机自动 30→15（iOS 无此坑，Android Camera2 经典问题）
-            targetFps = currentFps
+            // ⭐ 用采集帧率（档位60）而非推送目标：否则推送30时 AE 被钉 [30,30]，采集被硬拉回30，解耦失效
+            targetFps = captureFps()
         )
         Camera2ParamApplier.apply(videoCapturer, params)
     }
@@ -1925,20 +1971,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
         }
 
-        // 2) 🔥 同步采集侧帧率（此前只改编码器 maxFramerate，采集帧率不变 → 表现为“fps 不反应”）。
-        //    仅在帧率确有变化时下发 changeCaptureFormat（其内部会重开会话），避免相同值反复重开相机造成闪烁。
-        if (isPreviewRunning && fpsChanged) {
-            try {
-                videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, targetFps)
-                // 🔥 会话重建后重放硬件参数
-                scope.launch { delay(300); applyCameraParams() }
-            } catch (e: Exception) {
-                Log.e(TAG, "同步采集帧率失败: ${e.message}")
-            }
-        }
+        // 2) ⭐ 采集帧率不再跟随推送目标下调（2026-07-02 对齐 iOS「采集60·推30」）：
+        //    iOS 相机恒按档位帧率采集、FrameThrottler 只节流推送；Android 等价方案 =
+        //    编码器 maxFramerate 丢帧（预览 sink 在丢帧之前仍满帧）。这里只做一次校验，
+        //    把可能被旧逻辑降下去的采集帧率恢复到档位帧率（相同值不会重开相机）。
+        ensureCaptureFps("set_fps")
 
-        Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 实际${targetFps}fps(采集+编码已同步, changed=$fpsChanged)")
-        Log.d("meidui", "⚠️ fps修改源=后端set_fps 后端${backendFps}→实际${targetFps}fps")
+        Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
+        Log.d("meidui", "⚠️ fps修改源=后端set_fps 后端${backendFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")
     }
     
     /**
