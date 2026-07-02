@@ -572,6 +572,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         app = appName
         baseStreamKey = key
         
+        // 🔄 WS 重连成功 → 推流健康检查（两种模式统一，见 onWebSocketReconnected）
+        WebSocketManager.instance.onReconnected = { onWebSocketReconnected() }
+        
         // 🔥 与iOS一致：streamKey = 基础流名_时间戳，且【必须在 P2P/SRS 分流之前】生成并上报。
         //    PC 端 MainPage 的拉流入口是 `publishStatus===1 && streamKey非空` 才进（进了才按
         //    connectstype 分 P2P/SRS）——此前 P2P 分支提前 return 没设 streamKey，PC 收到的
@@ -703,8 +706,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
             withContext(Dispatchers.Main) {
                 // 信令接入：WS 收到 /topic/device/{id}/webrtc → P2PManager
+                // （onReconnected 已在 startPublish 统一挂到 onWebSocketReconnected，P2P 分支内会做 ICE Restart）
                 WebSocketManager.instance.onWebRTCSignaling = { msg -> p2pManager.handleSignaling(msg) }
-                WebSocketManager.instance.onReconnected = { p2pManager.onWebSocketReconnected() }
                 
                 p2pManager.dataSource = this@WebRTCManager
                 p2pManager.start()
@@ -823,7 +826,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     when (state) {
                         PeerConnection.IceConnectionState.CONNECTED -> onConnectionStateChanged?.invoke("已连接")
                         PeerConnection.IceConnectionState.DISCONNECTED -> onConnectionStateChanged?.invoke("连接断开")
-                        PeerConnection.IceConnectionState.FAILED -> onConnectionStateChanged?.invoke("连接失败")
+                        PeerConnection.IceConnectionState.FAILED -> {
+                            // 🔄 2026-07-02：SRS 媒体连接 FAILED 不会自愈（WHIP 无 ICE Restart 通路），
+                            //    此前只改状态文案 → 断了永远不回来。改为自动重推（节流防循环）。
+                            onConnectionStateChanged?.invoke("连接失败")
+                            scheduleSrsRepublish("ICE FAILED")
+                        }
                         else -> {}
                     }
                 }
@@ -1448,6 +1456,78 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             override fun onCameraClosed() {}
         }
         return enumerator.createCapturer(target, events)
+    }
+
+    // MARK: - 🔄 断线自动恢复推流（2026-07-02）
+
+    @Volatile private var republishScheduled = false
+    private var lastRepublishMs: Long = 0
+
+    /**
+     * SRS 媒体连接死亡（ICE FAILED / WS 重连后发现连接已关）→ 自动整体重推。
+     * WHIP 推流无 ICE Restart 通路，FAILED 不会自愈，唯一恢复方式=重新走一遍 startPublish。
+     * 10s 节流 + 单飞标记，防「失败→重推→又失败」空转循环打爆 SRS。
+     */
+    private fun scheduleSrsRepublish(reason: String) {
+        if (currentConnMode != ConnMode.SRS || !isPublishing) return
+        val now = System.currentTimeMillis()
+        if (republishScheduled || now - lastRepublishMs < 10_000) {
+            Log.d(TAG, "⏭️ [自动重推] 已在排队/节流中，跳过($reason)")
+            return
+        }
+        republishScheduled = true
+        lastRepublishMs = now
+        Log.w(TAG, "🔄 [自动重推] $reason → 3s 后重建 SRS 推流")
+        Log.d("meidui", "⚠️ SRS自动重推 reason=$reason")
+        scope.launch {
+            delay(3000)
+            republishScheduled = false
+            if (srsIP.isEmpty() || baseStreamKey.isEmpty()) return@launch
+            withContext(Dispatchers.Main) { stopPublish() }
+            delay(500)
+            withContext(Dispatchers.Main) {
+                startPublish(srsIP, app, baseStreamKey)  // 内部重新生成时间戳流名
+            }
+        }
+    }
+
+    /**
+     * ⭐ WebSocket 重连成功后的推流健康检查（两种模式统一入口，在 startPublish 里挂到
+     * WebSocketManager.onReconnected）。WS 断线常伴随网络切换/后台冻结，媒体链路大概率也断了：
+     * 1. 采集死了 → 恢复采集（后台被收相机的场景）；
+     * 2. 完全没在推流（进程被冻结期间停掉）→ 自动重新推流；
+     * 3. P2P → 全部会话 ICE Restart（原有逻辑）；
+     * 4. SRS → 媒体连接已死则自动重推。
+     */
+    fun onWebSocketReconnected() {
+        scope.launch {
+            withContext(Dispatchers.Main) {
+                Log.d(TAG, "🔄 [WS重连] 推流健康检查: publishing=$isPublishing mode=$currentConnMode")
+                Log.d("meidui", "⚠️ WS重连 → 推流健康检查 publishing=$isPublishing mode=$currentConnMode")
+                recoverCaptureIfNeeded("ws_reconnect")
+                if (!isPublishing) {
+                    // 之前推过流（参数还在）→ 自动恢复推流
+                    if (srsIP.isNotEmpty() && baseStreamKey.isNotEmpty()) {
+                        Log.w(TAG, "🔄 [WS重连] 未在推流 → 自动重新推流")
+                        startPublish(srsIP, app, baseStreamKey)
+                    }
+                    return@withContext
+                }
+                if (currentConnMode == ConnMode.P2P) {
+                    p2pManager.onWebSocketReconnected()   // 各会话 ICE Restart
+                } else {
+                    val st = try { peerConnection?.iceConnectionState() } catch (_: Exception) { null }
+                    if (st == null ||
+                        st == PeerConnection.IceConnectionState.FAILED ||
+                        st == PeerConnection.IceConnectionState.DISCONNECTED ||
+                        st == PeerConnection.IceConnectionState.CLOSED) {
+                        scheduleSrsRepublish("WS重连后媒体连接=$st")
+                    } else {
+                        Log.d(TAG, "▶️ [WS重连] SRS 媒体连接正常($st)，无需重推")
+                    }
+                }
+            }
+        }
     }
 
     /**
