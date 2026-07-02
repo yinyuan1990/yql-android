@@ -78,6 +78,7 @@ fun StreamingScreen(
     var connectionStatus by remember { mutableStateOf("未连接") }
     var currentFps by remember { mutableIntStateOf(0) }
     var currentKbps by remember { mutableIntStateOf(0) }
+    var currentCapFps by remember { mutableIntStateOf(0) }  // ⭐ 相机实际采集帧率（左上角显示）
     
     // 右侧面板 - 显示同步数据（后端下发 + WebRTC实际值）
     var zoomValue by remember { mutableFloatStateOf(1.0f) }
@@ -97,6 +98,10 @@ fun StreamingScreen(
         webRTCManager.onStatsUpdate = { kbps, fps, rtt ->
             currentKbps = kbps
             currentFps = fps
+        }
+        // ⭐ 采集帧率每秒回调（不依赖观看端连接，P2P 等待期也有值）
+        webRTCManager.onCapFpsUpdate = { capFps ->
+            currentCapFps = capFps
         }
         
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
@@ -531,7 +536,8 @@ fun StreamingScreen(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = if (isStreaming) "${currentFps}fps · ${currentKbps}kbps" else connectionStatus,
+                    text = if (isStreaming) "采集${currentCapFps} · 推${currentFps}fps · ${currentKbps}kbps"
+                           else connectionStatus,
                     color = Color.White,
                     fontSize = 12.sp
                 )

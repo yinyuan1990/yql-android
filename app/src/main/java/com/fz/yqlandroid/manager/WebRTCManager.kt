@@ -129,6 +129,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // 回调
     var onStatsUpdate: ((Int, Int, Int) -> Unit)? = null
     var onConnectionStateChanged: ((String) -> Unit)? = null
+    // ⭐ 采集帧率（相机实际吐帧率，每秒回调一次）——在统计循环层计算，
+    //   不依赖 statsPC（P2P 无观看会话时也有值），供 UI 左上角显示
+    var onCapFpsUpdate: ((Int) -> Unit)? = null
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -1169,16 +1172,35 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private var lastCapFrameCount: Long = 0
     // ⭐ [meidui 诊断] P2P 推送 fps=0 排查：统计源为空的节流日志时刻
     private var lastP2PDiagLogMs: Long = 0
+    // ⭐ UI 采集帧率：独立计数基线（在循环层每秒算一次，不依赖 statsPC/getStats 回调）
+    private var uiLastCapFrameCount: Long = 0
+    private var uiLastCapSampleMs: Long = 0
     
     private fun startStats() {
         statsJob?.cancel()
         lastBytesSent = 0; lastPacketsSent = 0; lastPacketsLost = 0; lastStatsTime = 0
         lastFramesEncoded = 0; lastFramesSent = 0; lastMeiduiLogMs = 0; lastNackCount = 0
         lastCapFrameCount = capFrameCount
+        uiLastCapFrameCount = capFrameCount; uiLastCapSampleMs = 0
         
         statsJob = scope.launch {
             while (isActive) {
                 delay(200) // 200ms采集一次（与iOS一致），自适应逻辑内部每秒执行一次
+                // ⭐ UI 采集帧率：循环层每秒算一次（不依赖 statsPC，P2P 等待观看端时也有值）
+                run {
+                    val nowMs = System.currentTimeMillis()
+                    if (uiLastCapSampleMs == 0L) {
+                        uiLastCapSampleMs = nowMs
+                        uiLastCapFrameCount = capFrameCount
+                    } else if (nowMs - uiLastCapSampleMs >= 1000) {
+                        val dt = (nowMs - uiLastCapSampleMs).toDouble() / 1000.0
+                        val capNow = capFrameCount
+                        val capFpsUi = ((capNow - uiLastCapFrameCount) / dt).toInt()
+                        uiLastCapFrameCount = capNow
+                        uiLastCapSampleMs = nowMs
+                        withContext(Dispatchers.Main) { onCapFpsUpdate?.invoke(capFpsUi) }
+                    }
+                }
                 // ⭐ 统计源按模式选取：SRS 用 peerConnection；P2P 用已连接的观看会话（取一路代表本机发送）。
                 //   iOS 曾因 P2P 模式下统计源为 null 导致 kbps/网络质量/自适应全部空转（§21.5 教训）。
                 val statsPC = if (currentConnMode == ConnMode.P2P)
@@ -1493,6 +1515,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // 🔥 观看端(PC)兜底关键帧请求（CONFIG_UPDATE ptype=request_keyframe，与 iOS P0-1 一致）
             //    这是周期 IDR 删除后的唯一应用层补帧入口，1s 节流防风暴。
             "request_keyframe" -> {
+                // ⭐ 2026-07-02 P2P 攒帧修复（与 SRS 周期 IDR 修复 40bf7ef / iOS §21.12 同机理）：
+                //    PC 的 requestKeyframeWithFallback 是「RTCP PLI + WS request_keyframe」两路同发。
+                //    SRS 模式 PLI 到不了手机（SRS 不转发 RTCP），WS 是唯一通路，必须手动补 IDR；
+                //    P2P 直连 PLI 直达 libwebrtc 会【自动】出 IDR（rtcp-mux，媒体通 PLI 就通），
+                //    这里再手动码率 trick 强制一发 = 每次请求双倍大 IDR + 每会话 2 次编码器重配
+                //    → 打满上行 → 攒帧 → PC 更卡 → 更频繁请求，自激振荡（「一坨帧堆出来」）。
+                //    故 P2P 只记日志，补帧交给 PLI 自动路径。
+                if (currentConnMode == ConnMode.P2P) {
+                    Log.d(TAG, "🔑 [按需关键帧] P2P 忽略 WS request_keyframe（PLI 直达自动补 IDR，防双倍 IDR 攒帧）")
+                    Log.d("meidui", "request_keyframe(WS) 到达但 P2P 跳过手动 IDR（PLI 自动路径生效中）")
+                    return
+                }
                 val now = System.currentTimeMillis()
                 if (now - lastKeyframeAtMs >= REQUEST_KEYFRAME_MIN_INTERVAL_MS) {
                     lastKeyframeAtMs = now
