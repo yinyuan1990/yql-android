@@ -147,12 +147,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     // 🌡️ 设备热状态管理（对标 iOS thermalState 主动降档）
     private val thermalManager = ThermalManager(context)
-    // 当前热档位对采集/推流的约束：fps 上限 + 码率缩放系数（1.0=不降）
+    // 当前热档位对推流的约束：fps 上限 + 码率缩放系数（1.0=不降）
+    // ⭐ 热控只作用于「推送」侧，采集帧率全程=档位帧率（对齐 iOS：iOS 无任何热控代码，
+    //    相机恒按档位60采集，发热只可能影响推送）。此前热控连采集一起降是 Android 自加的，
+    //    导致推流常态温度 FAIR 下「采集60」永远保不住（2026-07-02 用户实测：选档60、
+    //    AE被钉[30,30]、capFps=30，左上角采集≈推送）。
     private var thermalFpsCap: Int = Int.MAX_VALUE
-    // ⭐ 采集帧率的热控上限与推送分离：推流中手机几乎必然升温到 MODERATE(FAIR)，
-    //    若 FAIR 就压采集到 30，「采集60」实际永远保不住（2026-07-02 用户实测：选档60、
-    //    AE被钉[30,30]、capFps=30）。现 FAIR 只降推送/码率不动采集，SERIOUS/CRITICAL 才降采集。
-    private var thermalCaptureFpsCap: Int = Int.MAX_VALUE
     private var thermalBitrateScale: Double = 1.0
     
     // MARK: - 初始化
@@ -212,8 +212,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // MARK: - 🌡️ 热控降档（对标 iOS thermalState 处理）
 
     /**
-     * 根据设备热档位调整采集/推流参数，抑制发热。
-     * - fps 上限：降低采集与推流帧率（采集降帧同时减轻 ISP/传感器发热）
+     * 根据设备热档位调整「推送」参数，抑制发热（采集帧率不动，对齐 iOS）。
+     * - fps 上限：降低推送帧率（编码器 maxFramerate 丢帧，编码/发送是主要热源）
      * - 码率缩放：降低编码码率，减少编码器/调制解调器发热
      * 档位越高约束越强；回落到 NOMINAL 时恢复档位原始参数。
      */
@@ -225,19 +225,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val basePushFps = minOf(preset?.fps ?: currentFps, preset?.maxPushFps ?: 60, targetOutputFps)
         val baseMaxKbps = preset?.maxKbps ?: currentBitrateKbps
 
-        // ⭐ 推送与采集分开限：FAIR(=MODERATE，推流中常态温度)只降推送/码率，采集保持档位帧率
-        //    （否则「采集60」在实际推流中永远保不住，左上角采集≈推送，解耦形同虚设）；
-        //    SERIOUS/CRITICAL 才连采集一起降（真正过热，减轻传感器/ISP发热）
+        // ⭐ 热控只降「推送」fps + 码率，采集帧率不动（对齐 iOS：iOS 无热控、相机恒按档位采集；
+        //    编码/发送才是主要热源，降推送已能有效控温）
         when (level) {
-            ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalCaptureFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
-            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalCaptureFpsCap = Int.MAX_VALUE; thermalBitrateScale = 0.8 }
-            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalCaptureFpsCap = 20; thermalBitrateScale = 0.6 }
-            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalCaptureFpsCap = 12; thermalBitrateScale = 0.4 }
+            ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
+            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalBitrateScale = 0.8 }
+            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalBitrateScale = 0.6 }
+            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalBitrateScale = 0.4 }
         }
 
         val targetFps = minOf(basePushFps, thermalFpsCap).coerceAtLeast(1)
         val targetKbps = maxOf(300, (baseMaxKbps * thermalBitrateScale).toInt())
-        Log.d(TAG, "🌡️ [热控] $level → 推送fps≤$targetFps, 码率≤${targetKbps}kbps (推送基准${basePushFps}fps=min(档位,后端目标)/${baseMaxKbps}kbps, 采集另见ensureCaptureFps)")
+        Log.d(TAG, "🌡️ [热控] $level → 推送fps≤$targetFps, 码率≤${targetKbps}kbps (推送基准${basePushFps}fps=min(档位,后端目标)/${baseMaxKbps}kbps, 采集不动=${captureFps()}fps)")
         Log.d("meidui", "⚠️ fps修改源=热控 $level → fps≤$targetFps")
 
         // 1) 编码参数（帧率 + 码率）立即生效，平滑无重建
@@ -261,8 +260,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
         }
 
-        // 2) 采集帧率降档（重建会话）——真正减轻传感器/ISP 发热；仅在与已应用值不同时执行
-        //    （降温回 NOMINAL 时同样经此恢复到档位采集帧率，如 60）
+        // 2) 采集帧率不随热控变化（captureFps()=档位帧率，与 iOS 一致）；
+        //    仍调一次 ensureCaptureFps 兜底：若采集因历史原因偏离档位值，此处拉回（值相同则无操作）
         ensureCaptureFps("热控$level")
     }
     
@@ -1505,16 +1504,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // 预览始终吃满采集帧率 → 显示「采集60 · 推30」。
     // Android 此前 setTargetFps 会把采集一起 changeCaptureFormat 降到推送值 → 「采集30 · 推30」，
     // 预览也跟着掉帧，与 iOS 不一致。现改为：
-    //   - 采集帧率 = 档位采集帧率（已含镜头能力上限）+ 热控上限，与推送目标无关；
+    //   - 采集帧率 = 档位采集帧率（已含镜头能力上限），与推送目标/热控均无关（iOS 亦无热控压采集）；
     //   - 推送帧率 = 编码器 maxFramerate（后端 set_fps/自适应控制），由 libwebrtc 在编码前丢帧
     //     （作用等价 iOS 的 FrameThrottler，预览 sink 在丢帧之前、仍满帧）。
 
-    /** 当前应达到的采集帧率：档位采集 fps（选档时已含该镜头能力上限）+ 热控约束，与推送目标解耦。
-     *  热控用采集专属上限 thermalCaptureFpsCap（FAIR 不降采集，SERIOUS/CRITICAL 才降），
-     *  不能用推送的 thermalFpsCap——推流常态温度就是 FAIR，用它采集60永远保不住 */
+    /** 当前应达到的采集帧率 = 档位采集 fps（选档时已含该镜头能力上限），与推送目标/热控完全解耦。
+     *  对齐 iOS：相机恒按档位帧率采集，热控只降推送（thermalFpsCap 不进这里——
+     *  推流常态温度就是 FAIR，热控若压采集，「采集60」永远保不住） */
     private fun captureFps(): Int {
-        val presetFps = currentLadder[currentProfile]?.fps ?: currentFps
-        return minOf(presetFps, thermalCaptureFpsCap).coerceAtLeast(1)
+        return (currentLadder[currentProfile]?.fps ?: currentFps).coerceAtLeast(1)
     }
 
     /** 最近一次实际下发给相机的采集帧率（changeCaptureFormat 会重开会话，相同值不重复下发防闪烁） */
