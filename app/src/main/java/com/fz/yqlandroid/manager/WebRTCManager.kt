@@ -218,6 +218,9 @@ class WebRTCManager(private val context: Context) {
 
         // 1) 编码参数（帧率 + 码率）立即生效，平滑无重建
         currentFps = targetFps
+        // 🔥 同步自适应基准：否则 adaptiveFps 仍停留在旧值(如30)，下次网络好触发升帧分支
+        //    minOf(上限20, 30+2)=20 反而比旧值小，打出「自适应升帧 30→20fps」的假升帧日志
+        if (adaptiveFps > targetFps) adaptiveFps = targetFps
         currentBitrateKbps = targetKbps
         currentMinBitrateKbps = maxOf(200, (targetKbps * 0.6).toInt())
         videoSender?.let { sender ->
@@ -431,7 +434,9 @@ class WebRTCManager(private val context: Context) {
         currentWidth = preset.width
         currentHeight = preset.height
         
-        currentFps = minOf(preset.fps, if (isFrontCamera) frontMaxFps else backMaxFps)
+        // 🌡️ 档位重置帧率也要受热控上限约束（否则热控降到20后一次切档/切摄像头就弹回30，
+        //    相机满帧跑 → 降温失败升级 CRITICAL，见 2026-07-01 20:25 日志「目标30fps → [30,30]」）
+        currentFps = minOf(preset.fps, if (isFrontCamera) frontMaxFps else backMaxFps, thermalFpsCap)
         currentBitrateKbps = preset.maxKbps
         currentMinBitrateKbps = preset.minKbps
         
@@ -955,6 +960,9 @@ class WebRTCManager(private val context: Context) {
         
         // 🌡️ 自适应升帧上限同时受热控约束，避免降温前又升回高帧
         val maxFps = minOf(currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        // 上限被收紧（热控/切档）时先静默对齐基准：编码器帧率已由收紧方写入，
+        // 这里只同步 adaptiveFps，防止升帧分支打出「30→20fps」的假升帧
+        if (adaptiveFps > maxFps) adaptiveFps = maxFps
         
         // 网络状态判断（RTT + 丢包率，不用码率）
         val isRttBad = rttMs > rttDownThreshold && rttMs > 0
@@ -1498,6 +1506,11 @@ class WebRTCManager(private val context: Context) {
         val targetFps = minOf(pushFps, maxFps, thermalFpsCap).coerceAtLeast(1)
         val fpsChanged = (targetFps != currentFps)
         currentFps = targetFps
+        // 🔥 后端显式设帧率 = 新基准：同步 adaptiveFps 并盖时间戳。
+        //    此前 lastRemoteFpsTime 只读从未写入 →「后端指令生效中暂停自适应」的门是死代码，
+        //    自适应下一秒就用旧基准把后端指令顶掉
+        adaptiveFps = targetFps
+        lastRemoteFpsTime = System.currentTimeMillis()
 
         // 1) 更新编码器目标帧率（videoSender 可能在预览未推流时为 null，此时不 return，
         //    仍继续更新采集侧，保证“fps 不反应”问题在预览阶段也能生效）

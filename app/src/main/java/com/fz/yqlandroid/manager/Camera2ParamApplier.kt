@@ -152,7 +152,12 @@ object Camera2ParamApplier {
 
     // ===== AE 帧率区间（防低光降帧） =====
     // WebRTC Camera2Session 选 AE 区间偏好宽区间(如[15,30])，暗光时 AE 拉长曝光把帧率砍半(30→15)。
-    // 这里改为钉死：优先选 [fps,fps] 固定区间；没有则选下界最高且能覆盖 fps 的区间。
+    // 这里改为钉死固定区间，且绝不高钉（旧逻辑「下界最高」会把目标20钉成[30,30]，
+    // 相机被迫跑30fps → 热控降采集帧率完全失效 → 越跑越热升级 CRITICAL）。选择优先级：
+    //   1) 精确 [fps,fps]
+    //   2) 最小的固定区间 [x,x] 且 x>=fps（如目标20→[24,24]、目标12→[15,15]，防低光又贴近目标）
+    //   3) 覆盖 fps 的区间里下界最高、跨度最小（如目标20→[15,24]）
+    //   4) 兜底：上界最大的区间
     private fun applyFpsRange(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
         try {
             val fps = p.targetFps ?: return
@@ -161,9 +166,14 @@ object Camera2ParamApplier {
             if (p.shutterCjfps != null && p.shutterCjfps > 0) return
             val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
             val exact = ranges.firstOrNull { it.lower == fps && it.upper == fps }
-            val best = exact ?: ranges
-                .filter { it.upper >= fps }
-                .maxWithOrNull(compareBy({ it.lower }, { -it.upper }))
+            val fixedAbove = ranges
+                .filter { it.lower == it.upper && it.upper >= fps }
+                .minByOrNull { it.upper }
+            val covering = ranges
+                .filter { it.lower <= fps && it.upper >= fps }
+                .maxWithOrNull(compareBy({ it.lower }, { -(it.upper - it.lower) }))
+            val best = exact ?: fixedAbove ?: covering
+                ?: ranges.maxByOrNull { it.upper }
             if (best != null) {
                 b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(best.lower, best.upper))
                 Log.d("meidui", "🎞️ AE帧率区间钉死: 目标${fps}fps → [${best.lower},${best.upper}] " +
