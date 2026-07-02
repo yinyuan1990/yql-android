@@ -293,6 +293,42 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     sizeMaxFps[s] = minOf(perSize, aeMaxFps).coerceAtLeast(1)
                 }
                 
+                // ⭐ [meidui] 全量采集能力打印（用户排查「60fps 优先却全是 30」）：
+                //    - AE帧率区间 = 普通采集会话（WebRTC Camera2 走的就是这种）能跑的帧率上限，
+                //      若所有区间上界都是 30 → 该镜头普通会话根本给不了 60，选档退 30 是设备限制；
+                //    - YUV裸上限/纹理裸上限 = getOutputMinFrameDuration 理论值（未与 AE 取 min）；
+                //    - 采用值 = 选档实际用的 sizeMaxFps（已与 AE 上限取 min）；
+                //    - 高速会话 = 设备 60/120fps 常只在 CONSTRAINED_HIGH_SPEED 里，WebRTC 采集用不了，仅参考。
+                val camName = when (facing) {
+                    CameraCharacteristics.LENS_FACING_BACK -> "后置"
+                    CameraCharacteristics.LENS_FACING_FRONT -> "前置"
+                    else -> "其它($facing)"
+                }
+                Log.d("meidui", "📷 ===== $camName 摄像头全量采集能力 (cameraId=$cameraId, ${sizes.size}种分辨率) =====")
+                Log.d("meidui", "📷 AE帧率区间(${fpsRanges?.size ?: 0}个): ${fpsRanges?.joinToString()} → 普通会话采集上限=${aeMaxFps}fps")
+                for (s in sizes) {
+                    val yuvFps = try {
+                        val d = map.getOutputMinFrameDuration(imageFormat, s)
+                        if (d > 0) (1_000_000_000.0 / d).toInt() else -1
+                    } catch (_: Exception) { -1 }
+                    val texFps = try {
+                        val d = map.getOutputMinFrameDuration(android.graphics.SurfaceTexture::class.java, s)
+                        if (d > 0) (1_000_000_000.0 / d).toInt() else -1
+                    } catch (_: Exception) { -1 }
+                    Log.d("meidui", "📷 ${s.width}x${s.height} YUV裸上限=${yuvFps}fps 纹理裸上限=${texFps}fps 选档采用=${sizeMaxFps[s]}fps(已与AE上限${aeMaxFps}取min)")
+                }
+                try {
+                    val hsSizes = map.highSpeedVideoSizes
+                    if (hsSizes != null && hsSizes.isNotEmpty()) {
+                        for (s in hsSizes) {
+                            val r = try { map.getHighSpeedVideoFpsRangesFor(s)?.joinToString() } catch (_: Exception) { "?" }
+                            Log.d("meidui", "📷 [高速会话专用·WebRTC采集不可用] ${s.width}x${s.height} @ $r")
+                        }
+                    } else {
+                        Log.d("meidui", "📷 无高速会话(CONSTRAINED_HIGH_SPEED)能力")
+                    }
+                } catch (_: Exception) {}
+
                 when (facing) {
                     CameraCharacteristics.LENS_FACING_BACK -> {
                         backCameraFormats = sizes
@@ -430,11 +466,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val cameraType = if (front) "前置" else "后置"
         Log.d(TAG, "═══════════════════════════════════════════")
         Log.d(TAG, "📐 $cameraType 4档（iOS目标 → 设备就近采集[60fps优先]，整机最大FPS=$maxFps）：")
+        Log.d("meidui", "📐 ===== $cameraType 选档结果（60fps优先，普通会话AE上限=${maxFps}fps）=====")
         currentLadder.forEach { (profile, preset) ->
             val (tw, th, is169) = iosTargets[profile]!!
             val ratio = if (is169) "16:9" else "4:3"
             val capMax = sizeMaxFps[Size(preset.width, preset.height)] ?: maxFps
             Log.d(TAG, "   ${profileName(profile)}[$ratio] iOS目标${tw}x${th} → 实采${preset.width}x${preset.height} @${preset.fps}fps(该分辨率上限${capMax}fps) → ${preset.minKbps}-${preset.maxKbps}kbps")
+            Log.d("meidui", "📐 ${profileName(profile)}[$ratio] iOS目标${tw}x${th} → 实采${preset.width}x${preset.height}@${preset.fps}fps(该分辨率上限${capMax}fps)")
         }
         Log.d(TAG, "═══════════════════════════════════════════")
     }
@@ -1085,6 +1123,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private var lastAdaptiveProcessTime: Long = 0
     private var lastRemoteFpsTime: Long = 0
     private var lastNotifiedFps: Int = 0
+    // ⭐ 回声抑制（2026-07-02 修「网络好也不回升」根因）：自适应降帧 → sendFpsUpdate 上报 PC/后端 →
+    //   后端把同值经 set_fps 广播回来（日志坐实：降帧 24→20 后 76ms 收到「后端80→推送20」）→
+    //   setTargetFps 若把 targetOutputFps 也写成 20，升帧上限被自己的降帧值锁死 = 单向棘轮，永远回不去。
+    //   记录「我刚上报的值」，短窗口内收到同值 set_fps 判定为回声：只同步编码器、不动 targetOutputFps。
+    @Volatile private var adaptiveEchoFps: Int = -1
+    @Volatile private var adaptiveEchoUntilMs: Long = 0
     
     /**
      * 🔥 v2.1 自适应FPS处理（每秒执行一次）
@@ -1144,7 +1188,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     lastFpsChangeTime = now
                     lastFpsDirectionDown = true
                     Log.d(TAG, "⬇️ [降帧] $oldFps→${adaptiveFps}fps (RTT=${rttMs}ms 丢包=${String.format("%.1f", avgLoss * 100)}%)")
-                    Log.d("meidui", "⚠️ fps修改源=自适应降帧 $oldFps→${adaptiveFps}fps")
+                    // ⭐ 触发依据带全（用户排查「黑背景降帧是不是网络导致」）：rttBad/lossBad 谁触发一眼可见
+                    Log.d("meidui", "⚠️ fps修改源=自适应降帧 $oldFps→${adaptiveFps}fps [依据: RTT=${rttMs}ms(bad=$isRttBad,阈值>${rttDownThreshold}) 3s均丢包=${String.format("%.2f", avgLoss * 100)}%(bad=$isLossBad,阈值>3%)]")
                 }
                 highLossCounter = 0
             }
@@ -1160,7 +1205,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     lastFpsChangeTime = now
                     lastFpsDirectionDown = false
                     Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps=后端目标, RTT=${rttMs}ms)")
-                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps (上限$maxFps)")
+                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps (上限$maxFps=min(后端目标$targetOutputFps,热控))")
                 }
                 lowLossCounter = 0
             }
@@ -1184,9 +1229,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
-            // 通知PC端
+            // 通知PC端（并登记回声期望：后端会把该值经 set_fps 广播回来，勿当成新的用户目标）
             if (adaptiveFps != lastNotifiedFps) {
                 lastNotifiedFps = adaptiveFps
+                adaptiveEchoFps = adaptiveFps
+                adaptiveEchoUntilMs = System.currentTimeMillis() + 10_000
                 WebSocketManager.instance.sendFpsUpdate(adaptiveFps)
             }
         }
@@ -1356,6 +1403,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     "kbps=$kbps fpsStat=$fps " +
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
                                     "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
+                                    "adFps=$adaptiveFps/目标$targetOutputFps " +
                                     "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs}")
                             // ⭐ [meidui 诊断] P2P 推送 fps=0 定性：一行说清卡在哪一层
                             if (currentConnMode == ConnMode.P2P && fps == 0) {
@@ -1940,6 +1988,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun setTargetFps(backendFps: Int) {
         val pushFps = backendFps / 4
         val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
+        // ⭐ 回声抑制：这条 set_fps 若=我们刚经 sendFpsUpdate 上报的自适应值（10s 窗口内），
+        //   是后端的回声、不是用户/PC 的新指令——只让编码器与该值一致（本来就一致），
+        //   【不】下调 targetOutputFps（升帧封顶），否则自适应降一次帧就永远回不去（单向棘轮）。
+        val isAdaptiveEcho = pushFps == adaptiveEchoFps && System.currentTimeMillis() < adaptiveEchoUntilMs
+        if (isAdaptiveEcho) {
+            Log.d("meidui", "🔁 set_fps=$backendFps(÷4=${pushFps}fps) 判定为自适应上报回声，targetOutputFps保持${targetOutputFps}fps不动")
+            return
+        }
         // ⭐ 记录后端目标（= iOS targetOutputFPS）：自适应升帧的封顶值。
         //   不含热控（热控是动态约束，在升帧上限处另行叠加，降温后自动放开）
         targetOutputFps = minOf(pushFps, maxFps).coerceAtLeast(minAdaptiveFps)
