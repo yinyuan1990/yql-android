@@ -511,8 +511,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, capFps)
                 appliedCaptureFps = capFps
                 Log.d(TAG, "🔧 采集格式切换 → ${currentWidth}x${currentHeight}@${capFps}fps")
-                // 🔥 会话重建后重放硬件参数（曝光/对焦/变焦/快门/白平衡）
-                scope.launch { delay(300); applyCameraParams() }
+                // 🔥 会话重建后重放硬件参数（曝光/对焦/变焦/快门/白平衡/AE帧率区间）
+                //    主触发在 onFirstFrameAvailable（确定性）；这里留带重试的兜底
+                applyCameraParamsWithRetry("切档", initialDelayMs = 300)
             } catch (e: Exception) {
                 Log.e(TAG, "切换采集格式失败: ${e.message}")
             }
@@ -591,9 +592,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             isPreviewRunning = true
             Log.d(TAG, "✅ 预览已启动: 采集${currentWidth}x${currentHeight}@${appliedCaptureFps}fps · 推送目标${currentFps}fps (${profileName(currentProfile)})")
             
-            // 🔥 采集会话就绪后注入一次硬件参数：核心是钉死 AE 帧率区间 [fps,fps]，
-            //    否则暗光下相机自动把帧率砍半（30→15，logcat/应用层完全无感知）
-            scope.launch { delay(500); applyCameraParams() }
+            // 🔥 采集会话就绪后注入硬件参数：核心是钉死 AE 帧率区间 [fps,fps]，
+            //    否则暗光下相机自动把帧率砍半（30→15，logcat/应用层完全无感知）。
+            //    主触发在 onFirstFrameAvailable（确定性）；这里留带重试的兜底
+            applyCameraParamsWithRetry("启动预览", initialDelayMs = 500)
         }
     }
     
@@ -1479,10 +1481,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 
                 Log.d(TAG, "🔄 切换到${if (isFront) "前置" else "后置"}摄像头")
                 
+                // 🔥 原生采集器切换后，反射注入的曝光/对焦/变焦/快门/白平衡/AE区间需重放（新会话）
+                //    主触发在 onFirstFrameAvailable（确定性）；这里留带重试的兜底
+                applyCameraParamsWithRetry("切摄像头", initialDelayMs = 300)
                 scope.launch {
-                    // 🔥 原生采集器切换后，反射注入的曝光/对焦/变焦/快门/白平衡需重放（新会话）
-                    delay(300); applyCameraParams()
-                    delay(100); forceKeyframe()
+                    delay(400); forceKeyframe()
                     delay(100); forceKeyframe()
                 }
             }
@@ -1526,7 +1529,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         try {
             videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, target)
             appliedCaptureFps = target
-            scope.launch { delay(300); applyCameraParams() }
+            // 主触发在 onFirstFrameAvailable（确定性）；这里留带重试的兜底
+            applyCameraParamsWithRetry("采集帧率调整", initialDelayMs = 300)
             Log.d(TAG, "🎥 [采集帧率] $reason → ${target}fps（与推送解耦，推送目标=${currentFps}fps）")
         } catch (e: Exception) {
             Log.e(TAG, "采集帧率调整失败($reason): ${e.message}")
@@ -1562,7 +1566,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 Log.d("meidui", "⚠️ 相机冻结: $error")
             }
             override fun onCameraOpening(name: String?) { cameraDead = false }
-            override fun onFirstFrameAvailable() { cameraDead = false }
+            override fun onFirstFrameAvailable() {
+                cameraDead = false
+                // ⭐ 确定性重放点：每次采集会话(重)建后首帧到达 = captureSession 必然就绪、
+                //    currentSession 必然已指向新会话 → 此刻重放硬件参数（核心=AE帧率区间钉死60），
+                //    根治「切档后 AE 没钉上 → 采集掉 30 且切回原挡位也回不去」的注入竞态。
+                //    startPreview/切档/切摄像头/回前台恢复 都会走到这里，无需再赌固定延迟。
+                Log.d("meidui", "📷 会话首帧到达 → 重放硬件参数(钉AE=${captureFps()}fps)")
+                applyCameraParamsWithRetry("会话首帧", attempts = 8, initialDelayMs = 50)
+            }
             override fun onCameraClosed() {}
         }
         return enumerator.createCapturer(target, events)
@@ -1677,9 +1689,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 appliedCaptureFps = capFps
             }
             cameraDead = false
+            // 重开会话后重放硬件参数（AE区间/变焦/对焦等）——主触发在 onFirstFrameAvailable，此为兜底
+            applyCameraParamsWithRetry("恢复采集", initialDelayMs = 500)
             scope.launch {
-                delay(500); applyCameraParams()   // 重开会话后重放硬件参数（AE区间/变焦/对焦等）
-                delay(100); forceKeyframe()       // 观看端立刻有新 IDR，画面秒回
+                delay(600); forceKeyframe()       // 观看端立刻有新 IDR，画面秒回
             }
             Log.d(TAG, "✅ [$reason] 采集已恢复")
         } catch (e: Exception) {
@@ -1920,7 +1933,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 🔥 把当前缓存的全部硬件参数一次性反射注入原生 session（不常驻、不每帧）。
      * 供各 setter 与切档/切摄像头后重放调用。
      */
-    fun applyCameraParams() {
+    fun applyCameraParams(): Boolean {
         val params = Camera2ParamApplier.Params(
             exposureEv = if (_shutterEnabled) null else _currentExposure,
             focus = _currentFocus,
@@ -1933,7 +1946,33 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // ⭐ 用采集帧率（档位60）而非推送目标：否则推送30时 AE 被钉 [30,30]，采集被硬拉回30，解耦失效
             targetFps = captureFps()
         )
-        Camera2ParamApplier.apply(videoCapturer, params)
+        return Camera2ParamApplier.apply(videoCapturer, params)
+    }
+
+    /**
+     * ⭐ 会话(重)建后的硬件参数重放（核心=AE帧率区间钉死）——带重试。
+     * 背景（2026-07-02「切档后采集掉30回不去」根因）：changeCaptureFormat 会销毁并重建
+     * Camera2Session（关相机→重开→configure，常要 300~700ms），固定 delay(300) 一次性注入是
+     * 赌运气：① 新会话未就绪 → 反射拿不到 captureSession → 静默失败无重试；② 更阴险的是
+     * 可能注到「正在销毁的旧会话」上假成功——新会话没钉 AE 区间，WebRTC 自选宽区间(如[15,60])
+     * 在室内光线下 AE 自动落 30fps，于是「切档掉 30、切回原挡位还是 30」。
+     * 现改为：apply 失败按 250ms 重试（最多 attempts 次）；配合 onFirstFrameAvailable 的
+     * 确定性触发（新会话首帧到达=会话必然就绪且 currentSession 已换新），双保险。
+     */
+    private fun applyCameraParamsWithRetry(reason: String, attempts: Int = 12, initialDelayMs: Long = 0) {
+        scope.launch {
+            if (initialDelayMs > 0) delay(initialDelayMs)
+            repeat(attempts) { i ->
+                if (!isPreviewRunning) return@launch
+                if (applyCameraParams()) {
+                    if (i > 0) Log.d(TAG, "✅ [$reason] 硬件参数第${i + 1}次尝试注入成功")
+                    return@launch
+                }
+                delay(250)
+            }
+            Log.w(TAG, "⚠️ [$reason] 硬件参数注入${attempts}次仍失败")
+            Log.d("meidui", "⚠️ [$reason] 硬件参数注入${attempts}次仍失败, AE区间未钉死, 采集fps可能停在WebRTC默认宽区间(~30)")
+        }
     }
 
     /** 设置变焦 (1.0 ~ maxZoom) */
