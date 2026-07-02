@@ -72,6 +72,11 @@ class WebSocketManager private constructor() {
     var onSpecialMessage: ((String, Map<String, Any>) -> Unit)? = null  // 特殊消息
     var onSetFpsCommand: ((Int, String, Int, String) -> Unit)? = null   // 🔥 PC端set_fps指令(fps, urgency, bitrate, reason)
     var onConnectionChanged: ((Boolean) -> Unit)? = null
+    // ⭐ P2P WebRTC 信令（/topic/device/{id}/webrtc 收到的消息，转给 P2PManager.handleSignaling）
+    var onWebRTCSignaling: ((Map<String, Any>) -> Unit)? = null
+    // ⭐ WebSocket 重连成功（P2P 会话需要 ICE Restart）
+    var onReconnected: (() -> Unit)? = null
+    private var hadConnectedOnce = false
     
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -189,23 +194,40 @@ class WebSocketManager private constructor() {
                 stompConnected = true
                 updateState(true)
                 
-                // 订阅设备配置通道
+                // 订阅设备配置通道 + P2P 信令通道（与 iOS 一致）
                 deviceId?.let { id ->
                     val dest = "/topic/device/$id/config"
                     println("wb [WS] 📩 订阅: $dest")
                     subscribe(dest)
+                    val webrtcDest = "/topic/device/$id/webrtc"
+                    println("wb [WS] 📩 订阅: $webrtcDest")
+                    subscribe(webrtcDest)
                 }
+                
+                // ⭐ 重连成功通知（首次连接不算重连）
+                if (hadConnectedOnce) {
+                    onReconnected?.invoke()
+                }
+                hadConnectedOnce = true
                 
                 // 启动状态推送
                 println("wb [WS] 🔄 启动设备状态推送（每秒）")
                 startStatusPush()
             }
             "MESSAGE" -> {
-                // 解析消息体
+                // 解析消息体（按 destination 头路由：/webrtc=P2P信令，其余=配置）
                 val bodyIndex = raw.indexOf("\n\n")
                 if (bodyIndex != -1) {
+                    val headerBlock = raw.substring(0, bodyIndex)
+                    val destination = headerBlock.split("\n")
+                        .firstOrNull { it.startsWith("destination:") }
+                        ?.substringAfter("destination:")?.trim() ?: ""
                     var body = raw.substring(bodyIndex + 2).trimEnd('\u0000')
-                    parseConfigMessage(body)
+                    if (destination.contains("/webrtc")) {
+                        parseWebRTCSignaling(body)
+                    } else {
+                        parseConfigMessage(body)
+                    }
                 }
             }
             "ERROR" -> {
@@ -347,6 +369,48 @@ class WebSocketManager private constructor() {
         }
     }
     
+    // ⭐ P2P WebRTC 信令解析（/topic/device/{id}/webrtc）
+    private fun parseWebRTCSignaling(body: String) {
+        try {
+            @Suppress("UNCHECKED_CAST")
+            val json = gson.fromJson(body, Map::class.java) as? Map<String, Any> ?: return
+            println("wb [P2P] 📥 收到信令: type=${json["type"]}, from=${json["fromDevice"]}")
+            onWebRTCSignaling?.invoke(json)
+        } catch (e: Exception) {
+            Log.e(TAG, "解析 P2P 信令失败: ${e.message}")
+        }
+    }
+    
+    // MARK: - ⭐ P2P WebRTC 信令发送（统一发到 /app/webrtc/signal，与 iOS 完全一致）
+    
+    fun sendWebRTCSignalingSDP(sdpType: String, sdp: String, toDevice: String) {
+        val id = deviceId ?: return
+        sendWebRTCSignalingPayload(mapOf(
+            "type" to "WEBRTC_SDP", "sdpType" to sdpType, "sdp" to sdp,
+            "fromDevice" to id, "toDevice" to toDevice
+        ))
+    }
+    
+    fun sendWebRTCSignalingICE(candidate: String, sdpMid: String, sdpMLineIndex: Int, toDevice: String) {
+        val id = deviceId ?: return
+        sendWebRTCSignalingPayload(mapOf(
+            "type" to "WEBRTC_ICE", "candidate" to candidate, "sdpMid" to sdpMid,
+            "sdpMLineIndex" to sdpMLineIndex, "fromDevice" to id, "toDevice" to toDevice
+        ))
+    }
+    
+    fun sendWebRTCSignaling(type: String, reason: String = "", toDevice: String) {
+        val id = deviceId ?: return
+        val payload = mutableMapOf<String, Any>("type" to type, "fromDevice" to id, "toDevice" to toDevice)
+        if (reason.isNotEmpty()) payload["reason"] = reason
+        sendWebRTCSignalingPayload(payload)
+    }
+    
+    private fun sendWebRTCSignalingPayload(payload: Map<String, Any>) {
+        sendStompMessage("/app/webrtc/signal", gson.toJson(payload))
+        println("wb [P2P] 📤 信令已发送: type=${payload["type"]}, to=${payload["toDevice"]}")
+    }
+    
     // 🔥 处理 set_fps 指令（与iOS handleSetFpsCommand一致）
     private fun handleSetFpsCommand(msgDict: Map<String, Any>) {
         val fps = (msgDict["fps"] as? Number)?.toInt() ?: return
@@ -462,15 +526,18 @@ class WebSocketManager private constructor() {
         val qualityAccess = tokenPrefs?.getString("quality_access", "")
             ?.split(",")?.filter { it.isNotBlank() } ?: emptyList<String>()
         
+        // ⭐ 连接方式由 WebRTCManager 实时决策（0=SRS, 1=P2P），PC 跟随 connectstype 切换（与 iOS 一致）
+        val connectstype = WebRTCManager.effectiveConnectstype
+        val connectMode = if (connectstype == 1) "p2p" else "srs"
+        
         val state = mutableMapOf<String, Any>(
             "networkType" to getNetworkType(),
             "publishStatus" to isPublishingFlag,
             "streamKey" to publishingStreamKey,
             "streamPushIp" to streamPushIp,
-            // 🔥 连接方式（与iOS一致）：SRS固定 connectstype=0 / connectMode="srs"，PC据此拉流
-            "connectstype" to 0,
-            "connectMode" to "srs",
-            "p2pViewerCount" to 0,
+            "connectstype" to connectstype,
+            "connectMode" to connectMode,
+            "p2pViewerCount" to P2PManager.currentViewerCount,
             "kbps" to publishingKbps,
             "fps" to publishingFps,
             "sendFps" to publishingSendFps,

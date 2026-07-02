@@ -317,6 +317,15 @@ fun LoginScreen(
                                         response.status?.let { putString("status", it) }
                                         putInt("bound_control_count", response.boundControlCount ?: 0)
                                         
+                                        // ⭐ 连接方式与 P2P 配置（与iOS一致：后端下发 connectMode="p2p" 即走 P2P 直连）
+                                        putString("connect_mode", (response.connectMode ?: "srs").lowercase())
+                                        putBoolean("force_relay", response.forceRelay ?: false)
+                                        putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
+                                        response.iceServers?.let {
+                                            putString("ice_servers_json", com.google.gson.Gson().toJson(it))
+                                        }
+                                        println("jfh [Login] ✅ 连接方式=${response.connectMode ?: "srs"}, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
+                                        
                                         // 🔥 保存试用/激活信息（与iOS saveTrialInfo完全一致）
                                         response.trialInfo?.let { trial ->
                                             putBoolean("trial_required", trial.trialRequired)

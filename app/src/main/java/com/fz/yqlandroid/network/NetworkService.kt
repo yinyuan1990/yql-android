@@ -596,7 +596,11 @@ data class LoginResponse(
     // 🔥 连接方式（与iOS一致）："srs" | "p2p"，缺省按 srs 走
     val connectMode: String? = null,
     // 🔥 是否需要跳转扫码绑定：1=需要，0=不需要
-    val scan: Int? = null
+    val scan: Int? = null,
+    // ⭐ P2P 配置（与iOS一致，登录时下发）
+    val iceServers: List<IceServer>? = null,   // STUN/TURN 列表
+    val forceRelay: Boolean? = null,           // 强制 TURN 中继
+    val maxP2PViewers: Int? = null             // 最大 P2P 观看端数
 )
 
 /**

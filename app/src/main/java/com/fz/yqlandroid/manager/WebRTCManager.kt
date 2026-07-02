@@ -47,7 +47,7 @@ data class LadderPreset(
  * - 与iOS一致的4档配置：高清/超清/超高清/超高帧
  * - 超高帧(ultra)使用16:9，其他用4:3
  */
-class WebRTCManager(private val context: Context) {
+class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     
     companion object {
         private const val TAG = "WebRTCManager"
@@ -56,7 +56,18 @@ class WebRTCManager(private val context: Context) {
 
         // 🔥 关键帧节奏参数（2026-07-02 起仅按需触发，周期/快速窗口策略已删，见「关键帧」小节）
         private const val REQUEST_KEYFRAME_MIN_INTERVAL_MS = 1000L  // 观看端 request_keyframe 节流
+
+        // ⭐ 连接方式（0=SRS, 1=P2P），WebSocketManager 心跳读取上报，PC 跟随切换（与 iOS 一致）
+        @Volatile var effectiveConnectstype: Int = 0
     }
+
+    // ⭐ 连接模式（静态：登录时 connect_mode 决定，推流期间不自动切换，与 iOS decideMode 一致）
+    enum class ConnMode { SRS, P2P }
+    @Volatile var currentConnMode: ConnMode = ConnMode.SRS
+        private set
+
+    // ⭐ P2P 多会话管理（connect_mode == "p2p" 时启用，与 SRS 互斥）
+    val p2pManager = P2PManager(context)
     
     // WebRTC 核心组件
     private var peerConnectionFactory: PeerConnectionFactory? = null
@@ -223,7 +234,11 @@ class WebRTCManager(private val context: Context) {
         if (adaptiveFps > targetFps) adaptiveFps = targetFps
         currentBitrateKbps = targetKbps
         currentMinBitrateKbps = maxOf(200, (targetKbps * 0.6).toInt())
-        videoSender?.let { sender ->
+        if (currentConnMode == ConnMode.P2P) {
+            // ⭐ P2P：热控约束落到所有直连会话
+            p2pManager.applyBitrateToAllSessions()
+            p2pManager.applyFramerateToAllSessions()
+        } else videoSender?.let { sender ->
             val params = sender.parameters
             if (params.encodings.isNotEmpty()) {
                 params.encodings[0].maxFramerate = targetFps
@@ -549,9 +564,23 @@ class WebRTCManager(private val context: Context) {
             return
         }
         
+        // 先记录参数（RESET_PUBLISH/唤醒重推流依赖 srsIP/baseStreamKey 非空，P2P 模式同样要记）
         srsIP = serverIP
         app = appName
         baseStreamKey = key
+        
+        // ⭐ 静态连接方式决策（与 iOS decideMode 一致）：登录保存的 connect_mode == "p2p" → P2P 直连，
+        //   其它（"srs"/缺省）→ SRS。互斥，一次会话只走一条链路。
+        val connectMode = appContext?.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
+            ?.getString("connect_mode", "srs")?.lowercase() ?: "srs"
+        if (connectMode == "p2p") {
+            currentConnMode = ConnMode.P2P
+            effectiveConnectstype = 1
+            startP2PPublish()
+            return
+        }
+        currentConnMode = ConnMode.SRS
+        effectiveConnectstype = 0
         // 🔥 与iOS一致：streamKey = 基础流名_时间戳（每次推流唯一，避免SRS缓存冲突）
         streamKey = "${key}_${System.currentTimeMillis() / 1000}"
         // 🔥 立即上报给WebSocket，PC据此拉流
@@ -647,11 +676,58 @@ class WebRTCManager(private val context: Context) {
         }
     }
     
+    // MARK: - ⭐ P2P 直连推流（connect_mode == "p2p"，对照 iOS startP2PPublish）
+    
+    /**
+     * P2P 就绪：不建 SRS 连接，等待 PC 发 WEBRTC_REQUEST 后按观看端建独立会话。
+     * 复用现有采集管线（localVideoTrack），信令走 WebSocketManager。
+     */
+    private fun startP2PPublish() {
+        println("jfh [P2P] ═══════════════════════════════════════")
+        println("jfh [P2P] 🚀 启动 P2P 直连模式（不连 SRS，等待 PC 观看请求）")
+        println("jfh [P2P]    档位: ${profileName(currentProfile)}, 采集: ${currentWidth}x${currentHeight}@${currentFps}fps")
+        println("jfh [P2P] ═══════════════════════════════════════")
+        onConnectionStateChanged?.invoke("P2P 等待观看端...")
+        
+        scope.launch {
+            // 确保预览/采集已就绪（视频轨是 P2P 会话的源）
+            if (!isPreviewRunning) {
+                withContext(Dispatchers.Main) { startPreview() }
+            }
+            withContext(Dispatchers.Main) {
+                // 信令接入：WS 收到 /topic/device/{id}/webrtc → P2PManager
+                WebSocketManager.instance.onWebRTCSignaling = { msg -> p2pManager.handleSignaling(msg) }
+                WebSocketManager.instance.onReconnected = { p2pManager.onWebSocketReconnected() }
+                
+                p2pManager.dataSource = this@WebRTCManager
+                p2pManager.start()
+                
+                isPublishing = true
+                WebSocketManager.isPublishingFlag = 1
+                onConnectionStateChanged?.invoke("P2P 就绪")
+                
+                // 统计/自适应与 SRS 同一套（statsPeerConnection 会自动取 P2P 会话）
+                startStats()
+                println("jfh [P2P] ✅ 就绪，等待 PC 发起 WEBRTC_REQUEST")
+            }
+        }
+    }
+    
     fun stopPublish() {
         Log.d(TAG, "🔴 停止推流...")
         
         keyframeJob?.cancel()
         statsJob?.cancel()
+        
+        // ⭐ P2P 模式：关掉所有直连会话即可（无 SRS 流可删）
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.stop()
+            isPublishing = false
+            WebSocketManager.isPublishingFlag = 0
+            onConnectionStateChanged?.invoke("未连接")
+            Log.d(TAG, "✅ P2P 推流已停止")
+            return
+        }
         
         val key = streamKey
         peerConnection?.close()
@@ -668,6 +744,25 @@ class WebRTCManager(private val context: Context) {
         }
         
         Log.d(TAG, "✅ 推流已停止")
+    }
+    
+    // MARK: - ⭐ P2PManager.DataSource（向 P2P 会话提供工厂/视频轨/编码参数）
+    
+    override val p2pFactory: PeerConnectionFactory? get() = peerConnectionFactory
+    override val p2pLocalVideoTrack: VideoTrack? get() = localVideoTrack
+    override fun p2pBitrateRangeKbps(): Pair<Int, Int> {
+        // currentBitrateKbps/currentMinBitrateKbps 已含热控缩放与画质百分比
+        val maxK = maxOf(200, currentBitrateKbps)
+        val minK = maxOf(100, minOf(currentMinBitrateKbps, maxK))
+        return Pair(minK, maxK)
+    }
+    override fun p2pTargetFps(): Int {
+        val maxPushFps = currentLadder[currentProfile]?.maxPushFps ?: 60
+        return minOf(currentFps, maxPushFps, thermalFpsCap).coerceAtLeast(1)
+    }
+    override fun p2pScaleDown(): Double {
+        val preset = currentLadder[currentProfile]
+        return if (preset != null && preset.scaleDown > 1.0) preset.scaleDown else 1.0
     }
     
     /**
@@ -842,6 +937,13 @@ class WebRTCManager(private val context: Context) {
     // MARK: - 编码参数
     
     private fun setEncodingParameters() {
+        // ⭐ P2P：编码参数落到所有直连会话（码率与帧率解耦写入）
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.applyBitrateToAllSessions()
+            p2pManager.applyFramerateToAllSessions()
+            Log.d(TAG, "🔒 [P2P] 编码参数已同步全部直连会话: ${currentMinBitrateKbps}-${currentBitrateKbps}kbps, FPS≤${p2pTargetFps()}")
+            return
+        }
         val sender = videoSender ?: return
         val params = sender.parameters
         if (params.encodings.isEmpty()) return
@@ -867,6 +969,11 @@ class WebRTCManager(private val context: Context) {
     fun setMaxBitrateKbps(kbps: Int) {
         currentBitrateKbps = kbps
         currentMinBitrateKbps = maxOf(100, (kbps * 0.6).toInt())  // 🔥 min≈60%max，允许向下自适应
+        // ⭐ P2P：只写码率、不碰帧率（解耦，避免「调码率改了 fps」——iOS §21.5 的坑）
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.applyBitrateToAllSessions()
+            return
+        }
         val sender = videoSender ?: return
         val params = sender.parameters
         if (params.encodings.isEmpty()) return
@@ -892,6 +999,11 @@ class WebRTCManager(private val context: Context) {
     }
 
     fun forceKeyframe() {
+        // ⭐ P2P：videoSender 恒为 null，必须落到各直连会话（iOS 曾因此断链半年，§21.5 教训）
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.forceKeyframeAllSessions()
+            return
+        }
         val sender = videoSender ?: return
         val params = sender.parameters
         if (params.encodings.isEmpty()) return
@@ -1013,14 +1125,19 @@ class WebRTCManager(private val context: Context) {
         }
         
         if (fpsChanged) {
-            // 更新编码参数
-            val sender = videoSender ?: return
-            val params = sender.parameters
-            if (params.encodings.isNotEmpty()) {
-                params.encodings[0].maxFramerate = adaptiveFps
-                sender.parameters = params
-            }
+            // 先更新 currentFps（P2P 的 p2pTargetFps() 依赖它），再落到编码器
             currentFps = adaptiveFps
+            if (currentConnMode == ConnMode.P2P) {
+                // ⭐ P2P：自适应帧率必须落到各直连会话编码器（videoSender 恒 null，iOS §21.5 教训）
+                p2pManager.applyFramerateToAllSessions()
+            } else {
+                val sender = videoSender ?: return
+                val params = sender.parameters
+                if (params.encodings.isNotEmpty()) {
+                    params.encodings[0].maxFramerate = adaptiveFps
+                    sender.parameters = params
+                }
+            }
             
             // 通知PC端
             if (adaptiveFps != lastNotifiedFps) {
@@ -1054,7 +1171,12 @@ class WebRTCManager(private val context: Context) {
         statsJob = scope.launch {
             while (isActive) {
                 delay(200) // 200ms采集一次（与iOS一致），自适应逻辑内部每秒执行一次
-                peerConnection?.getStats { report ->
+                // ⭐ 统计源按模式选取：SRS 用 peerConnection；P2P 用已连接的观看会话（取一路代表本机发送）。
+                //   iOS 曾因 P2P 模式下统计源为 null 导致 kbps/网络质量/自适应全部空转（§21.5 教训）。
+                val statsPC = if (currentConnMode == ConnMode.P2P)
+                    p2pManager.connectedViewerPeerConnections.firstOrNull()
+                else peerConnection
+                statsPC?.getStats { report ->
                     var bytesSent: Long = 0
                     var fps = 0
                     var packetsSent: Long = 0
@@ -1067,6 +1189,10 @@ class WebRTCManager(private val context: Context) {
                     var qualityLimit = "-"          // 质量受限原因：none/bandwidth/cpu（=WebRTC 为什么降质）
                     var totalPacketSendDelay = 0.0  // 累计发包排队延迟（秒）——攒帧时会飙升
                     
+                    // ⭐ candidate-pair 的 RTT（ICE 层 STUN 自带测量，不依赖对端 RTCP RR）。
+                    //   remote-inbound-rtp 的 roundTripTime 依赖对端发 Receiver Report，P2P 场景可能恒 0 →
+                    //   自适应升降帧判定卡「中等」双向停摆（iOS P2P 已踩此坑）。这里以 candidate-pair 为主源。
+                    var icePairRtt = 0.0
                     report.statsMap.values.forEach { stats ->
                         if (stats.type == "outbound-rtp") {
                             (stats.members["bytesSent"] as? Number)?.let { bytesSent = it.toLong() }
@@ -1082,9 +1208,18 @@ class WebRTCManager(private val context: Context) {
                             (stats.members["packetsLost"] as? Number)?.let { packetsLost = it.toLong() }
                             (stats.members["roundTripTime"] as? Number)?.let { roundTripTime = it.toDouble() }
                         }
+                        if (stats.type == "candidate-pair") {
+                            val nominated = (stats.members["nominated"] as? Boolean) ?: false
+                            val state = stats.members["state"] as? String ?: ""
+                            if (nominated && state == "succeeded") {
+                                (stats.members["currentRoundTripTime"] as? Number)?.let { icePairRtt = it.toDouble() }
+                            }
+                        }
                     }
                     
-                    val rttMs = (roundTripTime * 1000).toInt()
+                    // RTT 主源=ICE candidate-pair；无值时回退 RTCP remote-inbound
+                    val effectiveRtt = if (icePairRtt > 0) icePairRtt else roundTripTime
+                    val rttMs = (effectiveRtt * 1000).toInt()
                     
                     // 计算瞬时丢包率
                     var instantLoss = 0.0
@@ -1514,15 +1649,20 @@ class WebRTCManager(private val context: Context) {
 
         // 1) 更新编码器目标帧率（videoSender 可能在预览未推流时为 null，此时不 return，
         //    仍继续更新采集侧，保证“fps 不反应”问题在预览阶段也能生效）
-        val sender = videoSender
-        if (sender != null) {
-            val params = sender.parameters
-            if (params.encodings.isNotEmpty()) {
-                params.encodings[0].maxFramerate = targetFps
-                sender.parameters = params
-            }
+        if (currentConnMode == ConnMode.P2P) {
+            // ⭐ P2P：帧率落到所有直连会话（p2pTargetFps 读的就是刚更新的 currentFps）
+            p2pManager.applyFramerateToAllSessions()
         } else {
-            Log.d(TAG, "🎬 [FPS] videoSender 尚未就绪(预览中)，仅更新采集帧率")
+            val sender = videoSender
+            if (sender != null) {
+                val params = sender.parameters
+                if (params.encodings.isNotEmpty()) {
+                    params.encodings[0].maxFramerate = targetFps
+                    sender.parameters = params
+                }
+            } else {
+                Log.d(TAG, "🎬 [FPS] videoSender 尚未就绪(预览中)，仅更新采集帧率")
+            }
         }
 
         // 2) 🔥 同步采集侧帧率（此前只改编码器 maxFramerate，采集帧率不变 → 表现为“fps 不反应”）。
