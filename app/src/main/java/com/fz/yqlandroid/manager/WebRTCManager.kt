@@ -2038,6 +2038,34 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
     
     /**
+     * ⭐ cmd=set_fps 指令通道（PC 自适应模块直发，与 iOS applyRemoteFps 完全同语义）：
+     * - fps 已是【推送口径】（PC FPS_LEVELS={15,30,45,60}），【不】除以 4——此前误走 setTargetFps
+     *   把 30 除成 7fps，单位错配（该通道 PC v13 已停发，属休眠 bug，本次对齐修正）；
+     * - 只作用于编码器 + 自适应基准（adaptiveFps/lastRemoteFpsTime/lastNotifiedFps），
+     *   【不】改 targetOutputFps——iOS 同款：持久目标只认 CONFIG_UPDATE 的 fps 字段（÷4 那条）；
+     * - urgency=critical/high 补一发关键帧（iOS 还会临时短 GOP，Android 无 GOP 定时器，仅补 IDR）。
+     */
+    fun applyRemotePushFps(pushFps: Int, urgency: String) {
+        val targetFps = maxOf(minAdaptiveFps, pushFps)
+        adaptiveFps = targetFps
+        lastRemoteFpsTime = System.currentTimeMillis()
+        lastNotifiedFps = targetFps   // 防自适应把同值再上报一遍
+        currentFps = minOf(targetFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.applyFramerateToAllSessions()
+        } else videoSender?.let { sender ->
+            val params = sender.parameters
+            if (params.encodings.isNotEmpty()) {
+                params.encodings[0].maxFramerate = currentFps
+                sender.parameters = params
+            }
+        }
+        if (urgency == "critical" || urgency == "high") forceKeyframe()
+        Log.d(TAG, "🎯 [cmd=set_fps] 推送目标=${currentFps}fps urgency=$urgency（推送口径不÷4，targetOutputFps=${targetOutputFps}不动）")
+        Log.d("meidui", "⚠️ fps修改源=PC指令cmd=set_fps ${pushFps}→${currentFps}fps urgency=$urgency")
+    }
+
+    /**
      * 设置码率/清晰度百分比 (0~100)
      * 与iOS setQualityPercentage 一致
      */

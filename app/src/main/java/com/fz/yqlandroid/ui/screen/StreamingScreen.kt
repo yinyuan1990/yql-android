@@ -185,10 +185,12 @@ fun StreamingScreen(
             }
         }
         
-        // 🔥 监听 PC端 set_fps 指令（与iOS applyRemoteFps一致）
+        // 🔥 监听 PC端 cmd=set_fps 指令（与iOS applyRemoteFps一致）
+        // ⭐ 该通道 fps 已是推送口径（PC FPS_LEVELS={15,30,45,60}），不÷4；
+        //    此前误走 setTargetFps（÷4 通道，专用于 CONFIG_UPDATE 的 fps 字段=0~240）会把 30 除成 7fps
         WebSocketManager.instance.onSetFpsCommand = { fps, urgency, bitrate, reason ->
             Log.d("StreamingScreen", "🎯 [set_fps] fps=$fps, urgency=$urgency")
-            webRTCManager.setTargetFps(fps)
+            webRTCManager.applyRemotePushFps(fps, urgency)
             // 发送确认
             WebSocketManager.instance.sendSetFpsAck(fps)
         }
