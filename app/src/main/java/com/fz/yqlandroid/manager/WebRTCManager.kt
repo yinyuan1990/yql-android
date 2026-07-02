@@ -149,6 +149,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private val thermalManager = ThermalManager(context)
     // 当前热档位对采集/推流的约束：fps 上限 + 码率缩放系数（1.0=不降）
     private var thermalFpsCap: Int = Int.MAX_VALUE
+    // ⭐ 采集帧率的热控上限与推送分离：推流中手机几乎必然升温到 MODERATE(FAIR)，
+    //    若 FAIR 就压采集到 30，「采集60」实际永远保不住（2026-07-02 用户实测：选档60、
+    //    AE被钉[30,30]、capFps=30）。现 FAIR 只降推送/码率不动采集，SERIOUS/CRITICAL 才降采集。
+    private var thermalCaptureFpsCap: Int = Int.MAX_VALUE
     private var thermalBitrateScale: Double = 1.0
     
     // MARK: - 初始化
@@ -221,11 +225,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val basePushFps = minOf(preset?.fps ?: currentFps, preset?.maxPushFps ?: 60, targetOutputFps)
         val baseMaxKbps = preset?.maxKbps ?: currentBitrateKbps
 
+        // ⭐ 推送与采集分开限：FAIR(=MODERATE，推流中常态温度)只降推送/码率，采集保持档位帧率
+        //    （否则「采集60」在实际推流中永远保不住，左上角采集≈推送，解耦形同虚设）；
+        //    SERIOUS/CRITICAL 才连采集一起降（真正过热，减轻传感器/ISP发热）
         when (level) {
-            ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
-            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalBitrateScale = 0.8 }
-            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalBitrateScale = 0.6 }
-            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalBitrateScale = 0.4 }
+            ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalCaptureFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
+            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalCaptureFpsCap = Int.MAX_VALUE; thermalBitrateScale = 0.8 }
+            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalCaptureFpsCap = 20; thermalBitrateScale = 0.6 }
+            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalCaptureFpsCap = 12; thermalBitrateScale = 0.4 }
         }
 
         val targetFps = minOf(basePushFps, thermalFpsCap).coerceAtLeast(1)
@@ -1502,10 +1509,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     //   - 推送帧率 = 编码器 maxFramerate（后端 set_fps/自适应控制），由 libwebrtc 在编码前丢帧
     //     （作用等价 iOS 的 FrameThrottler，预览 sink 在丢帧之前、仍满帧）。
 
-    /** 当前应达到的采集帧率：档位采集 fps（选档时已含该镜头能力上限）+ 热控约束，与推送目标解耦 */
+    /** 当前应达到的采集帧率：档位采集 fps（选档时已含该镜头能力上限）+ 热控约束，与推送目标解耦。
+     *  热控用采集专属上限 thermalCaptureFpsCap（FAIR 不降采集，SERIOUS/CRITICAL 才降），
+     *  不能用推送的 thermalFpsCap——推流常态温度就是 FAIR，用它采集60永远保不住 */
     private fun captureFps(): Int {
         val presetFps = currentLadder[currentProfile]?.fps ?: currentFps
-        return minOf(presetFps, thermalFpsCap).coerceAtLeast(1)
+        return minOf(presetFps, thermalCaptureFpsCap).coerceAtLeast(1)
     }
 
     /** 最近一次实际下发给相机的采集帧率（changeCaptureFormat 会重开会话，相同值不重复下发防闪烁） */
