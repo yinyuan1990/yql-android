@@ -501,6 +501,10 @@ class WebRTCManager(private val context: Context) {
             
             isPreviewRunning = true
             Log.d(TAG, "✅ 预览已启动: ${currentWidth}x${currentHeight}@${currentFps}fps (${profileName(currentProfile)})")
+            
+            // 🔥 采集会话就绪后注入一次硬件参数：核心是钉死 AE 帧率区间 [fps,fps]，
+            //    否则暗光下相机自动把帧率砍半（30→15，logcat/应用层完全无感知）
+            scope.launch { delay(500); applyCameraParams() }
         }
     }
     
@@ -1398,7 +1402,9 @@ class WebRTCManager(private val context: Context) {
             shutterCjfps = if (_shutterEnabled) _currentShutterSpeed else null,
             manualIso = null,
             whiteBalanceSlider = if (_whiteBalanceManual) _currentWhiteBalance else null,
-            whiteBalanceLocked = _whiteBalanceLocked
+            whiteBalanceLocked = _whiteBalanceLocked,
+            // 🔥 钉死 AE 帧率区间，防低光时相机自动 30→15（iOS 无此坑，Android Camera2 经典问题）
+            targetFps = currentFps
         )
         Camera2ParamApplier.apply(videoCapturer, params)
     }

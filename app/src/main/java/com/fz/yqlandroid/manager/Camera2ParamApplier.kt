@@ -10,6 +10,7 @@ import android.hardware.camera2.params.RggbChannelVector
 import android.os.Build
 import android.os.Handler
 import android.util.Log
+import android.util.Range
 import android.view.Surface
 import org.webrtc.CameraVideoCapturer
 
@@ -41,7 +42,8 @@ object Camera2ParamApplier {
         val shutterCjfps: Int? = null,     // 快门 1/cjfps 秒(60~600)，非空=手动曝光(AE OFF)
         val manualIso: Int? = null,        // 手动 ISO（快门模式下）
         val whiteBalanceSlider: Int? = null, // 0..100 手动色温(0冷100暖)
-        val whiteBalanceLocked: Boolean = false // 锁定当前白平衡
+        val whiteBalanceLocked: Boolean = false, // 锁定当前白平衡
+        val targetFps: Int? = null         // 🔥 钉死 AE 帧率区间 [fps,fps]，防低光自动砍半(30→15)
     )
 
     /**
@@ -73,6 +75,7 @@ object Camera2ParamApplier {
             builder.addTarget(surface)
 
             applyExposureAndShutter(builder, characteristics, p)
+            applyFpsRange(builder, characteristics, p)
             applyFocus(builder, characteristics, p)
             applyZoom(builder, characteristics, p)
             applyWhiteBalance(builder, characteristics, p)
@@ -118,6 +121,29 @@ object Camera2ParamApplier {
             }
         } catch (e: Exception) {
             Log.w(TAG, "exposure/shutter 写入失败: ${e.message}")
+        }
+    }
+
+    // ===== AE 帧率区间（防低光降帧） =====
+    // WebRTC Camera2Session 选 AE 区间偏好宽区间(如[15,30])，暗光时 AE 拉长曝光把帧率砍半(30→15)。
+    // 这里改为钉死：优先选 [fps,fps] 固定区间；没有则选下界最高且能覆盖 fps 的区间。
+    private fun applyFpsRange(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
+        try {
+            val fps = p.targetFps ?: return
+            if (fps <= 0) return
+            // 手动快门(AE OFF)时帧率由 SENSOR_EXPOSURE_TIME 决定，AE 区间无效，跳过
+            if (p.shutterCjfps != null && p.shutterCjfps > 0) return
+            val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
+            val exact = ranges.firstOrNull { it.lower == fps && it.upper == fps }
+            val best = exact ?: ranges
+                .filter { it.upper >= fps }
+                .maxWithOrNull(compareBy({ it.lower }, { -it.upper }))
+            if (best != null) {
+                b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(best.lower, best.upper))
+                Log.d(TAG, "🎞️ AE帧率区间钉死: 目标${fps}fps → [${best.lower},${best.upper}]")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fpsRange 写入失败: ${e.message}")
         }
     }
 
