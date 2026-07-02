@@ -1114,9 +1114,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             highLossCounter++
             lowLossCounter = 0
             if (highLossCounter >= downgradeHoldSec) {
-                // ⭐ iOS 阶梯降帧：切到下一档（60→45→30→24→20→15），不再 -5 逐步微调
+                // ⭐ iOS 阶梯降帧：切到下一档（60→45→30→24→20→15），不再 -5 逐步微调。
+                //   方向守卫：adaptiveFps 已低于阶梯最低档（如后端下发极低帧）时兜底值=15 反而更高，
+                //   此时保持不动，绝不在「降帧」分支把帧率调高
                 val newFps = fpsLadder.firstOrNull { it < adaptiveFps } ?: fpsLadder.last()
-                if (newFps != adaptiveFps) {
+                if (newFps < adaptiveFps) {
                     adaptiveFps = newFps
                     fpsChanged = true
                     lastFpsChangeTime = now
