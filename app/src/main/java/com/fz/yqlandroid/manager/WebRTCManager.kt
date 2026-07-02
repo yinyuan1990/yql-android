@@ -1236,6 +1236,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 // ⭐ [meidui 诊断] P2P 推送 fps=0 排查①：统计源为空 → 整个 stats 回调不会执行，
                 //   publishingFps 永远停在 0。每秒打一行会话状态，区分「没PC来看/ICE没连上」vs「连上了但fps读不到」。
                 if (statsPC == null) {
+                    // ⭐ 无统计源（P2P 无人观看/观看端刚断开）：推送帧率/码率清零。
+                    //   否则 UI 与心跳会冻结上一次的旧值——「采集」独立计算一直在动、「推」不动，
+                    //   若采集随后被热控/set_fps 降低，左上角会出现「推>采集」的假象（像是两个数字搞反了）。
+                    if (WebSocketManager.publishingFps != 0 || WebSocketManager.publishingKbps != 0) {
+                        WebSocketManager.publishingFps = 0
+                        WebSocketManager.publishingSendFps = 0
+                        WebSocketManager.publishingKbps = 0
+                    }
+                    onStatsUpdate?.invoke(0, 0, 0)
                     val nowMs = System.currentTimeMillis()
                     if (currentConnMode == ConnMode.P2P && nowMs - lastP2PDiagLogMs >= 1000) {
                         lastP2PDiagLogMs = nowMs
