@@ -164,7 +164,8 @@ fun StreamingScreen(
                 "TryDisconnect" -> {
                     val needDisconnect = messageDict["needDisconnect"] as? Boolean ?: false
                     if (needDisconnect) {
-                        // 强制退出推流
+                        // 强制退出推流（试用到期被踢：禁止 WS 重连健康检查自动拉起推流）
+                        webRTCManager.autoRecoverEnabled = false
                         webRTCManager.stopPublish()
                         keepAliveManager.stop()  // 🔊 断开推流：停止保活
                         isStreaming = false

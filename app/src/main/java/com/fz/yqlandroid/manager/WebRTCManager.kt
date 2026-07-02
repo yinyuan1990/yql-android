@@ -574,6 +574,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         // 🔄 WS 重连成功 → 推流健康检查（两种模式统一，见 onWebSocketReconnected）
         WebSocketManager.instance.onReconnected = { onWebSocketReconnected() }
+        autoRecoverEnabled = true   // 开始推流即恢复自动自愈（睡眠/被踢时会关掉）
         
         // 🔥 与iOS一致：streamKey = 基础流名_时间戳，且【必须在 P2P/SRS 分流之前】生成并上报。
         //    PC 端 MainPage 的拉流入口是 `publishStatus===1 && streamKey非空` 才进（进了才按
@@ -1460,6 +1461,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     // MARK: - 🔄 断线自动恢复推流（2026-07-02）
 
+    /**
+     * ⭐ 自动恢复总开关：睡眠(shuimian)/试用到期踢流(TryDisconnect)等「有意停流」场景必须置 false，
+     * 否则 WS 断线重连后健康检查会把推流自动拉起来，违背停流指令。
+     * startPublish / 唤醒(gongzuo) 重新置 true。
+     */
+    @Volatile var autoRecoverEnabled: Boolean = true
+
     @Volatile private var republishScheduled = false
     private var lastRepublishMs: Long = 0
 
@@ -1483,10 +1491,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             delay(3000)
             republishScheduled = false
             if (srsIP.isEmpty() || baseStreamKey.isEmpty()) return@launch
+            if (!autoRecoverEnabled) return@launch   // 期间收到睡眠/被踢 → 放弃重推
             withContext(Dispatchers.Main) { stopPublish() }
             delay(500)
             withContext(Dispatchers.Main) {
-                startPublish(srsIP, app, baseStreamKey)  // 内部重新生成时间戳流名
+                if (autoRecoverEnabled) startPublish(srsIP, app, baseStreamKey)  // 内部重新生成时间戳流名
             }
         }
     }
@@ -1502,6 +1511,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun onWebSocketReconnected() {
         scope.launch {
             withContext(Dispatchers.Main) {
+                if (!autoRecoverEnabled) {
+                    Log.d(TAG, "⏭️ [WS重连] 自动恢复已关闭（睡眠/被踢停流中），跳过健康检查")
+                    return@withContext
+                }
                 Log.d(TAG, "🔄 [WS重连] 推流健康检查: publishing=$isPublishing mode=$currentConnMode")
                 Log.d("meidui", "⚠️ WS重连 → 推流健康检查 publishing=$isPublishing mode=$currentConnMode")
                 recoverCaptureIfNeeded("ws_reconnect")
@@ -1751,6 +1764,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
             "shuimian" -> {
                 Log.d(TAG, "💤 收到睡眠指令，停止采集")
+                autoRecoverEnabled = false   // ⭐ 有意停流：禁止 WS 重连健康检查把推流自动拉起来
                 scope.launch {
                     withContext(Dispatchers.Main) {
                         stopPublish()
@@ -1760,6 +1774,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
             "gongzuo" -> {
                 Log.d(TAG, "☀️ 收到唤醒指令，重新推流")
+                autoRecoverEnabled = true
                 scope.launch {
                     withContext(Dispatchers.Main) { startPreview() }
                     delay(500)
