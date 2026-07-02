@@ -77,11 +77,17 @@ class P2PManager(private val context: Context) {
     /** 已连接（ICE connected/completed）的观看会话，供 WebRTCManager 采集码率/网络 stats。 */
     val connectedViewerPeerConnections: List<PeerConnection>
         get() = synchronized(viewerSessions) {
-            viewerSessions.values.filter {
-                val s = it.iceConnectionState()
-                s == PeerConnection.IceConnectionState.CONNECTED ||
-                        s == PeerConnection.IceConnectionState.COMPLETED
-            }
+            // ⭐ 按 pcId 排序保证稳定顺序（iOS 曾因 Dictionary 无序导致多观看端统计基线来回跳 →
+            //   假 PLI 风暴/假丢包，引发攒帧卡顿。LinkedHashMap 本身有序，排序双保险：
+            //   首路观看端断开重连后插入顺序变化时基线也不跳）。
+            viewerSessions.entries
+                .sortedBy { it.key }
+                .map { it.value }
+                .filter {
+                    val s = it.iceConnectionState()
+                    s == PeerConnection.IceConnectionState.CONNECTED ||
+                            s == PeerConnection.IceConnectionState.COMPLETED
+                }
         }
 
     val viewerCount: Int get() = synchronized(viewerSessions) { viewerSessions.size }
