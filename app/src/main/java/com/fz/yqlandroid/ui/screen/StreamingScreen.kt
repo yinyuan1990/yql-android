@@ -48,12 +48,15 @@ fun StreamingScreen(
 ) {
     val context = LocalContext.current
     
-    // 权限
+    // 权限（Android 13+ 需要通知权限，否则前台服务保活通知不显示）
     val permissionsState = rememberMultiplePermissionsState(
-        permissions = listOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        )
+        permissions = buildList {
+            add(Manifest.permission.CAMERA)
+            add(Manifest.permission.RECORD_AUDIO)
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     )
     
     // WebRTC管理器
@@ -70,6 +73,19 @@ fun StreamingScreen(
             activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             keepAliveManager.stop()
         }
+    }
+
+    // 🔄 回前台自动恢复采集：前台服务是主保障，这里是双保险——
+    //    部分 OEM 电池优化仍可能在后台断相机，ON_RESUME 时若推流中但采集已死则自动重启相机会话
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                webRTCManager.recoverCaptureIfNeeded("onResume")
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     
     // UI状态

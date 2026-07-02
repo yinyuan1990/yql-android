@@ -42,7 +42,7 @@ class KeepAliveManager(context: Context) {
     private var audioTrack: AudioTrack? = null
     private var writerThread: Thread? = null
 
-    /** 启动保活：无声音频 + WakeLock。重复调用安全（幂等）。 */
+    /** 启动保活：前台服务(camera) + 无声音频 + WakeLock。重复调用安全（幂等）。 */
     @Synchronized
     fun start() {
         if (running) {
@@ -50,16 +50,21 @@ class KeepAliveManager(context: Context) {
             return
         }
         running = true
+        // 🔥 2026-07-02 后台断流根治：无声音频/WakeLock 只能保 CPU，保不住相机——
+        //    Android 9+ 后台应用会被系统直接断开 CameraDevice（约1分钟内），
+        //    必须挂 camera 类型前台服务系统才允许后台继续采集。
+        com.fz.yqlandroid.service.StreamingForegroundService.start(appContext)
         acquireWakeLock()
         startSilentAudio()
-        Log.d(TAG, "🔊 后台保活已启动（无声音频 + WakeLock）")
+        Log.d(TAG, "🔊 后台保活已启动（前台服务 + 无声音频 + WakeLock）")
     }
 
-    /** 停止保活：释放音频与 WakeLock。重复调用安全（幂等）。 */
+    /** 停止保活：释放前台服务、音频与 WakeLock。重复调用安全（幂等）。 */
     @Synchronized
     fun stop() {
         if (!running) return
         running = false
+        com.fz.yqlandroid.service.StreamingForegroundService.stop(appContext)
         stopSilentAudio()
         releaseWakeLock()
         Log.d(TAG, "🔇 后台保活已停止")

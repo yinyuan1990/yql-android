@@ -1412,6 +1412,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     
     // MARK: - 辅助方法
     
+    // ⭐ 相机被系统断开标记（后台被收回/被其它应用抢占/HAL错误）。回前台时据此自动恢复采集。
+    @Volatile private var cameraDead = false
+
     private fun createCameraCapturer(useFront: Boolean): CameraVideoCapturer {
         // 🔥 使用 WebRTC 原生 Camera2 采集器（低发热，走 WebRTC 优化纹理管线）。
         //    曝光/对焦/变焦/快门/白平衡改由 Camera2ParamApplier 反射原生 session 按需注入（见 docs 十五）。
@@ -1423,7 +1426,61 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         } ?: names.firstOrNull()
         ?: throw IllegalStateException("找不到可用摄像头")
         Log.d(TAG, "🎥 原生采集器: camera=$target front=$useFront")
-        return enumerator.createCapturer(target, null)
+        // ⭐ 挂相机事件回调：此前传 null，相机被系统断开（切后台约1分钟）应用完全无感知，
+        //    回前台也不知道要恢复——这是「后台断流、回来不自动推」的感知缺失一环
+        val events = object : CameraVideoCapturer.CameraEventsHandler {
+            override fun onCameraError(error: String?) {
+                cameraDead = true
+                Log.e(TAG, "📷❌ 相机错误: $error")
+                Log.d("meidui", "⚠️ 相机错误(cameraDead=true): $error")
+            }
+            override fun onCameraDisconnected() {
+                cameraDead = true
+                Log.e(TAG, "📷🔌 相机被系统断开（后台被收回/被抢占）")
+                Log.d("meidui", "⚠️ 相机被系统断开(cameraDead=true)，回前台将自动恢复")
+            }
+            override fun onCameraFreezed(error: String?) {
+                Log.w(TAG, "📷🥶 相机冻结: $error")
+                Log.d("meidui", "⚠️ 相机冻结: $error")
+            }
+            override fun onCameraOpening(name: String?) { cameraDead = false }
+            override fun onFirstFrameAvailable() { cameraDead = false }
+            override fun onCameraClosed() {}
+        }
+        return enumerator.createCapturer(target, events)
+    }
+
+    /**
+     * ⭐ App 回前台自动恢复采集（配合前台服务作双保险）：
+     * 部分 OEM 电池优化仍可能在后台杀相机——回前台时若推流中但相机已死/采集未跑，重启采集。
+     * 只重启相机会话，不动 videoSource/localVideoTrack/PeerConnection（推流链路无缝续上）。
+     */
+    fun recoverCaptureIfNeeded(reason: String) {
+        if (!isPublishing) return
+        val needRestart = cameraDead || !isPreviewRunning
+        if (!needRestart) {
+            Log.d(TAG, "▶️ [$reason] 采集正常，无需恢复")
+            return
+        }
+        Log.w(TAG, "🔄 [$reason] 检测到采集中断(cameraDead=$cameraDead, preview=$isPreviewRunning)，自动恢复...")
+        Log.d("meidui", "⚠️ 回前台自动恢复采集 reason=$reason cameraDead=$cameraDead preview=$isPreviewRunning")
+        try {
+            if (!isPreviewRunning) {
+                startPreview()
+            } else {
+                // 同一 capturer 重开相机（CameraCapturer.startCapture 内部会重新 openCamera）
+                try { videoCapturer?.stopCapture() } catch (_: Exception) {}
+                videoCapturer?.startCapture(currentWidth, currentHeight, currentFps)
+            }
+            cameraDead = false
+            scope.launch {
+                delay(500); applyCameraParams()   // 重开会话后重放硬件参数（AE区间/变焦/对焦等）
+                delay(100); forceKeyframe()       // 观看端立刻有新 IDR，画面秒回
+            }
+            Log.d(TAG, "✅ [$reason] 采集已恢复")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ [$reason] 恢复采集失败: ${e.message}")
+        }
     }
     
     // MARK: - 🔥 后端配置下发处理（与iOS applyThinRemoteConfig一致）

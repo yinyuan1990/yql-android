@@ -23,6 +23,12 @@
     <!-- 保持屏幕常亮 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- 🔊 推流前台服务（Android 9+ 后台禁用相机，必须挂 camera 类型前台服务才能后台推流） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:usesCleartextTraffic="true"
@@ -47,6 +53,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 🔊 推流前台服务：推流期间常驻，保证切后台/息屏时摄像头不被系统断开 -->
+        <service
+            android:name=".service.StreamingForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
     </application>
 
 </manifest>
