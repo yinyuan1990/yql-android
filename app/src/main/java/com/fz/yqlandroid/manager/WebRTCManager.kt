@@ -322,10 +322,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 🔥 从摄像头支持列表中选择最接近目标的分辨率
      * 避免请求不支持的分辨率导致崩溃
      *
-     * 选档策略（用户要求：相同/接近分辨率时高帧率优先）：
-     *   1. 先在“能达到 desiredFps（默认 60）的分辨率”里，选面积最接近目标的；
-     *   2. 只有当没有任何分辨率支持 desiredFps 时，才在全体候选里选面积最接近的（此时可能只有 30fps）。
-     * 这样避免了“选到最接近但只支持 30fps 的分辨率、而旁边有个能跑 60fps 的近似分辨率被忽略”的问题。
+     * 选档策略（2026-07-02 用户指定：60fps 采集优先于一切）：
+     *   ① 先筛「能采 desiredFps（默认 60）」的分辨率（前/后镜头各自的 sizeMaxFps 能力表）；
+     *   ② 在 60fps 集合里再做比例匹配（5% 误差，匹配不到放宽）→ 面积就近；
+     *   ③ 整机没有任何 60fps 采集分辨率时才退回 30：在全体候选里 比例 → 面积就近。
+     * 与旧版的差别：旧版先卡比例再筛 60fps——当比例匹配的子集都不支持 60、而其它比例
+     * 有 60fps 分辨率时，会错过 60 直接落到 30；现在 fps 优先级最高，不会再错过。
      */
     private fun findBestResolution(
         formats: List<Size>,
@@ -337,27 +339,27 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     ): Size {
         if (formats.isEmpty()) return Size(targetWidth, targetHeight)
         
-        // 过滤比例（允许5%误差）
-        val candidates = if (aspectRatio != null) {
-            formats.filter {
+        val targetArea = targetWidth * targetHeight
+        // 比例匹配（允许5%误差；匹配不到时放宽为原列表，不因比例丢掉候选）
+        fun ratioMatched(list: List<Size>): List<Size> {
+            if (aspectRatio == null) return list
+            return list.filter {
                 val ratio = it.width.toDouble() / it.height.toDouble()
                 Math.abs(ratio - aspectRatio) < 0.05
-            }.ifEmpty { formats }
-        } else {
-            formats
+            }.ifEmpty { list }
         }
-        
-        val targetArea = targetWidth * targetHeight
-        val nearestByArea: (List<Size>) -> Size? = { list ->
+        fun nearestByArea(list: List<Size>): Size? =
             list.minByOrNull { Math.abs(it.width * it.height - targetArea) }
+        
+        // ① 60fps 优先于一切：先把能采 desiredFps 的分辨率挑出来
+        val fps60 = formats.filter { (sizeMaxFps[it] ?: 30) >= desiredFps }
+        if (fps60.isNotEmpty()) {
+            // ② 60fps 集合内：比例 → 面积就近
+            nearestByArea(ratioMatched(fps60))?.let { return it }
         }
         
-        // 🔥 第一优先级：能跑 desiredFps 的分辨率里，选面积最接近目标的
-        val highFpsCandidates = candidates.filter { (sizeMaxFps[it] ?: 30) >= desiredFps }
-        nearestByArea(highFpsCandidates)?.let { return it }
-        
-        // 回退：没有任何分辨率支持 desiredFps，则在全体候选里选面积最接近的
-        return nearestByArea(candidates) ?: Size(targetWidth, targetHeight)
+        // ③ 该镜头无任何 60fps 采集分辨率 → 退回 30：全体候选里 比例 → 面积就近
+        return nearestByArea(ratioMatched(formats)) ?: Size(targetWidth, targetHeight)
     }
     
     // MARK: - 🔥 动态计算档位配置
