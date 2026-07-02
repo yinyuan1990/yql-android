@@ -569,6 +569,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         app = appName
         baseStreamKey = key
         
+        // 🔥 与iOS一致：streamKey = 基础流名_时间戳，且【必须在 P2P/SRS 分流之前】生成并上报。
+        //    PC 端 MainPage 的拉流入口是 `publishStatus===1 && streamKey非空` 才进（进了才按
+        //    connectstype 分 P2P/SRS）——此前 P2P 分支提前 return 没设 streamKey，PC 收到的
+        //    CONFIG_STATE 里 streamKey=""，整个拉流分支不进 → 永远不发 WEBRTC_REQUEST →
+        //    Android 一直「无观看会话」、推送 fps=0（§21.14 诊断日志坐实）。
+        streamKey = "${key}_${System.currentTimeMillis() / 1000}"
+        WebSocketManager.publishingStreamKey = streamKey
+        
         // ⭐ 静态连接方式决策（与 iOS decideMode 一致）：登录保存的 connect_mode == "p2p" → P2P 直连，
         //   其它（"srs"/缺省）→ SRS。互斥，一次会话只走一条链路。
         val connectMode = appContext?.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
@@ -581,10 +589,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
         currentConnMode = ConnMode.SRS
         effectiveConnectstype = 0
-        // 🔥 与iOS一致：streamKey = 基础流名_时间戳（每次推流唯一，避免SRS缓存冲突）
-        streamKey = "${key}_${System.currentTimeMillis() / 1000}"
-        // 🔥 立即上报给WebSocket，PC据此拉流
-        WebSocketManager.publishingStreamKey = streamKey
         
         println("jfh [推流] ═══════════════════════════════════════")
         println("jfh [推流] 🚀 开始推流")
@@ -724,6 +728,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             p2pManager.stop()
             isPublishing = false
             WebSocketManager.isPublishingFlag = 0
+            WebSocketManager.publishingStreamKey = ""  // 与 iOS stopPublish 一致，PC 据空值退出拉流分支
             onConnectionStateChanged?.invoke("未连接")
             Log.d(TAG, "✅ P2P 推流已停止")
             return
@@ -736,6 +741,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         isPublishing = false
         WebSocketManager.isPublishingFlag = 0
+        WebSocketManager.publishingStreamKey = ""  // 与 iOS stopPublish 一致，清空流名
         onConnectionStateChanged?.invoke("未连接")
         
         // 🔥 与iOS SRSManager.stop() 一致：通知SRS删除该推流
