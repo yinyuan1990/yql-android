@@ -626,6 +626,10 @@ class WebSocketManager private constructor() {
             "type" to "CONFIG_UPDATE",
             "deviceId" to id,
             "config" to config,
+            // ⭐ 与 iOS 一致：带 operator=自己，广播回来时被 parseConfigMessage 的
+            //   「跳过自己发送的消息」自检过滤（此前缺这个字段 → 自检永远不命中 →
+            //   自己上报的 fps 回声被当成后端新指令处理，见 §21.21b 回声棘轮）
+            "operator" to id,
             "timestamp" to System.currentTimeMillis()
         )
         
