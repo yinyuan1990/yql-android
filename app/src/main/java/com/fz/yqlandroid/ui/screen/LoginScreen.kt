@@ -56,6 +56,8 @@ fun LoginScreen(
     var rememberPassword by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    // ⭐ 连接方式（与 iOS 登录页一致：用户手选、记住上次选择、覆盖后端下发）："srs" | "p2p"
+    var selectedConnectMode by remember { mutableStateOf("srs") }
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
@@ -72,6 +74,8 @@ fun LoginScreen(
             password = savedPassword
             rememberPassword = true
         }
+        // ⭐ 恢复上次选择的连接方式（与 iOS ConnectModeOption.lastSelected 一致，默认 SRS）
+        selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
     }
     
     // 渐变背景
@@ -249,6 +253,43 @@ fun LoginScreen(
                             color = Color(0xFF1A1A1A)
                         )
                     }
+                    
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 30.dp),
+                        color = Color(0xFFF0F0F0)
+                    )
+                    
+                    // ⭐ 连接方式选择（与 iOS 登录页一致：SRS / P2P 手选，记住上次选择）
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "连接方式",
+                            fontSize = 16.sp,
+                            color = Color(0xFF1A1A1A)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        listOf("srs" to "SRS", "p2p" to "P2P").forEach { (mode, label) ->
+                            val selected = selectedConnectMode == mode
+                            Box(
+                                modifier = Modifier
+                                    .padding(end = 8.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
+                                    .clickable { selectedConnectMode = mode }
+                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontSize = 14.sp,
+                                    color = if (selected) Color.White else Color(0xFF666666)
+                                )
+                            }
+                        }
+                    }
                 }
             }
             
@@ -298,6 +339,8 @@ fun LoginScreen(
                                             remove("password")
                                         }
                                         putBoolean("remember", rememberPassword)
+                                        // ⭐ 记住本次选择的连接方式（下次登录默认）
+                                        putString("selected_connect_mode", selectedConnectMode)
                                         apply()
                                     }
                                     
@@ -317,14 +360,14 @@ fun LoginScreen(
                                         response.status?.let { putString("status", it) }
                                         putInt("bound_control_count", response.boundControlCount ?: 0)
                                         
-                                        // ⭐ 连接方式与 P2P 配置（与iOS一致：后端下发 connectMode="p2p" 即走 P2P 直连）
-                                        putString("connect_mode", (response.connectMode ?: "srs").lowercase())
+                                        // ⭐ 连接方式与 P2P 配置（与iOS一致：以用户在登录页的手动选择为准，覆盖后端下发）
+                                        putString("connect_mode", selectedConnectMode)
                                         putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         response.iceServers?.let {
                                             putString("ice_servers_json", com.google.gson.Gson().toJson(it))
                                         }
-                                        println("jfh [Login] ✅ 连接方式=${response.connectMode ?: "srs"}, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
+                                        println("jfh [Login] ✅ 连接方式(用户选)=$selectedConnectMode, 后端下发=${response.connectMode ?: "nil"}, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
                                         
                                         // 🔥 保存试用/激活信息（与iOS saveTrialInfo完全一致）
                                         response.trialInfo?.let { trial ->
