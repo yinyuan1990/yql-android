@@ -253,6 +253,12 @@ class P2PManager(private val context: Context) {
 
     private fun handleRemoteAnswer(sdp: String, pcId: String) {
         val pc = synchronized(viewerSessions) { viewerSessions[pcId] } ?: return
+        // ⭐ [meidui 诊断] 打出 PC Answer 实际协商到的视频 codec（应为 H264；出现 VP8/VP9 = munge 没生效）
+        run {
+            val codecs = Regex("a=rtpmap:\\d+\\s+([A-Za-z0-9]+)/90000").findAll(sdp)
+                .map { it.groupValues[1] }.filter { !it.equals("rtx", true) }.distinct().toList()
+            Log.d("meidui", "P2P Answer($pcId) 协商视频codec=${codecs.joinToString("/")}")
+        }
         val answer = SessionDescription(SessionDescription.Type.ANSWER, sdp)
         pc.setRemoteDescription(object : SdpObserver {
             override fun onCreateSuccess(s: SessionDescription?) {}
@@ -367,9 +373,14 @@ class P2PManager(private val context: Context) {
         newPC.createOffer(object : SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 if (sdp == null) return
-                newPC.setLocalDescription(SilentSdpObserver, sdp)
-                WebSocketManager.instance.sendWebRTCSignalingSDP("offer", sdp.description, pcId)
-                Log.d(TAG, "📤 已发送 Offer 给 $pcId")
+                // ⭐ H264 限定（对齐 iOS preferredCodec=H264）：Android DefaultVideoEncoderFactory
+                //   的 codec 顺序是软件编码器(VP8/VP9/AV1)在前、H264 在后 → Offer 首选 VP8；
+                //   PC GStreamer 是 Answerer 且解码链路写死 rtph264depay(只解 H264)，
+                //   协商成 VP8 = ICE 连上但画面永远出不来（SRS 不受影响：SRS Answer 只回 H264）。
+                val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                newPC.setLocalDescription(SilentSdpObserver, munged)
+                WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
+                Log.d(TAG, "📤 已发送 Offer 给 $pcId（H264 限定）")
             }
             override fun onCreateFailure(e: String?) { Log.e(TAG, "❌ 创建 Offer 失败 $pcId: $e") }
             override fun onSetSuccess() {}
@@ -484,8 +495,10 @@ class P2PManager(private val context: Context) {
             pc.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription?) {
                     if (sdp == null) return
-                    pc.setLocalDescription(SilentSdpObserver, sdp)
-                    WebSocketManager.instance.sendWebRTCSignalingSDP("offer", sdp.description, pcId)
+                    // ⭐ ICE Restart 的 Offer 同样做 H264 限定（与首次 Offer 一致，防重协商时倒回 VP8）
+                    val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                    pc.setLocalDescription(SilentSdpObserver, munged)
+                    WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
                     Log.d(TAG, "🔄 ICE Restart Offer 已发送 $pcId (${cur + 1}/$MAX_ICE_RETRIES)")
                 }
                 override fun onCreateFailure(e: String?) { Log.e(TAG, "ICE Restart Offer 失败 $pcId: $e") }
@@ -573,6 +586,61 @@ class P2PManager(private val context: Context) {
         if (params.encodings.isEmpty()) return
         params.encodings[0].maxFramerate = ds.p2pTargetFps()
         sender.parameters = params
+    }
+
+    // MARK: - SDP codec 限定（对齐 iOS preferredCodec=H264，见 createViewerSession 处注释）
+
+    /**
+     * 把 m=video 段限定为 H264（含其关联 RTX）：
+     * - 重写 m=video 行的 payload 列表（H264 pt 在前、RTX pt 在后，其余剔除）；
+     * - 删除被剔除 pt 的 a=rtpmap / a=rtcp-fb / a=fmtp 行；
+     * - 找不到 H264（个别设备无 H264 硬编）或解析异常时原样返回，绝不因 munge 弄坏协商。
+     */
+    internal fun forceH264InVideoSection(sdp: String): String {
+        return try {
+            val lines = sdp.split("\r\n").toMutableList()
+            val mVideoIdx = lines.indexOfFirst { it.startsWith("m=video ") }
+            if (mVideoIdx < 0) return sdp
+            var sectionEnd = lines.size
+            for (i in mVideoIdx + 1 until lines.size) {
+                if (lines[i].startsWith("m=")) { sectionEnd = i; break }
+            }
+
+            val rtpmapRe = Regex("^a=rtpmap:(\\d+)\\s+([^/]+)/")
+            val fmtpAptRe = Regex("^a=fmtp:(\\d+)\\s+.*apt=(\\d+)")
+            val h264Pts = LinkedHashSet<String>()
+            for (i in mVideoIdx + 1 until sectionEnd) {
+                val m = rtpmapRe.find(lines[i]) ?: continue
+                if (m.groupValues[2].equals("H264", ignoreCase = true)) h264Pts.add(m.groupValues[1])
+            }
+            if (h264Pts.isEmpty()) {
+                Log.w(TAG, "⚠️ Offer 无 H264（设备无 H264 编码器？），SDP 原样发出")
+                return sdp
+            }
+            val rtxPts = LinkedHashSet<String>()
+            for (i in mVideoIdx + 1 until sectionEnd) {
+                val m = fmtpAptRe.find(lines[i]) ?: continue
+                if (m.groupValues[2] in h264Pts) rtxPts.add(m.groupValues[1])
+            }
+            val keep = h264Pts + rtxPts
+
+            // 重写 m=video 行：m=video <port> <proto> <pt...>
+            val mTokens = lines[mVideoIdx].split(" ")
+            if (mTokens.size <= 3) return sdp
+            lines[mVideoIdx] = (mTokens.take(3) + h264Pts + rtxPts).joinToString(" ")
+
+            // 剔除非 H264 pt 的属性行（倒序删避免索引错位）
+            val ptAttrRe = Regex("^a=(rtpmap|rtcp-fb|fmtp):(\\d+)[\\s:]?")
+            for (i in sectionEnd - 1 downTo mVideoIdx + 1) {
+                val m = ptAttrRe.find(lines[i]) ?: continue
+                if (m.groupValues[2] !in keep) lines.removeAt(i)
+            }
+            Log.d(TAG, "🎬 Offer 已限定 H264: pt=${h264Pts.joinToString("/")}, rtx=${rtxPts.joinToString("/")}")
+            lines.joinToString("\r\n")
+        } catch (e: Exception) {
+            Log.e(TAG, "forceH264InVideoSection 解析失败，SDP 原样发出: ${e.message}")
+            sdp
+        }
     }
 
     private object SilentSdpObserver : SdpObserver {
