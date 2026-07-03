@@ -57,6 +57,10 @@ class P2PManager(private val context: Context) {
     private val pendingIceRestart = HashSet<String>()
     private val iceRetryCount = HashMap<String, Int>()
     private val forceRelayPeerIds = HashSet<String>()      // ICE 失败黑名单 → 重建时强制 relay
+    // ⭐ §25.7b：链路择优的 relay 钉住集合。与 forceRelayPeerIds 的区别：**跨会话拆建存活**
+    //（removeViewerSession 不清除，仅 closeAllViewerSessions 清），因为硬切中继 = 拆会话让 PC
+    // 重新 REQUEST，重建时必须还记得「这个 PC 要走 relay」。
+    private val qualityRelayPeerIds = HashSet<String>()
     private val peerNetworkType = HashMap<String, String>() // pcDeviceId → "cellular"/"wifi"/...
     // ⭐ 会话创建时间：① WEBRTC_REQUEST 去重只在 3s 内生效（防切网后卡死的 CONNECTING 僵尸会话
     //   永远吞掉 PC 的重连请求）；② 创建后 1s 内到达的 WEBRTC_HANGUP 视为旧会话残留信令，忽略
@@ -178,7 +182,8 @@ class P2PManager(private val context: Context) {
 
     private fun effectiveForceRelay(pcId: String): Boolean {
         if (forceRelay) return true
-        return isOnCellular || peerNetworkType[pcId] == "cellular" || forceRelayPeerIds.contains(pcId)
+        return isOnCellular || peerNetworkType[pcId] == "cellular" || forceRelayPeerIds.contains(pcId) ||
+                qualityRelayPeerIds.contains(pcId)
     }
 
     private fun loadIceServers(): List<PeerConnection.IceServer> {
@@ -423,6 +428,7 @@ class P2PManager(private val context: Context) {
         pendingIceRestart.clear()
         iceRetryCount.clear()
         forceRelayPeerIds.clear()
+        qualityRelayPeerIds.clear()   // §25.7b：整体停止才清 relay 钉住（单会话拆建不清）
         peerNetworkType.clear()
     }
 
@@ -516,9 +522,15 @@ class P2PManager(private val context: Context) {
     /**
      * 直连路径质量持续差（由 WebRTCManager stats 判定：ICE RTT >300ms 持续 10s）时，
      * 把所有会话切到 TURN 中继。
-     * 做法：setConfiguration(RELAY) + ICE Restart Offer（不整拆会话，旧路径持续出画面直到
-     * 新 relay 路径 nominated，比 remove+create 重建平滑得多）。pcId 进 forceRelayPeerIds
-     * （会话期内单向不回切，后续切网/重建也保持 relay），会话拆除时随 removeViewerSession 自动清除。
+     * 两级策略（§25.7b，2026-07-03 iOS 实测日志定型）：
+     * - **第一次触发 = 软切**：setConfiguration(RELAY) + ICE Restart Offer（不整拆会话，旧路径
+     *   持续出画面直到新 relay 路径 nominated）。Chromium 内核（网页内核）走这条即可完成切换。
+     * - **第二次触发（10s 后路径仍是直连）= 硬切**：实测 GStreamer webrtcbin 收到新 ufrag 的
+     *   Offer 不重启 libnice、不重新收集候选（回了 Answer 但零新增本地候选），软切必然失效。
+     *   升级为：pcId 钉进 qualityRelayPeerIds（跨会话存活）→ 拆会话 → 发
+     *   WEBRTC_HANGUP(network_switch_reconnect)（PC 已有处理：不拆 pipeline，自动重发
+     *   WEBRTC_REQUEST）→ 重建的会话 effectiveForceRelay=true，从建会话起就只走 TURN。
+     *   网页内核第一次软切就生效、到不了第二次，不受硬切 HANGUP（网页内核收 HANGUP 停播不重连）影响。
      */
     fun switchAllSessionsToRelay(reason: String) {
         mainScope.launch {
@@ -533,7 +545,16 @@ class P2PManager(private val context: Context) {
             }
             val sessions = synchronized(viewerSessions) { viewerSessions.toMap() }
             for ((pcId, pc) in sessions) {
-                if (forceRelayPeerIds.contains(pcId)) continue
+                if (forceRelayPeerIds.contains(pcId)) {
+                    // 已软切过仍被再次触发 = 路径还是直连，对端不支持 ICE Restart（GStreamer）→ 硬切
+                    if (qualityRelayPeerIds.contains(pcId)) continue   // 硬切也做过 = 等重建，别重复拆
+                    qualityRelayPeerIds.add(pcId)
+                    Log.w(TAG, "🔨 软切中继未生效(路径仍直连，对端不支持 ICE Restart) → 硬切重建 $pcId reason=$reason")
+                    Log.d("meidui", "🔨 [P2P线路] 软切未生效 → 硬切重建(拆会话+network_switch_reconnect) $pcId")
+                    removeViewerSession(pcId, notifyPC = false)
+                    WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
+                    continue
+                }
                 forceRelayPeerIds.add(pcId)
                 try {
                     // Android 无 pc.configuration 读取器 → 按 createViewerSession 同参重建配置，仅传输策略改 RELAY
