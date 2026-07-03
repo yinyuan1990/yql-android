@@ -511,6 +511,69 @@ class P2PManager(private val context: Context) {
         }
     }
 
+    // MARK: - 链路择优（§25.7：直连质量差 → 主动切中继，对照 iOS switchAllSessionsToRelay 移植）
+
+    /**
+     * 直连路径质量持续差（由 WebRTCManager stats 判定：ICE RTT >300ms 持续 10s）时，
+     * 把所有会话切到 TURN 中继。
+     * 做法：setConfiguration(RELAY) + ICE Restart Offer（不整拆会话，旧路径持续出画面直到
+     * 新 relay 路径 nominated，比 remove+create 重建平滑得多）。pcId 进 forceRelayPeerIds
+     * （会话期内单向不回切，后续切网/重建也保持 relay），会话拆除时随 removeViewerSession 自动清除。
+     */
+    fun switchAllSessionsToRelay(reason: String) {
+        mainScope.launch {
+            val servers = loadIceServers()
+            // 无 TURN 服务器时强制 relay = 零候选必死，直接放弃
+            val hasTurn = servers.any { s ->
+                s.urls.any { it.startsWith("turn:") || it.startsWith("turns:") }
+            }
+            if (!hasTurn) {
+                Log.w(TAG, "⚠️ 切中继请求被忽略（无 TURN 服务器配置）reason=$reason")
+                return@launch
+            }
+            val sessions = synchronized(viewerSessions) { viewerSessions.toMap() }
+            for ((pcId, pc) in sessions) {
+                if (forceRelayPeerIds.contains(pcId)) continue
+                forceRelayPeerIds.add(pcId)
+                try {
+                    // Android 无 pc.configuration 读取器 → 按 createViewerSession 同参重建配置，仅传输策略改 RELAY
+                    val cfg = PeerConnection.RTCConfiguration(servers)
+                    cfg.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                    cfg.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                    cfg.bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+                    cfg.rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+                    cfg.iceCandidatePoolSize = 2
+                    cfg.iceConnectionReceivingTimeout = 8000
+                    cfg.iceBackupCandidatePairPingInterval = 2000
+                    cfg.iceTransportsType = PeerConnection.IceTransportsType.RELAY
+                    pc.setConfiguration(cfg)
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ 切中继 setConfiguration 失败 $pcId: ${e.message}")
+                    continue
+                }
+                pendingIceRestart.add(pcId)
+                val cons = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                }
+                pc.createOffer(object : SdpObserver {
+                    override fun onCreateSuccess(sdp: SessionDescription?) {
+                        if (sdp == null) return
+                        val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                        pc.setLocalDescription(SilentSdpObserver, munged)
+                        WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
+                        Log.d(TAG, "🔀 已切中继并发送 ICE Restart Offer → $pcId reason=$reason")
+                        Log.d("meidui", "🔀 [P2P线路] 已切中继+ICE Restart → $pcId reason=$reason")
+                    }
+                    override fun onCreateFailure(e: String?) { Log.e(TAG, "❌ 切中继 Offer 创建失败 $pcId: $e") }
+                    override fun onSetSuccess() {}
+                    override fun onSetFailure(e: String?) {}
+                }, cons)
+            }
+        }
+    }
+
     // MARK: - 编码参数（码率与帧率解耦，AllSessions 遍历 —— iOS §21.5 教训）
 
     /** 仅同步「码率」到所有直连会话（不改 maxFramerate）。 */

@@ -876,8 +876,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     override val p2pLocalVideoTrack: VideoTrack? get() = localVideoTrack
     override fun p2pBitrateRangeKbps(): Pair<Int, Int> {
         // currentBitrateKbps/currentMinBitrateKbps 已含热控缩放与画质百分比
-        val maxK = maxOf(200, currentBitrateKbps)
-        val minK = maxOf(100, minOf(currentMinBitrateKbps, maxK))
+        var maxK = maxOf(200, currentBitrateKbps)
+        var minK = maxOf(100, minOf(currentMinBitrateKbps, maxK))
+        // ⭐ §25.5-1：选中路径=TURN 中继时整体钳到 relayMaxKbps，
+        //   防止高档位把中继灌崩（min 也一起钳，否则 libwebrtc 被下限焊死无法退让）。
+        if (p2pPathIsRelay && maxK > relayMaxKbps) {
+            maxK = relayMaxKbps
+            minK = minOf(minK, relayMaxKbps * 6 / 10)   // 下限同步压到上限的 60%
+        }
         return Pair(minK, maxK)
     }
     override fun p2pTargetFps(): Int {
@@ -1320,6 +1326,25 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ UI 采集帧率：独立计数基线（在循环层每秒算一次，不依赖 statsPC/getStats 回调）
     private var uiLastCapFrameCount: Long = 0
     private var uiLastCapSampleMs: Long = 0
+
+    // ⭐ §25.5-1（2026-07-03 对照 iOS 移植）：P2P 选中路径走 TURN 中继时的码率钳制。
+    //   中继实测：高档位 7.5Mbps 灌 TURN → 缓冲堆积 → RTT 5.6s → ICE 断链；coturn 已加
+    //   max-bps≈4Mbps 服务器兜底，客户端在编码器层主动钳到 relayMaxKbps 更平滑。
+    //   由 stats 的 transport.selectedCandidatePairId + local-candidate.candidateType 判定，
+    //   路径切换（直连↔中继）时自动重算并经 p2pBitrateRangeKbps 下发。
+    @Volatile private var p2pPathIsRelay = false
+    private val relayMaxKbps = 3000   // 中继单路码率上限（< coturn max-bps 4Mbps，留余量）
+
+    // ⭐ §25.7（2026-07-03 对照 iOS 移植）：链路择优——直连质量持续差 → 主动切中继。
+    //   iOS 实测（同一烂 WiFi）：中继 RTT=93ms 流畅、直连 RTT=533ms 卡死（链路层重传+缓冲膨胀，
+    //   丢包恒 0%），但 ICE 只按候选类型优先级选路（srflx > relay）不看质量 → 锁死在烂直连。
+    //   规则：P2P 选中路径=直连 且 ICE 层 RTT 持续 > directBadRttMs 达 directBadHoldMs →
+    //   调 P2PManager.switchAllSessionsToRelay 对全部会话 setConfiguration(RELAY) + ICE Restart。
+    //   单向操作：会话期内不切回直连（pcId 进 forceRelayPeerIds），拆会话自动清除。
+    //   只用 ICE candidate-pair RTT 判定（STUN 探测、不受拉流端 RR 污染）。
+    private var directBadSinceMs: Long = 0
+    private val directBadRttMs = 300        // 直连 ICE RTT 阈值（中继实测 ~93ms，留足余量）
+    private val directBadHoldMs = 10_000L   // 持续时长（防瞬时抖动误切）
     
     private fun startStats() {
         statsJob?.cancel()
@@ -1400,7 +1425,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     // ⭐ candidate-pair 的 RTT（ICE 层 STUN 自带测量，不依赖对端 RTCP RR）。
                     //   remote-inbound-rtp 的 roundTripTime 依赖对端发 Receiver Report，P2P 场景可能恒 0 →
                     //   自适应升降帧判定卡「中等」双向停摆（iOS P2P 已踩此坑）。这里以 candidate-pair 为主源。
-                    var icePairRtt = 0.0
+                    // ⭐ §25.5/§25.7：选中候选对 + 本地候选类型 → 判定选中路径是直连还是 TURN 中继
+                    var selectedPairId: String? = null                     // transport.selectedCandidatePairId
+                    val pairRttSec = HashMap<String, Double>()             // pairId → currentRoundTripTime(秒)
+                    val pairLocalCandId = HashMap<String, String>()        // pairId → localCandidateId
+                    val nominatedPairIds = mutableListOf<String>()         // 兜底：nominated+succeeded 的 pair
+                    val localCandType = HashMap<String, String>()          // candidateId → host/srflx/prflx/relay
                     report.statsMap.values.forEach { stats ->
                         if (stats.type == "outbound-rtp") {
                             sawVideoOutbound = true
@@ -1417,18 +1447,58 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             (stats.members["packetsLost"] as? Number)?.let { packetsLost = it.toLong() }
                             (stats.members["roundTripTime"] as? Number)?.let { roundTripTime = it.toDouble() }
                         }
+                        if (stats.type == "transport") {
+                            (stats.members["selectedCandidatePairId"] as? String)?.let { selectedPairId = it }
+                        }
                         if (stats.type == "candidate-pair") {
+                            (stats.members["currentRoundTripTime"] as? Number)?.let { pairRttSec[stats.id] = it.toDouble() }
+                            (stats.members["localCandidateId"] as? String)?.let { pairLocalCandId[stats.id] = it }
                             val nominated = (stats.members["nominated"] as? Boolean) ?: false
                             val state = stats.members["state"] as? String ?: ""
-                            if (nominated && state == "succeeded") {
-                                (stats.members["currentRoundTripTime"] as? Number)?.let { icePairRtt = it.toDouble() }
-                            }
+                            if (nominated && state == "succeeded") nominatedPairIds.add(stats.id)
+                        }
+                        if (stats.type == "local-candidate") {
+                            (stats.members["candidateType"] as? String)?.let { localCandType[stats.id] = it }
                         }
                     }
-                    
+
+                    // ⭐ 选中候选对：优先 transport.selectedCandidatePairId，否则取 nominated+succeeded 的第一个
+                    val activePairId = selectedPairId ?: nominatedPairIds.firstOrNull()
+                    // ICE 层 RTT（秒）：仅在选中候选对上有读数时采用
+                    val icePairRtt = activePairId?.let { pairRttSec[it] }?.takeIf { it > 0 } ?: 0.0
+                    // 选中路径是否走 TURN 中继
+                    val pathIsRelay = activePairId?.let { pairLocalCandId[it] }
+                        ?.let { localCandType[it] } == "relay"
+
                     // RTT 主源=ICE candidate-pair；无值时回退 RTCP remote-inbound
                     val effectiveRtt = if (icePairRtt > 0) icePairRtt else roundTripTime
                     val rttMs = (effectiveRtt * 1000).toInt()
+
+                    // ⭐ §25.5-1：选中路径 relay 状态同步（首次/变化时触发中继码率钳制重下发）
+                    if (activePairId != null && pathIsRelay != p2pPathIsRelay) {
+                        p2pPathIsRelay = pathIsRelay
+                        Log.d("meidui", "[线路] 选中路径=${if (pathIsRelay) "中继(relay)" else "直连"} → 码率区间重算")
+                        if (currentConnMode == ConnMode.P2P) {
+                            p2pManager.applyBitrateToAllSessions()
+                        }
+                    }
+
+                    // ⭐ §25.7 链路择优：直连 ICE RTT 持续差 → 主动切中继（仅 ICE 层 RTT，不用 RR）
+                    val iceRttMs = (icePairRtt * 1000).toInt()
+                    if (currentConnMode == ConnMode.P2P && activePairId != null && !pathIsRelay &&
+                        iceRttMs > directBadRttMs) {
+                        val nowMs = System.currentTimeMillis()
+                        if (directBadSinceMs == 0L) {
+                            directBadSinceMs = nowMs
+                        } else if (nowMs - directBadSinceMs >= directBadHoldMs) {
+                            directBadSinceMs = 0
+                            Log.d("meidui", "[线路] 🔀直连质量差(ICE RTT=${iceRttMs}ms>${directBadRttMs}ms " +
+                                    "持续${directBadHoldMs / 1000}s) → 主动切中继")
+                            p2pManager.switchAllSessionsToRelay("direct_rtt_${iceRttMs}ms")
+                        }
+                    } else {
+                        directBadSinceMs = 0
+                    }
                     
                     // 计算瞬时丢包率
                     var instantLoss = 0.0
