@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit
 
 // ===== 档位定义（与iOS LadderProfile一致，共4档：3个4:3 + 1个16:9） =====
 enum class LadderProfile {
+    LOW,        // 超低网 (4:3, 目标640x480；§21.28 多数机型原生640x480只有30fps → 由最低档缩放而来)
     STANDARD,   // 高清   (4:3)
     HIGH,       // 超清   (4:3)
     ULTRA,      // 超高帧 (16:9)
@@ -412,7 +413,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         LadderProfile.P4K to Triple(1920, 1440, false),      // 超高清 4:3
         LadderProfile.HIGH to Triple(1440, 1080, false),     // 超清   4:3
         LadderProfile.STANDARD to Triple(1024, 768, false),  // 高清   4:3
-        LadderProfile.ULTRA to Triple(1280, 720, true)       // 超高帧 16:9
+        LadderProfile.ULTRA to Triple(1280, 720, true),      // 超高帧 16:9
+        LadderProfile.LOW to Triple(640, 480, false)         // 超低网 4:3（§21.28 第5档）
     )
 
     private fun calculateLadder(front: Boolean) {
@@ -444,9 +446,37 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val highCap = nearest(LadderProfile.HIGH)
         val stdCap = nearest(LadderProfile.STANDARD)
         val ultraCap = nearest(LadderProfile.ULTRA)
-        
-        // 🔥 4档预设：width/height=就近采集分辨率，fps=该分辨率实际可用帧率(60优先)，scaleDown=1.0（直接采集不缩放）
+        val lowCap = nearest(LadderProfile.LOW)
+
+        // §21.28 超低网(low)第5档：目标输出 640x480。多数机型原生 640x480 采集只有 30fps ——
+        //   若原生就近分辨率的帧率不低于 STANDARD 档（即原生就是最优解）则直接采集不缩放；
+        //   否则采集用 STANDARD 的分辨率（60fps 优先选出来的），编码前 scaleResolutionDownBy
+        //   缩到 640x480（scaleDown 链路 SRS/P2P 两路本就打通：setEncodingParameters + p2pScaleDown）。
+        val lowNativeFps = fpsFor(lowCap)
+        val stdFps = fpsFor(stdCap)
+        val lowPreset = if (lowNativeFps >= stdFps) {
+            LadderPreset(
+                width = lowCap.width, height = lowCap.height,
+                fps = lowNativeFps, maxKbps = 1500, minKbps = 900,
+                maxPushFps = 60, scaleDown = 1.0, is16x9 = false
+            )
+        } else {
+            LadderPreset(
+                width = stdCap.width, height = stdCap.height,
+                fps = stdFps, maxKbps = 1500, minKbps = 900,
+                maxPushFps = 60,
+                scaleDown = maxOf(1.0, stdCap.height.toDouble() / 480.0),
+                is16x9 = false
+            )
+        }
+        Log.d("meidui", "📐 超低网(low)决策: 原生640x480就近=${lowCap.width}x${lowCap.height}@${lowNativeFps}fps, " +
+                "STANDARD采集=${stdCap.width}x${stdCap.height}@${stdFps}fps → " +
+                if (lowPreset.scaleDown > 1.0) "采集${lowPreset.width}x${lowPreset.height}缩放/${"%.2f".format(lowPreset.scaleDown)}到640x480"
+                else "原生直采不缩放")
+
+        // 🔥 5档预设：width/height=就近采集分辨率，fps=该分辨率实际可用帧率(60优先)，scaleDown=1.0（直接采集不缩放；low 档除外）
         currentLadder = mapOf(
+            LadderProfile.LOW to lowPreset,
             LadderProfile.P4K to LadderPreset(
                 width = p4kCap.width, height = p4kCap.height,
                 fps = fpsFor(p4kCap), maxKbps = 7500, minKbps = 4500,
@@ -532,6 +562,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         LadderProfile.P4K -> "超高清(p4k)"
         LadderProfile.ULTRA -> "超高帧(ultra)"
         LadderProfile.HIGH -> "超清(high)"
+        LadderProfile.LOW -> "超低网(low)"
         LadderProfile.STANDARD -> "高清(standard)"
     }
     
@@ -1814,6 +1845,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH
+                    // §21.28 超低网独立成档（PC 发 type="low"；此前落 else 与高清同档）
+                    "low" -> LadderProfile.LOW
                     else -> LadderProfile.STANDARD
                 }
                 if (currentProfile != profile) {

@@ -153,6 +153,7 @@ fun StreamingScreen(
                         "ultra" -> "超高帧"
                         "high" -> "超清"
                         "standard" -> "高清"
+                        "low" -> "超低网"
                         else -> selectedProfile
                     }
                 }
