@@ -378,7 +378,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         targetHeight: Int,
         aspectRatio: Double? = null,  // null=不限，16/9=16:9，4/3=4:3
         sizeMaxFps: Map<Size, Int> = emptyMap(),
-        desiredFps: Int = 60
+        desiredFps: Int = 60,
+        // §21.28b：low 档取「真·原生就近」时置 false——否则 60fps 优先会把 640x480(30fps)
+        // 筛掉、把 lowCap 拉到大分辨率（常=STANDARD 同款），导致超低网与高清完全一样。
+        fpsPriority: Boolean = true
     ): Size {
         if (formats.isEmpty()) return Size(targetWidth, targetHeight)
         
@@ -394,11 +397,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         fun nearestByArea(list: List<Size>): Size? =
             list.minByOrNull { Math.abs(it.width * it.height - targetArea) }
         
-        // ① 60fps 优先于一切：先把能采 desiredFps 的分辨率挑出来
-        val fps60 = formats.filter { (sizeMaxFps[it] ?: 30) >= desiredFps }
-        if (fps60.isNotEmpty()) {
-            // ② 60fps 集合内：比例 → 面积就近
-            nearestByArea(ratioMatched(fps60))?.let { return it }
+        // ① 60fps 优先于一切：先把能采 desiredFps 的分辨率挑出来（fpsPriority=false 时跳过，纯就近）
+        if (fpsPriority) {
+            val fps60 = formats.filter { (sizeMaxFps[it] ?: 30) >= desiredFps }
+            if (fps60.isNotEmpty()) {
+                // ② 60fps 集合内：比例 → 面积就近
+                nearestByArea(ratioMatched(fps60))?.let { return it }
+            }
         }
         
         // ③ 该镜头无任何 60fps 采集分辨率 → 退回 30：全体候选里 比例 → 面积就近
@@ -435,7 +440,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             return findBestResolution(
                 formats, tw, th,
                 if (is169) 16.0 / 9.0 else 4.0 / 3.0,
-                sizeMaxFps, desiredFps
+                sizeMaxFps, desiredFps,
+                // §21.28b：LOW 档要「真·原生 640x480 就近」——不带 60fps 优先。
+                //   否则 640x480 只有 30fps 的机型会被筛掉，lowCap 被拉到大分辨率
+                //  （常=STANDARD 同款）→ lowNativeFps>=stdFps 恒成立 → 超低网与高清完全一样。
+                fpsPriority = (profile != LadderProfile.LOW)
             )
         }
         // 🔥 该分辨率实际可用采集帧率：min(60, 分辨率支持fps, 整机maxFps)
