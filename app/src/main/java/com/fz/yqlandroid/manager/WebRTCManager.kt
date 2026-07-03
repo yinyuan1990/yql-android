@@ -640,6 +640,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    Android 一直「无观看会话」、推送 fps=0（§21.14 诊断日志坐实）。
         streamKey = "${key}_${System.currentTimeMillis() / 1000}"
         WebSocketManager.publishingStreamKey = streamKey
+
+        // ⭐ P2P诊断日志上报（总后台开关控制）：按推流ID分流，采集 logcat 的 meidui/P2PManager/jfh 行
+        P2PLogReporter.start(streamKey)
         
         // ⭐ 静态连接方式决策（与 iOS decideMode 一致）：登录保存的 connect_mode == "p2p" → P2P 直连，
         //   其它（"srs"/缺省）→ SRS。互斥，一次会话只走一条链路。
@@ -786,6 +789,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         keyframeJob?.cancel()
         statsJob?.cancel()
+        
+        // ⭐ P2P诊断日志上报：停流即冲刷剩余并停止采集
+        P2PLogReporter.stop()
         
         // ⭐ P2P 模式：关掉所有直连会话即可（无 SRS 流可删）
         if (currentConnMode == ConnMode.P2P) {
