@@ -122,15 +122,32 @@ object Camera2ParamApplier {
             val cj = p.shutterCjfps
             if (cj != null && cj > 0) {
                 // 🔥 手动快门(保留 cjfps 能力)：AE OFF + SENSOR_EXPOSURE_TIME + 手动 ISO
+                // ⭐ [meidui 诊断] 快门"无作用"排查：手动曝光需要 MANUAL_SENSOR 能力，
+                //   LEGACY/部分 LIMITED 机型没有 → SENSOR_EXPOSURE_TIME 会被 HAL 静默忽略。
+                val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                val hasManualSensor = caps?.contains(
+                    CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+                val hwLevel = when (c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+                    CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
+                    CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
+                    CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
+                    CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
+                    else -> "UNKNOWN"
+                }
                 val expRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
                 val isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 var expNs = 1_000_000_000L / cj
+                val wantNs = expNs
                 if (expRange != null) expNs = expNs.coerceIn(expRange.lower, expRange.upper)
                 b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expNs)
                 val iso = p.manualIso ?: isoRange?.let { (it.lower + it.upper) / 2 } ?: 400
                 val safeIso = if (isoRange != null) iso.coerceIn(isoRange.lower, isoRange.upper) else iso
                 b.set(CaptureRequest.SENSOR_SENSITIVITY, safeIso)
+                Log.d("meidui", "📸 [快门] 注入 1/${cj}s: 请求exp=${wantNs / 1000}us → clamp后=${expNs / 1000}us" +
+                        " (设备范围=${expRange?.lower?.div(1000)}~${expRange?.upper?.div(1000)}us)" +
+                        " iso=$safeIso MANUAL_SENSOR=$hasManualSensor hwLevel=$hwLevel" +
+                        if (!hasManualSensor) " ⚠️ 该机型无手动曝光能力，HAL 会忽略快门设置(快门无作用的根因)" else "")
             } else {
                 // 自动曝光 + 曝光补偿(EV)
                 b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)

@@ -132,6 +132,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ 采集帧率（相机实际吐帧率，每秒回调一次）——在统计循环层计算，
     //   不依赖 statsPC（P2P 无观看会话时也有值），供 UI 左上角显示
     var onCapFpsUpdate: ((Int) -> Unit)? = null
+    // ⭐ PC 观看端连接状态（每秒回调）：P2P=有 ICE 已连接的观看会话；
+    //   SRS/通用=最近 6s 内收到过 PC 的 VIEWER_HEARTBEAT（PC 出画面才发心跳）。
+    var onPcConnectedUpdate: ((Boolean) -> Unit)? = null
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -629,8 +632,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         app = appName
         baseStreamKey = key
         
-        // 🔄 WS 重连成功 → 推流健康检查（两种模式统一，见 onWebSocketReconnected）
+        // 🔄 WS 重连成功 → 推流健康检查（两种模式统一，见 publishHealthCheck）
         WebSocketManager.instance.onReconnected = { onWebSocketReconnected() }
+        // 📶 §21.27 网络切换监听（统一入口，P2P/SRS 共用；切网 → publishHealthCheck 同一出口）
+        startNetworkMonitoring()
         autoRecoverEnabled = true   // 开始推流即恢复自动自愈（睡眠/被踢时会关掉）
         
         // 🔥 与iOS一致：streamKey = 基础流名_时间戳，且【必须在 P2P/SRS 分流之前】生成并上报。
@@ -789,6 +794,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         keyframeJob?.cancel()
         statsJob?.cancel()
+        
+        // 📶 §21.27 网络切换监听随推流生命周期（统一入口在 WebRTCManager）
+        stopNetworkMonitoring()
         
         // ⭐ P2P诊断日志上报：停流即冲刷剩余并停止采集
         P2PLogReporter.stop()
@@ -1295,7 +1303,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         val capFpsUi = ((capNow - uiLastCapFrameCount) / dt).toInt()
                         uiLastCapFrameCount = capNow
                         uiLastCapSampleMs = nowMs
-                        withContext(Dispatchers.Main) { onCapFpsUpdate?.invoke(capFpsUi) }
+                        // ⭐ PC 连接判定：P2P 看 ICE 已连接会话；心跳兜底两模式通用
+                        //   （PC 每秒发 VIEWER_HEARTBEAT，仅在画面实际显示 fps>0 时发）。
+                        val heartbeatAlive =
+                            nowMs - WebSocketManager.instance.lastViewerHeartbeatAtMs < 6000
+                        val pcConnected = if (currentConnMode == ConnMode.P2P)
+                            p2pManager.connectedViewerPeerConnections.isNotEmpty() || heartbeatAlive
+                        else heartbeatAlive
+                        withContext(Dispatchers.Main) {
+                            onCapFpsUpdate?.invoke(capFpsUi)
+                            onPcConnectedUpdate?.invoke(pcConnected)
+                        }
                     }
                 }
                 // ⭐ 统计源按模式选取：SRS 用 peerConnection；P2P 用已连接的观看会话（取一路代表本机发送）。
@@ -1635,39 +1653,111 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 3. P2P → 全部会话 ICE Restart（原有逻辑）；
      * 4. SRS → 媒体连接已死则自动重推。
      */
-    fun onWebSocketReconnected() {
+    fun onWebSocketReconnected() = publishHealthCheck("WS重连")
+
+    /**
+     * ⭐ §21.27 推流健康检查（网络恢复类事件的【统一出口】）：WS 重连成功、切网（WS 仍连着）
+     * 两个入口都汇到这里，动作一致：
+     * 1. 采集死了 → 恢复采集（后台被收相机的场景）；
+     * 2. 完全没在推流（进程被冻结期间停掉）→ 自动重新推流；
+     * 3. P2P → 全部会话 ICE Restart；
+     * 4. SRS → 媒体连接已死则自动重推。
+     */
+    private fun publishHealthCheck(source: String) {
         scope.launch {
             withContext(Dispatchers.Main) {
                 if (!autoRecoverEnabled) {
-                    Log.d(TAG, "⏭️ [WS重连] 自动恢复已关闭（睡眠/被踢停流中），跳过健康检查")
+                    Log.d(TAG, "⏭️ [$source] 自动恢复已关闭（睡眠/被踢停流中），跳过健康检查")
                     return@withContext
                 }
-                Log.d(TAG, "🔄 [WS重连] 推流健康检查: publishing=$isPublishing mode=$currentConnMode")
-                Log.d("meidui", "⚠️ WS重连 → 推流健康检查 publishing=$isPublishing mode=$currentConnMode")
-                recoverCaptureIfNeeded("ws_reconnect")
+                Log.d(TAG, "🔄 [$source] 推流健康检查: publishing=$isPublishing mode=$currentConnMode")
+                Log.d("meidui", "⚠️ $source → 推流健康检查 publishing=$isPublishing mode=$currentConnMode")
+                recoverCaptureIfNeeded(source)
                 if (!isPublishing) {
                     // 之前推过流（参数还在）→ 自动恢复推流
                     if (srsIP.isNotEmpty() && baseStreamKey.isNotEmpty()) {
-                        Log.w(TAG, "🔄 [WS重连] 未在推流 → 自动重新推流")
+                        Log.w(TAG, "🔄 [$source] 未在推流 → 自动重新推流")
                         startPublish(srsIP, app, baseStreamKey)
                     }
                     return@withContext
                 }
                 if (currentConnMode == ConnMode.P2P) {
-                    p2pManager.onWebSocketReconnected()   // 各会话 ICE Restart
+                    p2pManager.restartAllSessions(source)   // 各会话 ICE Restart / 僵尸会话拆除
                 } else {
                     val st = try { peerConnection?.iceConnectionState() } catch (_: Exception) { null }
                     if (st == null ||
                         st == PeerConnection.IceConnectionState.FAILED ||
                         st == PeerConnection.IceConnectionState.DISCONNECTED ||
                         st == PeerConnection.IceConnectionState.CLOSED) {
-                        scheduleSrsRepublish("WS重连后媒体连接=$st")
+                        scheduleSrsRepublish("${source}后媒体连接=$st")
                     } else {
-                        Log.d(TAG, "▶️ [WS重连] SRS 媒体连接正常($st)，无需重推")
+                        Log.d(TAG, "▶️ [$source] SRS 媒体连接正常($st)，无需重推")
                     }
                 }
             }
         }
+    }
+
+    // ===== §21.27 网络切换监听（统一入口，P2P/SRS 两模式共用；P2PManager 不再自注册监听）=====
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var lastNetEventMs = 0L
+
+    private fun startNetworkMonitoring() {
+        if (netCallback != null) return
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as android.net.ConnectivityManager
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: android.net.Network,
+                caps: android.net.NetworkCapabilities
+            ) {
+                val cellular = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                        !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+                // 蜂窝状态喂给 P2PManager（relay 策略用）；网络类型变化=切网事件
+                if (p2pManager.updateCellularState(cellular)) {
+                    onNetworkChanged("类型变化(蜂窝=$cellular)")
+                }
+            }
+            override fun onAvailable(network: android.net.Network) {
+                // 换 WiFi / 断网恢复通常经历 onAvailable
+                onNetworkChanged("网络可用")
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+            Log.d(TAG, "📶 [网络监听] 已注册（统一入口）")
+        } catch (e: Exception) {
+            Log.e(TAG, "📶 [网络监听] 注册失败: ${e.message}")
+        }
+    }
+
+    private fun stopNetworkMonitoring() {
+        val cb = netCallback ?: return
+        netCallback = null
+        try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as android.net.ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {}
+    }
+
+    /** 切网事件统一入口：5s 节流 → WS 活着就立即健康检查；WS 已断就等 WS 重连回调（同一出口） */
+    private fun onNetworkChanged(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastNetEventMs < 5000) return
+        lastNetEventMs = now
+        if (!isPublishing && (srsIP.isEmpty() || baseStreamKey.isEmpty())) return
+        val wsConnected = WebSocketManager.instance.isConnected
+        Log.d(TAG, "📶 [切网] $reason mode=$currentConnMode ws=$wsConnected")
+        Log.d("meidui", "📶 [切网统一入口] $reason mode=$currentConnMode wsConnected=$wsConnected")
+        if (!wsConnected) {
+            // 切网瞬间 WS 多半已死：信令发不出去，此刻做任何重连都是黑洞。
+            // WS 自动重连成功后 onReconnected → publishHealthCheck("WS重连")，同一出口兜住。
+            Log.d("meidui", "📶 [切网] WS 断开中，等 WS 重连后由健康检查统一处理")
+            return
+        }
+        publishHealthCheck("切网($reason)")
     }
 
     /**
@@ -1766,9 +1856,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             
             // 快门速度（采集帧率）: 60~600
             "cjfps" -> {
-                (config["cjfps"] as? Number)?.let { cj ->
+                val cj = (config["cjfps"] as? Number)
+                if (cj != null) {
+                    Log.d("meidui", "📸 [快门链路①] 收到 ptype=cjfps 值=${cj.toInt()} → setShutterSpeed")
                     setShutterSpeed(cj.toInt())
                     Log.d(TAG, "📸 [快门] cjfps=${cj.toInt()} → 1/${cj.toInt()}s")
+                } else {
+                    Log.w(TAG, "⚠️ ptype=cjfps 但值缺失/非数字: ${config["cjfps"]}")
+                    Log.d("meidui", "📸 [快门链路①] ptype=cjfps 值解析失败: ${config["cjfps"]}")
                 }
             }
             
@@ -1833,7 +1928,29 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
-            else -> Log.w(TAG, "⚠️ 未知 ptype=$ptype，忽略")
+            // ⭐ [meidui 诊断] PC 滤镜弹框下发的 iOS CIFilter 专属参数——Android 无 GPU 滤镜管线，
+            //   收到后明确记日志（区别于「未知 ptype」），说明「其它滤镜参数无作用」是未实现而非丢消息。
+            //   注：PC 的 brightness/exposure(滤镜) 已被上面的分支映射到 AE 曝光补偿，所以只有这俩"有作用"。
+            "filterEnabled", "contrast", "saturation", "redBoost", "gamma", "blackPoint",
+            "sharpness", "highlightLift", "chroma", "videoHDR", "autoHDR", "test_mode",
+            "lutName", "anti_flicker", "captureColor", "captureColorReset" -> {
+                Log.w(TAG, "🎨 [滤镜] ptype=$ptype 收到但 Android 端未实现（iOS CIFilter 专属），无作用")
+                Log.d("meidui", "🎨 [滤镜未实现] ptype=$ptype value=${config[ptype] ?: config} → Android 无滤镜管线，忽略")
+            }
+
+            // ⭐ PC「综合亮度」滑块（相机设定/曝光弹框）发 exposureBias(0~100)。iOS 语义=EV[-2,2]，
+            //   量级不一致待与 iOS 对齐映射；先记日志定位（用户报「曝光有作用」走的是滤镜弹框的
+            //   exposure/brightness → AE 补偿，不是这条）。
+            "exposureBias" -> {
+                val v = (config["exposureBias"] as? Number)?.toFloat()
+                Log.w(TAG, "☀️ [exposureBias] 收到 $v（PC 0~100 量级）——Android 暂未映射，无作用；曝光请用滤镜弹框的亮度/曝光")
+                Log.d("meidui", "☀️ [exposureBias未映射] value=$v (PC综合亮度滑块，iOS语义EV[-2,2]与0~100量级不符，待对齐)")
+            }
+
+            else -> {
+                Log.w(TAG, "⚠️ 未知 ptype=$ptype，忽略")
+                Log.d("meidui", "⚠️ [未知ptype] ptype=$ptype config=$config")
+            }
         }
     }
 
@@ -2002,8 +2119,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun setShutterSpeed(cjfps: Int) {
         _currentShutterSpeed = cjfps.coerceIn(60, 600)
         _shutterEnabled = true
-        applyCameraParams()
-        Log.d(TAG, "📸 快门: 1/${_currentShutterSpeed}s (手动快门)")
+        val ok = applyCameraParams()
+        Log.d(TAG, "📸 快门: 1/${_currentShutterSpeed}s (手动快门) 注入=${if (ok) "成功" else "失败"}")
+        Log.d("meidui", "📸 [快门链路②] setShutterSpeed 1/${_currentShutterSpeed}s → 反射注入${if (ok) "成功" else "失败(会话未就绪/反射失败)"}" +
+                "；生效验证看 ~5s 后 cam 行: aeMode 应=0(OFF)、exp 应≈${1000.0 / _currentShutterSpeed}ms")
+        if (!ok) applyCameraParamsWithRetry("快门注入失败重试")
     }
 
     /**

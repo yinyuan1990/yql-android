@@ -49,6 +49,13 @@ class WebSocketManager private constructor() {
         private set
     var connectionStatus: String = "未连接"
         private set
+
+    // ⭐ PC 观看端心跳：PC 拉流出画面时每秒发 VIEWER_HEARTBEAT 到 /config topic。
+    //   用「最近一次心跳时间」判断 PC 是否在看（SRS/P2P 通用；超 6s 无心跳=PC 未连接/画面没出）。
+    @Volatile var lastViewerHeartbeatAtMs: Long = 0
+        private set
+    @Volatile var lastViewerHeartbeatFps: Int = 0
+        private set
     
     // WebSocket
     private var webSocket: WebSocket? = null
@@ -355,6 +362,12 @@ class WebSocketManager private constructor() {
                 
                 "CONFIG_STATE" -> {
                     // 状态回传，忽略
+                }
+
+                // ⭐ PC 拉流心跳（PC 出画面时每秒一条）→ 记录时间戳供「PC 已连接」显示
+                "VIEWER_HEARTBEAT" -> {
+                    lastViewerHeartbeatAtMs = System.currentTimeMillis()
+                    lastViewerHeartbeatFps = (json["fps"] as? Number)?.toInt() ?: 0
                 }
             }
             

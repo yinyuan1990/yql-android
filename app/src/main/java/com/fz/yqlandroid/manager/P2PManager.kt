@@ -1,9 +1,6 @@
 package com.fz.yqlandroid.manager
 
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -61,14 +58,16 @@ class P2PManager(private val context: Context) {
     private val iceRetryCount = HashMap<String, Int>()
     private val forceRelayPeerIds = HashSet<String>()      // ICE 失败黑名单 → 重建时强制 relay
     private val peerNetworkType = HashMap<String, String>() // pcDeviceId → "cellular"/"wifi"/...
+    // ⭐ 会话创建时间：① WEBRTC_REQUEST 去重只在 3s 内生效（防切网后卡死的 CONNECTING 僵尸会话
+    //   永远吞掉 PC 的重连请求）；② 创建后 1s 内到达的 WEBRTC_HANGUP 视为旧会话残留信令，忽略
+    //   （§23.2 首开 17s 竞态：PC 先 HANGUP 旧会话再 REQUEST，两条消息乱序到达会把新会话干掉）。
+    private val sessionCreatedAt = HashMap<String, Long>()
 
     private val gson = Gson()
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    // 本机网络监听（蜂窝强制 relay + 切网重连）
+    // 本机网络状态（蜂窝→强制 relay）。§21.27：由 WebRTCManager 的统一网络监听喂入，本类不再自注册回调
     private var isOnCellular = false
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var lastNetSwitchAt = 0L
 
     private val prefs get() = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
     private val maxViewers: Int get() = prefs.getInt("max_p2p_viewers", 4).let { if (it > 0) it else 4 }
@@ -115,73 +114,50 @@ class P2PManager(private val context: Context) {
         if (isActive) return
         isActive = true
         isReadyForViewers = true
-        startNetworkMonitoring()
+        // §21.27：网络监听已统一收口到 WebRTCManager（P2P/SRS 共用），这里不再自注册
         Log.d(TAG, "✅ P2PManager 启动，maxViewers=$maxViewers, forceRelay=$forceRelay")
     }
 
     fun stop() {
         isReadyForViewers = false
         closeAllViewerSessions(notifyPC = true)
-        stopNetworkMonitoring()
         isActive = false
         Log.d(TAG, "🛑 P2PManager 停止")
     }
 
-    // MARK: - 网络监听（切网 → ICE Restart；蜂窝 → 强制 relay）
+    // MARK: - 网络事件（§21.27 统一入口在 WebRTCManager，这里只留出口）
 
-    private fun startNetworkMonitoring() {
-        if (networkCallback != null) return
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                val cellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                        !caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                val typeChanged = (cellular != isOnCellular)
-                isOnCellular = cellular
-                if (typeChanged) onNetworkSwitched("类型变化(蜂窝=$cellular)")
-            }
-
-            override fun onAvailable(network: Network) {
-                // 换 WiFi / 断网恢复通常经历 onAvailable
-                onNetworkSwitched("网络可用")
-            }
-        }
-        try {
-            cm.registerDefaultNetworkCallback(cb)
-            networkCallback = cb
-        } catch (e: Exception) {
-            Log.e(TAG, "网络监听注册失败: ${e.message}")
-        }
+    /** §21.27 由 WebRTCManager 的统一网络监听喂入蜂窝状态（relay 策略用）。返回 true=类型变化（切网事件） */
+    fun updateCellularState(cellular: Boolean): Boolean {
+        val changed = cellular != isOnCellular
+        isOnCellular = cellular
+        return changed
     }
 
-    private fun stopNetworkMonitoring() {
-        val cb = networkCallback ?: return
-        networkCallback = null
-        try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            cm.unregisterNetworkCallback(cb)
-        } catch (_: Exception) {}
-    }
-
-    private fun onNetworkSwitched(reason: String) {
-        // 节流：5s 内多次抖动只触发一次
-        val now = System.currentTimeMillis()
-        if (now - lastNetSwitchAt < 5000) return
-        if (viewerCount == 0) return
-        lastNetSwitchAt = now
-        Log.d(TAG, "📶 网络切换($reason)，处理 $viewerCount 个会话")
+    /** §21.27 统一出口：WS 重连成功 / 切网（经 WebRTCManager.publishHealthCheck）→ 全部会话 ICE Restart */
+    fun restartAllSessions(source: String) {
+        if (viewerCount == 0) {
+            Log.d(TAG, "📶 [$source] 无观看会话，等 PC 发 WEBRTC_REQUEST")
+            return
+        }
+        Log.d(TAG, "🔌 [$source] 重连所有 P2P 会话")
         mainScope.launch { restartAllIceForNetworkSwitch() }
     }
 
-    /** WebSocket 重连成功后由外部调用：所有 P2P 会话做 ICE Restart（信令通道刚恢复） */
-    fun onWebSocketReconnected() {
-        if (viewerCount == 0) return
-        Log.d(TAG, "🔌 WebSocket 重连，重连所有 P2P 会话")
-        mainScope.launch { restartAllIceForNetworkSwitch() }
-    }
+    /** 兼容旧调用点 */
+    fun onWebSocketReconnected() = restartAllSessions("WS重连")
 
     private fun restartAllIceForNetworkSwitch() {
+        // ⭐ 切网重连关键修复：切网瞬间旧 WS 多半已死，此时发 ICE Restart Offer = 发进黑洞
+        //   （PC 永远收不到），且会话被标 pendingIceRestart 卡住。改为等 WS 重连成功后
+        //   （onWebSocketReconnected 会再次调本方法）统一重连，信令必达。
+        if (!WebSocketManager.instance.isConnected) {
+            Log.w(TAG, "📶 切网但 WS 未连接，ICE Restart 推迟到 WS 重连后统一执行")
+            Log.d("meidui", "📶 [P2P切网] WS断开中，Offer 不发（防黑洞），等 WS 重连后统一 ICE Restart")
+            return
+        }
         val sessions = synchronized(viewerSessions) { viewerSessions.toMap() }
+        Log.d("meidui", "📶 [P2P切网] 开始处理 ${sessions.size} 个会话: ${sessionStatesSummary()}")
         for ((pcId, pc) in sessions) {
             // 切网是「新一次」重连，重置该会话的 ICE 重试计数
             iceRetryCount[pcId] = 0
@@ -247,7 +223,19 @@ class P2PManager(private val context: Context) {
                 if (sdpType == "answer") handleRemoteAnswer(sdp, fromDevice)
             }
             "WEBRTC_ICE" -> handleRemoteIce(message, fromDevice)
-            "WEBRTC_HANGUP" -> removeViewerSession(fromDevice, notifyPC = false)
+            "WEBRTC_HANGUP" -> {
+                // ⭐ §23.2 竞态保护：会话刚创建（<1s）就收到 HANGUP = PC 针对「上一个会话」的挂断
+                //   乱序迟到（PC 先 HANGUP 再 REQUEST，服务器转发顺序不保证）。无条件移除会把
+                //   正在 createOffer 的新会话干掉 → Offer 发到死会话 → 首开白等 15s+。
+                val createdAt = synchronized(viewerSessions) { sessionCreatedAt[fromDevice] } ?: 0L
+                val ageMs = System.currentTimeMillis() - createdAt
+                if (createdAt > 0 && ageMs < 1000) {
+                    Log.w(TAG, "🛡️ 忽略 HANGUP($fromDevice)：会话仅 ${ageMs}ms 前创建，判定为旧会话残留信令")
+                    Log.d("meidui", "🛡️ [P2P] 忽略旧会话残留 HANGUP(from=$fromDevice, 会话年龄=${ageMs}ms)")
+                } else {
+                    removeViewerSession(fromDevice, notifyPC = false)
+                }
+            }
         }
     }
 
@@ -302,11 +290,18 @@ class P2PManager(private val context: Context) {
         synchronized(viewerSessions) {
             viewerSessions[pcId]?.let { existing ->
                 val s = existing.connectionState()
-                if (s == PeerConnection.PeerConnectionState.NEW ||
-                    s == PeerConnection.PeerConnectionState.CONNECTING) {
-                    Log.w(TAG, "⚠️ PC $pcId 会话建立中，忽略重复请求")
+                val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
+                if ((s == PeerConnection.PeerConnectionState.NEW ||
+                     s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 3000) {
+                    // 3s 内的重复 REQUEST 才当去重处理
+                    Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms)，忽略重复请求")
                     return
                 }
+                // ⭐ 切网重连关键修复：超过 3s 仍停在 NEW/CONNECTING = 僵尸会话（切网后 ICE 永远
+                //   连不上/Offer 曾发进死 WS）。旧逻辑无条件忽略 → PC 每次超时重发 REQUEST 都被
+                //   吞掉 → 永远连不上。现在拆掉重建，PC 的重连请求必须赢。
+                Log.w(TAG, "🔁 PC $pcId 旧会话状态=$s(${ageMs}ms)，拆掉重建响应新 REQUEST")
+                Log.d("meidui", "🔁 [P2P] REQUEST 触发旧会话重建: state=$s age=${ageMs}ms")
             }
         }
         // 已存在旧会话（非建立中）→ 拆掉重建
@@ -358,6 +353,7 @@ class P2PManager(private val context: Context) {
         synchronized(viewerSessions) {
             viewerSessions[pcId] = newPC
             viewerSenders[pcId] = sender
+            sessionCreatedAt[pcId] = System.currentTimeMillis()
             currentViewerCount = viewerSessions.size
         }
         // 会话创建时初始化整组参数（码率 + 帧率），后续走拆分后的独立方法
@@ -395,6 +391,7 @@ class P2PManager(private val context: Context) {
         val pc = synchronized(viewerSessions) {
             val removed = viewerSessions.remove(pcId)
             viewerSenders.remove(pcId)
+            sessionCreatedAt.remove(pcId)
             currentViewerCount = viewerSessions.size
             removed
         }
@@ -412,6 +409,7 @@ class P2PManager(private val context: Context) {
             val copy = viewerSessions.toMap()
             viewerSessions.clear()
             viewerSenders.clear()
+            sessionCreatedAt.clear()
             currentViewerCount = 0
             copy
         }
