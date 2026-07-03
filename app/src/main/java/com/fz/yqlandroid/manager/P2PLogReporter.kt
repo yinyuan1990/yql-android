@@ -99,12 +99,19 @@ object P2PLogReporter {
                 val body = resp.body?.string() ?: return
                 val newEnabled = JSONObject(body).optBoolean("enabled", false)
                 if (newEnabled != enabled) {
-                    enabled = newEnabled
                     Log.d(TAG, "服务器P2P日志开关: ${if (newEnabled) "开" else "关"}")
-                    if (newEnabled) startLogcat() else {
-                        stopLogcat()
-                        synchronized(lock) { buffer.setLength(0); bufferLines = 0 }
-                    }
+                }
+                enabled = newEnabled
+                // ⭐ 幂等自愈（修「第一次能上报、重新推流后不上报」）：
+                //   本对象是进程级单例，stop() 停掉 logcat 采集线程后 enabled 仍是 true；
+                //   第二次 start() 时开关值无变化，旧逻辑只在「值变化」时才 startLogcat →
+                //   采集线程永远没人重启。现改为：只要开关=开就确保采集在跑（startLogcat
+                //   自带 isActive 幂等保护），logcat 进程意外死亡也能在下轮复查自动拉起。
+                if (newEnabled) {
+                    startLogcat()
+                } else {
+                    stopLogcat()
+                    synchronized(lock) { buffer.setLength(0); bufferLines = 0 }
                 }
             }
         } catch (e: Exception) {
