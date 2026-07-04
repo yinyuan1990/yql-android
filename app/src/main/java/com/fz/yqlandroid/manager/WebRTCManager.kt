@@ -1335,21 +1335,22 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     @Volatile private var p2pPathIsRelay = false
     private val relayMaxKbps = 3000   // 中继单路码率上限（< coturn max-bps 4Mbps，留余量）
 
-    // ⭐ §25.7（2026-07-03 对照 iOS 移植）：链路择优——直连质量持续差 → 主动切中继。
-    //   iOS 实测（同一烂 WiFi）：中继 RTT=93ms 流畅、直连 RTT=533ms 卡死（链路层重传+缓冲膨胀，
-    //   丢包恒 0%），但 ICE 只按候选类型优先级选路（srflx > relay）不看质量 → 锁死在烂直连。
-    //   规则：P2P 选中路径=直连 且 ICE 层 RTT 持续 > directBadRttMs 达 directBadHoldMs →
-    //   调 P2PManager.switchAllSessionsToRelay 对全部会话 setConfiguration(RELAY) + ICE Restart。
+    // ⭐ §25.7（2026-07-04 简化）：链路择优——只认「同 WiFi 直连」，其余一律中继。
+    //   旧版靠 ICE RTT>300ms 持续 10s 才切中继，探测窗口内用户已经卡了 10 秒；且跨网直连
+    //   （srflx 打洞）质量随公网波动，探测阈值难调。现改为拓扑判定，一次到位：
+    //   选中 ICE 候选对 host↔host（两端候选类型都是 host）= 打通的是局域网直连 = 同 WiFi → 保持直连；
+    //   选中路径含 srflx/prflx（跨 NAT/公网）→ 立即 switchAllSessionsToRelay，不看 RTT、不等待。
     //   单向操作：会话期内不切回直连（pcId 进 forceRelayPeerIds），拆会话自动清除。
-    //   只用 ICE candidate-pair RTT 判定（STUN 探测、不受拉流端 RR 污染）。
-    private var directBadSinceMs: Long = 0
-    private val directBadRttMs = 300        // 直连 ICE RTT 阈值（中继实测 ~93ms，留足余量）
-    private val directBadHoldMs = 10_000L   // 持续时长（防瞬时抖动误切）
+    //   relaySwitchGapMs：两次触发的最小间隔。软切(ICE Restart)生效要几秒，期间路径仍显示直连，
+    //   若每秒重触发会被 P2PManager 误判「软切无效」而提前硬切拆会话（网页内核观看端会断播）。
+    private var lastRelaySwitchMs: Long = 0
+    private val relaySwitchGapMs = 8_000L
     
     private fun startStats() {
         statsJob?.cancel()
         lastBytesSent = 0; lastPacketsSent = 0; lastPacketsLost = 0; lastStatsTime = 0
         lastFramesEncoded = 0; lastFramesSent = 0; lastMeiduiLogMs = 0; lastNackCount = 0
+        lastRelaySwitchMs = 0
         lastCapFrameCount = capFrameCount
         uiLastCapFrameCount = capFrameCount; uiLastCapSampleMs = 0
         
@@ -1429,8 +1430,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     var selectedPairId: String? = null                     // transport.selectedCandidatePairId
                     val pairRttSec = HashMap<String, Double>()             // pairId → currentRoundTripTime(秒)
                     val pairLocalCandId = HashMap<String, String>()        // pairId → localCandidateId
+                    val pairRemoteCandId = HashMap<String, String>()       // pairId → remoteCandidateId
                     val nominatedPairIds = mutableListOf<String>()         // 兜底：nominated+succeeded 的 pair
                     val localCandType = HashMap<String, String>()          // candidateId → host/srflx/prflx/relay
+                    val remoteCandType = HashMap<String, String>()         // candidateId → host/srflx/prflx/relay
                     report.statsMap.values.forEach { stats ->
                         if (stats.type == "outbound-rtp") {
                             sawVideoOutbound = true
@@ -1453,12 +1456,16 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         if (stats.type == "candidate-pair") {
                             (stats.members["currentRoundTripTime"] as? Number)?.let { pairRttSec[stats.id] = it.toDouble() }
                             (stats.members["localCandidateId"] as? String)?.let { pairLocalCandId[stats.id] = it }
+                            (stats.members["remoteCandidateId"] as? String)?.let { pairRemoteCandId[stats.id] = it }
                             val nominated = (stats.members["nominated"] as? Boolean) ?: false
                             val state = stats.members["state"] as? String ?: ""
                             if (nominated && state == "succeeded") nominatedPairIds.add(stats.id)
                         }
                         if (stats.type == "local-candidate") {
                             (stats.members["candidateType"] as? String)?.let { localCandType[stats.id] = it }
+                        }
+                        if (stats.type == "remote-candidate") {
+                            (stats.members["candidateType"] as? String)?.let { remoteCandType[stats.id] = it }
                         }
                     }
 
@@ -1467,8 +1474,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     // ICE 层 RTT（秒）：仅在选中候选对上有读数时采用
                     val icePairRtt = activePairId?.let { pairRttSec[it] }?.takeIf { it > 0 } ?: 0.0
                     // 选中路径是否走 TURN 中继
-                    val pathIsRelay = activePairId?.let { pairLocalCandId[it] }
-                        ?.let { localCandType[it] } == "relay"
+                    val localType = activePairId?.let { pairLocalCandId[it] }?.let { localCandType[it] }
+                    val remoteType = activePairId?.let { pairRemoteCandId[it] }?.let { remoteCandType[it] }
+                    val pathIsRelay = localType == "relay"
+                    // ⭐ §25.7：同 WiFi 判定 = 选中候选对 host↔host（两侧类型都拿到才判定，防 stats 未就绪误判）
+                    val pathIsLan = localType == "host" && remoteType == "host"
 
                     // RTT 主源=ICE candidate-pair；无值时回退 RTCP remote-inbound
                     val effectiveRtt = if (icePairRtt > 0) icePairRtt else roundTripTime
@@ -1483,21 +1493,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         }
                     }
 
-                    // ⭐ §25.7 链路择优：直连 ICE RTT 持续差 → 主动切中继（仅 ICE 层 RTT，不用 RR）
-                    val iceRttMs = (icePairRtt * 1000).toInt()
+                    // ⭐ §25.7 链路择优（简化版）：非同 WiFi（选中路径不是 host↔host）→ 立即切中继。
+                    //   两侧候选类型都已知才判定；relaySwitchGapMs 限频，给软切(ICE Restart)生效时间，
+                    //   仍未生效才由 P2PManager 升级硬切。
                     if (currentConnMode == ConnMode.P2P && activePairId != null && !pathIsRelay &&
-                        iceRttMs > directBadRttMs) {
+                        localType != null && remoteType != null && !pathIsLan) {
                         val nowMs = System.currentTimeMillis()
-                        if (directBadSinceMs == 0L) {
-                            directBadSinceMs = nowMs
-                        } else if (nowMs - directBadSinceMs >= directBadHoldMs) {
-                            directBadSinceMs = 0
-                            Log.d("meidui", "[线路] 🔀直连质量差(ICE RTT=${iceRttMs}ms>${directBadRttMs}ms " +
-                                    "持续${directBadHoldMs / 1000}s) → 主动切中继")
-                            p2pManager.switchAllSessionsToRelay("direct_rtt_${iceRttMs}ms")
+                        if (nowMs - lastRelaySwitchMs >= relaySwitchGapMs) {
+                            lastRelaySwitchMs = nowMs
+                            Log.d("meidui", "[线路] 🔀非同WiFi直连(本端=$localType 远端=$remoteType) → 立即切中继")
+                            p2pManager.switchAllSessionsToRelay("non_lan_${localType}_$remoteType")
                         }
-                    } else {
-                        directBadSinceMs = 0
                     }
                     
                     // 计算瞬时丢包率
