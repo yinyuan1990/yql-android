@@ -1,8 +1,6 @@
 package com.fz.yqlandroid.ui.theme
 
-import android.app.Activity
 import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -35,9 +33,12 @@ private val LightColorScheme = lightColorScheme(
 
 @Composable
 fun YqlandroidTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
+    // ⭐ 深色模式灰字修复（2026-07-04）：界面按浅色设计（白底），跟随系统深色模式时
+    //   整套配色切到 DarkColorScheme，未显式指定颜色的 Text 用 onBackground（浅灰，
+    //   为黑底准备的字色）→ 白底灰字看不清；dynamicColor 又让 Android 12+ 按壁纸动态
+    //   取色，每台机器调色盘不同——「有些机器正常有些发灰」即此。锁定浅色 + 关动态取色。
+    darkTheme: Boolean = false,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
