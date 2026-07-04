@@ -186,6 +186,58 @@ class P2PManager(private val context: Context) {
                 qualityRelayPeerIds.contains(pcId)
     }
 
+    // MARK: - §25.7e 线路预判定（建会话前经 WebSocket 信令定直连/中继）
+
+    /** 本机全部 IPv4（WiFi/热点/有线，排除回环与链路本地 169.254.*） */
+    private fun localIPv4Addresses(): List<String> {
+        val result = mutableListOf<String>()
+        try {
+            val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return result
+            for (iface in ifaces) {
+                if (!iface.isUp || iface.isLoopback) continue
+                for (addr in iface.inetAddresses) {
+                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
+                        val ip = addr.hostAddress ?: continue
+                        if (!ip.startsWith("169.254.")) result.add(ip)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    /** 同网段判定（/24）：双方任意一对 IPv4 前三段相同 = 同一局域网（同 WiFi） */
+    private fun sharesSubnet(peerIps: List<String>): Boolean {
+        fun prefix24(ip: String): String? {
+            val parts = ip.split(".")
+            return if (parts.size == 4) parts.subList(0, 3).joinToString(".") else null
+        }
+        val myPrefixes = localIPv4Addresses().mapNotNull(::prefix24).toSet()
+        return peerIps.any { prefix24(it)?.let(myPrefixes::contains) == true }
+    }
+
+    /**
+     * ⭐ §25.7e：建会话前预判线路。PC 的 WEBRTC_REQUEST 带 localIps（逗号分隔的局域网 IPv4），
+     * 与本机比网段：非同网段 = 非同 WiFi → pcId 钉进 qualityRelayPeerIds → 会话从创建起
+     * relay-only，一次 ICE 定终身，不再有「直连先通→ICE 换车→软切/硬切」的中途折腾。
+     * 同网段/字段缺失（旧版 PC）→ 保持直连优先，host↔host stats 判定兜底。
+     * 只进不出：不因后续 REQUEST 判同网段而摘除钉住（防两个不同网络恰好同网段号 → 死循环回直连）。
+     */
+    private fun applyLanPrecheck(pcId: String, message: Map<String, Any>) {
+        val ipsStr = message["localIps"] as? String
+        if (ipsStr.isNullOrEmpty()) {
+            Log.d(TAG, "🛣 [P2P线路预判] $pcId REQUEST 未带 localIps（旧版PC）→ 直连优先+stats兜底")
+            return
+        }
+        val peerIps = ipsStr.split(",").filter { it.isNotBlank() }
+        if (sharesSubnet(peerIps)) {
+            Log.d(TAG, "🛣 [P2P线路预判] $pcId 同网段(同WiFi) → 直连优先 peer=$peerIps")
+        } else {
+            qualityRelayPeerIds.add(pcId)
+            Log.d(TAG, "🛣 [P2P线路预判] $pcId 非同网段(非同WiFi) → 建会话即中继 peer=$peerIps 本机=${localIPv4Addresses()}")
+        }
+    }
+
     private fun loadIceServers(): List<PeerConnection.IceServer> {
         val json = prefs.getString("ice_servers_json", null) ?: return emptyList()
         return try {
@@ -216,6 +268,7 @@ class P2PManager(private val context: Context) {
             "VIEWER_DISCONNECTED" -> Log.d(TAG, "🔌 PC $fromDevice 断开")
             "WEBRTC_REQUEST" -> {
                 peerNetworkType[fromDevice] = (message["networkType"] as? String) ?: "unknown"
+                applyLanPrecheck(fromDevice, message)   // §25.7e：建会话前定直连/中继
                 if (!isReadyForViewers) {
                     WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
                     return
