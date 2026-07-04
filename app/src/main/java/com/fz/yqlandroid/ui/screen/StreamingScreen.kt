@@ -227,6 +227,7 @@ fun StreamingScreen(
             "p4k", "4k" -> "超高清"
             "ultra" -> "超高帧"
             "high" -> "超清"
+            "low" -> "超低网"    // ⭐ 对齐 iOS 5 档：初始映射此前缺 low，登录后档位高亮错到「高清」
             else -> "高清"
         }
         
@@ -542,7 +543,9 @@ fun StreamingScreen(
                             .padding(horizontal = 18.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        listOf("高清", "超清", "超高清", "超高帧").forEach { name ->
+                        // ⭐ 对齐 iOS 5 档（ContentView 顺序 low→standard→high→p4k→ultra）：
+                        //   此前少画「超低网」，服务器下发 type=low 时 UI 无处高亮。
+                        listOf("超低网", "高清", "超清", "超高清", "超高帧").forEach { name ->
                             QualityRadioItem(
                                 name = name,
                                 isSelected = selectedProfile == name,

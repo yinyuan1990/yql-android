@@ -2086,10 +2086,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // 1) 档位（会更新采集分辨率/编码参数）
         applyRemoteConfig(mapOf("ptype" to "type", "type" to config.type))
 
-        // 2) 摄像头方向
-        if (config.direction == "1" && !isFrontCamera) {
-            applyRemoteConfig(mapOf("ptype" to "direction", "direction" to "1"))
-        }
+        // 2) 摄像头方向（对齐 iOS applyThinRemoteConfigInit："1"=前置、其余=后置，**双向**对齐——
+        //    旧代码只处理「要前置且当前后置」，服务器要后置而当前是前置时不切，登录后方向对不上）
+        //    applyRemoteConfig 内部按 wantFront != isFrontCamera 差异切换，直传即可。
+        applyRemoteConfig(mapOf("ptype" to "direction", "direction" to config.direction))
 
         // 3) 变焦
         applyRemoteConfig(mapOf("ptype" to "zoom", "zoom" to config.zoom))
