@@ -431,7 +431,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    发热优化：采集帧率不超过推流帧率上限(maxPushFps=60)。此前 ultra 档按设备能力采集到 240/120fps，
         //    但推流最高只有 60fps，多出的帧在 ISP/传感器/纹理管线里“空转”后被直接丢弃，是 Android 端主要发热来源之一。
         //    注：慢门/快门(cjfps)由 SENSOR_EXPOSURE_TIME 单独控制，不依赖高采集帧率。
-        val desiredFps = 60
+        // 2026-07-06 用户要求：采集帧率标准从 60 降到 30（每档实采 = min(30, 分辨率上限, 整机maxFps)）。
+        //    连带效果：推送基准 basePushFps=min(preset.fps=30, maxPushFps, 后端目标) 也随之 ≤30。
+        val desiredFps = 30
         
         // 每档独立按 iOS 目标分辨率就近选取设备实际采集分辨率（直接采集，scaleDown=1.0）
         // 🔥 选档时“60fps 优先”：优先在能跑 60fps 的分辨率里就近选，没有 60 才退回 30。
