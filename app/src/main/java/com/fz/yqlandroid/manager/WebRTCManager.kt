@@ -2001,14 +2001,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
-            // 🔥 曝光/亮度（与iOS test_brightness/exposure/brightness一致）: EV 补偿
-            //    后端/UI 可能以 "brightness" 下发亮度调节，这里与曝光统一走 AE 补偿。
-            "exposure", "test_brightness", "brightness" -> {
-                val ev = (config["exposure"] as? Number)
+            // 🔥 ISO 增益（PC 硬件链路 test_brightness，value=0~100 → 手动 SENSOR_SENSITIVITY）。
+            //    2026-07-06：Android 滤镜代码全部移除（颜色类滤镜改 PC 端本地处理），
+            //    设备端只保留 快门(cjfps) + ISO增益 两个采集参数。ISO 与快门同属手动曝光
+            //    (AE OFF)，快门未开时 HAL 会忽略 SENSOR_SENSITIVITY（日志可见）。
+            "test_brightness" -> {
+                val v = (config["value"] as? Number)
                     ?: (config["testBrightness"] as? Number)
-                    ?: (config["brightness"] as? Number)
-                if (ev != null) setExposure(ev.toFloat())
-                else Log.w(TAG, "⚠️ ptype=$ptype 缺少曝光/亮度值，忽略")
+                if (v != null) setIsoGain(v.toInt())
+                else Log.w(TAG, "⚠️ ptype=test_brightness 缺少 value，忽略")
             }
             
             // 🔥 白平衡（与iOS white_balance/applyWhiteBalance一致）
@@ -2048,23 +2049,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
-            // ⭐ [meidui 诊断] PC 滤镜弹框下发的 iOS CIFilter 专属参数——Android 无 GPU 滤镜管线，
-            //   收到后明确记日志（区别于「未知 ptype」），说明「其它滤镜参数无作用」是未实现而非丢消息。
-            //   注：PC 的 brightness/exposure(滤镜) 已被上面的分支映射到 AE 曝光补偿，所以只有这俩"有作用"。
-            "filterEnabled", "contrast", "saturation", "redBoost", "gamma", "blackPoint",
-            "sharpness", "highlightLift", "chroma", "videoHDR", "autoHDR", "test_mode",
-            "lutName", "anti_flicker", "captureColor", "captureColorReset" -> {
-                Log.w(TAG, "🎨 [滤镜] ptype=$ptype 收到但 Android 端未实现（iOS CIFilter 专属），无作用")
-                Log.d("meidui", "🎨 [滤镜未实现] ptype=$ptype value=${config[ptype] ?: config} → Android 无滤镜管线，忽略")
-            }
-
-            // ⭐ PC「综合亮度」滑块（相机设定/曝光弹框）发 exposureBias(0~100)。iOS 语义=EV[-2,2]，
-            //   量级不一致待与 iOS 对齐映射；先记日志定位（用户报「曝光有作用」走的是滤镜弹框的
-            //   exposure/brightness → AE 补偿，不是这条）。
-            "exposureBias" -> {
-                val v = (config["exposureBias"] as? Number)?.toFloat()
-                Log.w(TAG, "☀️ [exposureBias] 收到 $v（PC 0~100 量级）——Android 暂未映射，无作用；曝光请用滤镜弹框的亮度/曝光")
-                Log.d("meidui", "☀️ [exposureBias未映射] value=$v (PC综合亮度滑块，iOS语义EV[-2,2]与0~100量级不符，待对齐)")
+            // ⭐ 2026-07-06 滤镜代码已移除：颜色类滤镜（亮度/对比度/饱和度/gamma/曝光/redBoost/
+            //   黑点/锐化/高光/色度/LUT/HDR/exposureBias 等）改由 PC 端本地处理（GStreamer
+            //   videobalance / 网页内核 CSS filter），新版 PC 对 Android 不再下发这些 ptype。
+            //   旧版 PC 若仍下发 → 静默忽略（不当未知 ptype 刷 warning）。
+            "filterEnabled", "brightness", "exposure", "contrast", "saturation", "redBoost",
+            "gamma", "blackPoint", "sharpness", "highlightLift", "chroma", "videoHDR",
+            "autoHDR", "test_mode", "lutName", "anti_flicker", "captureColor",
+            "captureColorReset", "exposureBias" -> {
+                Log.d("meidui", "🎨 [滤镜已移除] ptype=$ptype → 颜色滤镜走 PC 端本地处理，Android 忽略")
             }
 
             else -> {
@@ -2077,13 +2070,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     /**
      * 🔥 启动时一次性应用全部初始配置（对标 iOS applyThinRemoteConfigInit）
      *
-     * 修复：此前启动只应用了 type/direction，导致 cjfps(快门)/zoom/focus/brightness/bitrate/fps
-     * 这些“滤镜/图像参数”在启动时没有挂上。现在这里逐项下发到硬件与编码器。
+     * 修复：此前启动只应用了 type/direction，导致 cjfps(快门)/zoom/focus/bitrate/fps
+     * 这些采集/编码参数在启动时没有挂上。现在这里逐项下发到硬件与编码器。
+     * （2026-07-06：颜色滤镜已移除，改 PC 端本地处理；初始不再应用亮度/曝光。）
      *
      * 需在 startPreview() 之后调用（原生 session 就绪后，Camera2ParamApplier 才能反射注入）。
      */
     fun applyInitialConfig(config: ThinRemoteConfig) {
-        Log.d(TAG, "📋 [初始配置] 应用全部初始参数: type=${config.type}, dir=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, bitrate=${config.bitrate}, focus=${config.focus}, brightness=${config.brightness}")
+        Log.d(TAG, "📋 [初始配置] 应用全部初始参数: type=${config.type}, dir=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, bitrate=${config.bitrate}, focus=${config.focus}")
 
         // 1) 档位（会更新采集分辨率/编码参数）
         applyRemoteConfig(mapOf("ptype" to "type", "type" to config.type))
@@ -2102,13 +2096,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // 5) 对焦
         config.focus?.let { applyRemoteConfig(mapOf("ptype" to "focus", "focus" to it)) }
 
-        // 6) 亮度/曝光
-        config.brightness?.let { applyRemoteConfig(mapOf("ptype" to "brightness", "brightness" to it)) }
-
-        // 7) 码率/清晰度百分比
+        // 6) 码率/清晰度百分比（滤镜已移除：不再应用初始亮度/曝光）
         config.bitrate?.let { applyRemoteConfig(mapOf("ptype" to "bitrate", "bitrate" to it)) }
 
-        // 8) 推送FPS
+        // 7) 推送FPS
         config.fps?.let { applyRemoteConfig(mapOf("ptype" to "fps", "fps" to it)) }
     }
 
@@ -2165,8 +2156,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private var _currentShutterSpeed: Int = 240
     val currentShutterSpeed: Int get() = _currentShutterSpeed
     private var _shutterEnabled: Boolean = false     // 是否启用手动快门(cjfps)；false=自动曝光
-    private var _currentExposure: Float = 0f
-    val currentExposure: Float get() = _currentExposure
+    private var _isoPercent: Int? = null             // ISO 增益 0~100（null=快门模式用 ISO 中值）；仅手动快门(AE OFF)下生效
     private var _currentWhiteBalance: Int = 50
     val currentWhiteBalance: Int get() = _currentWhiteBalance
     private var _whiteBalanceLocked: Boolean = false
@@ -2178,11 +2168,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      */
     fun applyCameraParams(): Boolean {
         val params = Camera2ParamApplier.Params(
-            exposureEv = if (_shutterEnabled) null else _currentExposure,
+            exposureEv = null,   // 滤镜已移除：不再做 AE 曝光补偿（颜色调整走 PC 端）
             focus = _currentFocus,
             zoom = _currentZoom,
             shutterCjfps = if (_shutterEnabled) _currentShutterSpeed else null,
-            manualIso = null,
+            manualIsoPercent = _isoPercent,
             whiteBalanceSlider = if (_whiteBalanceManual) _currentWhiteBalance else null,
             whiteBalanceLocked = _whiteBalanceLocked,
             // 🔥 钉死 AE 帧率区间，防低光时相机自动 30→15（iOS 无此坑，Android Camera2 经典问题）
@@ -2247,13 +2237,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     /**
-     * 🔥 曝光（自动AE下的曝光补偿EV）。设置曝光=切回自动曝光模式（关闭手动快门）。
+     * 🔥 ISO 增益（PC 硬件链路 test_brightness，0~100 → 映射设备 SENSOR_INFO_SENSITIVITY_RANGE）。
+     * 与快门同属手动曝光：仅 AE OFF（快门开启）时 HAL 才吃 SENSOR_SENSITIVITY，
+     * 快门未开时先缓存，开快门后随 applyCameraParams 一并生效。
      */
-    fun setExposure(ev: Float) {
-        _currentExposure = ev
-        _shutterEnabled = false   // 曝光补偿仅在自动AE下有效
-        applyCameraParams()
-        Log.d(TAG, "☀️ 曝光补偿: EV=$ev (自动曝光)")
+    fun setIsoGain(percent: Int) {
+        _isoPercent = percent.coerceIn(0, 100)
+        val ok = applyCameraParams()
+        Log.d(TAG, "🎚️ ISO增益: $_isoPercent/100 注入=${if (ok) "成功" else "失败"}")
+        if (!ok) applyCameraParamsWithRetry("ISO增益注入失败重试")
     }
 
     /**

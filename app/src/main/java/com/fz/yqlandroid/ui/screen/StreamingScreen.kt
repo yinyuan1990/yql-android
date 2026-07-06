@@ -115,7 +115,7 @@ fun StreamingScreen(
     var exposureValue by remember { mutableFloatStateOf(240f) }   // 曝光 60~600
     var focusValue by remember { mutableFloatStateOf(0.5f) }      // 焦距 0~1
     var fluencyValue by remember { mutableFloatStateOf(100f) }    // 流畅 0~100
-    var brightnessValue by remember { mutableFloatStateOf(0f) }   // 亮度 -2~8
+    var isoGainValue by remember { mutableFloatStateOf(0f) }      // ISO增益 0~100（滤镜移除后，亮度改显 ISO 增益）
     var selectedProfile by remember { mutableStateOf("高清") }     // 清晰度档位
     
     // WebSocket配置同步回调
@@ -145,7 +145,8 @@ fun StreamingScreen(
                 "zoom" -> (config["zoom"] as? Number)?.let { zoomValue = it.toFloat() }
                 "cjfps" -> (config["cjfps"] as? Number)?.let { exposureValue = it.toFloat() }
                 "focus" -> (config["focus"] as? Number)?.let { focusValue = it.toFloat() }
-                "brightness" -> (config["brightness"] as? Number)?.let { brightnessValue = it.toFloat() }
+                // 滤镜已移除：仅 ISO 增益（PC 硬件链路 test_brightness，0~100）仍在设备端显示
+                "test_brightness" -> ((config["value"] as? Number) ?: (config["testBrightness"] as? Number))?.let { isoGainValue = it.toFloat() }
                 "type" -> {
                     val type = config["type"] as? String ?: ""
                     selectedProfile = when (type.lowercase()) {
@@ -222,7 +223,6 @@ fun StreamingScreen(
         config.cjfps?.let { exposureValue = it.toFloat() }
         config.focus?.let { focusValue = it }
         config.bitrate?.let { fluencyValue = it.toFloat() }
-        config.brightness?.let { brightnessValue = it }
         selectedProfile = when (config.type.lowercase()) {
             "p4k", "4k" -> "超高清"
             "ultra" -> "超高帧"
@@ -238,7 +238,7 @@ fun StreamingScreen(
         kotlinx.coroutines.delay(800)
         webRTCManager.applyInitialConfig(config)
 
-        Log.d("StreamingScreen", "📋 初始配置已加载并全量应用: type=${config.type}, direction=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, focus=${config.focus}, brightness=${config.brightness}, bitrate=${config.bitrate}")
+        Log.d("StreamingScreen", "📋 初始配置已加载并全量应用: type=${config.type}, direction=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, focus=${config.focus}, bitrate=${config.bitrate}")
     }
     
     // 自动推流
@@ -526,12 +526,12 @@ fun StreamingScreen(
                     
                     Divider(color = Color.White, thickness = 1.dp)
                     
-                    // 亮度
+                    // ISO 增益（滤镜移除后保留：0~100，PC 硬件链路 test_brightness）
                     SliderRow(
-                        label = "亮度",
-                        value = brightnessValue,
-                        range = -2f..8f,
-                        displayText = String.format("%.2f", brightnessValue)
+                        label = "ISO增益",
+                        value = isoGainValue,
+                        range = 0f..100f,
+                        displayText = String.format("%.0f", isoGainValue)
                     )
                     
                     Divider(color = Color.White, thickness = 1.dp)

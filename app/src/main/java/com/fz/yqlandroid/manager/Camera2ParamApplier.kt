@@ -42,7 +42,7 @@ object Camera2ParamApplier {
         val focus: Float? = null,          // 0..1；0.5=连续自动对焦，其余=手动对焦距离
         val zoom: Float? = null,           // >=1.0；变焦
         val shutterCjfps: Int? = null,     // 快门 1/cjfps 秒(60~600)，非空=手动曝光(AE OFF)
-        val manualIso: Int? = null,        // 手动 ISO（快门模式下）
+        val manualIsoPercent: Int? = null, // ISO 增益 0~100（PC test_brightness）→ 映射设备 SENSITIVITY_RANGE；仅手动快门(AE OFF)生效
         val whiteBalanceSlider: Int? = null, // 0..100 手动色温(0冷100暖)
         val whiteBalanceLocked: Boolean = false, // 锁定当前白平衡
         val targetFps: Int? = null         // 🔥 钉死 AE 帧率区间 [fps,fps]，防低光自动砍半(30→15)
@@ -141,7 +141,12 @@ object Camera2ParamApplier {
                 if (expRange != null) expNs = expNs.coerceIn(expRange.lower, expRange.upper)
                 b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expNs)
-                val iso = p.manualIso ?: isoRange?.let { (it.lower + it.upper) / 2 } ?: 400
+                // ISO 增益：PC 下发 0~100 百分比 → 映射设备 SENSITIVITY_RANGE；未给则用区间中值
+                val iso = when {
+                    p.manualIsoPercent != null && isoRange != null ->
+                        isoRange.lower + (isoRange.upper - isoRange.lower) * p.manualIsoPercent.coerceIn(0, 100) / 100
+                    else -> isoRange?.let { (it.lower + it.upper) / 2 } ?: 400
+                }
                 val safeIso = if (isoRange != null) iso.coerceIn(isoRange.lower, isoRange.upper) else iso
                 b.set(CaptureRequest.SENSOR_SENSITIVITY, safeIso)
                 Log.d("meidui", "📸 [快门] 注入 1/${cj}s: 请求exp=${wantNs / 1000}us → clamp后=${expNs / 1000}us" +
