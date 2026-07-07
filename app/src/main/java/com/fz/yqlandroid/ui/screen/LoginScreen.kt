@@ -58,6 +58,8 @@ fun LoginScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     // ⭐ 连接方式（与 iOS 登录页一致：用户手选、记住上次选择、覆盖后端下发）："srs" | "p2p"
     var selectedConnectMode by remember { mutableStateOf("srs") }
+    // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
+    var selectedCodec by remember { mutableStateOf("h264") }
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
@@ -76,6 +78,8 @@ fun LoginScreen(
         }
         // ⭐ 恢复上次选择的连接方式（与 iOS ConnectModeOption.lastSelected 一致，默认 SRS）
         selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
+        // ⭐ H265：恢复上次选择的 P2P 编码（默认 H264）
+        selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h264") ?: "h264"
     }
     
     // 渐变背景
@@ -290,6 +294,44 @@ fun LoginScreen(
                             }
                         }
                     }
+
+                    // ⭐ H265：P2P 二级选项——编码 H264/H265（仅 P2P 选中时显示，与 iOS CodecOptionChips 一致）
+                    if (selectedConnectMode == "p2p") {
+                        HorizontalDivider(
+                            modifier = Modifier.padding(start = 30.dp),
+                            color = Color(0xFFF0F0F0)
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "P2P编码",
+                                fontSize = 16.sp,
+                                color = Color(0xFF1A1A1A)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            listOf("h264" to "H264", "h265" to "H265").forEach { (codec, label) ->
+                                val selected = selectedCodec == codec
+                                Box(
+                                    modifier = Modifier
+                                        .padding(end = 8.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
+                                        .clickable { selectedCodec = codec }
+                                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = label,
+                                        fontSize = 14.sp,
+                                        color = if (selected) Color.White else Color(0xFF666666)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
             
@@ -341,6 +383,8 @@ fun LoginScreen(
                                         putBoolean("remember", rememberPassword)
                                         // ⭐ 记住本次选择的连接方式（下次登录默认）
                                         putString("selected_connect_mode", selectedConnectMode)
+                                        // ⭐ H265：记住本次选择的 P2P 编码
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, selectedCodec)
                                         apply()
                                     }
                                     
@@ -362,6 +406,8 @@ fun LoginScreen(
                                         
                                         // ⭐ 连接方式与 P2P 配置（与iOS一致：以用户在登录页的手动选择为准，覆盖后端下发）
                                         putString("connect_mode", selectedConnectMode)
+                                        // ⭐ H265：P2P 编码运行时决策值（WebRTCManager.startPublish → H265Support.decideForP2P 读取）
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, selectedCodec)
                                         putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         response.iceServers?.let {

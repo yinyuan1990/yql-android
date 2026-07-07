@@ -431,10 +431,10 @@ class P2PManager(private val context: Context) {
                 //   的 codec 顺序是软件编码器(VP8/VP9/AV1)在前、H264 在后 → Offer 首选 VP8；
                 //   PC GStreamer 是 Answerer 且解码链路写死 rtph264depay(只解 H264)，
                 //   协商成 VP8 = ICE 连上但画面永远出不来（SRS 不受影响：SRS Answer 只回 H264）。
-                val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                 newPC.setLocalDescription(SilentSdpObserver, munged)
                 WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
-                Log.d(TAG, "📤 已发送 Offer 给 $pcId（H264 限定）")
+                Log.d(TAG, "📤 已发送 Offer 给 $pcId（${H265Support.codecLabel()} 限定）")
             }
             override fun onCreateFailure(e: String?) { Log.e(TAG, "❌ 创建 Offer 失败 $pcId: $e") }
             override fun onSetSuccess() {}
@@ -552,8 +552,8 @@ class P2PManager(private val context: Context) {
             pc.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription?) {
                     if (sdp == null) return
-                    // ⭐ ICE Restart 的 Offer 同样做 H264 限定（与首次 Offer 一致，防重协商时倒回 VP8）
-                    val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                    // ⭐ ICE Restart 的 Offer 同样做 codec 限定（与首次 Offer 一致，防重协商时倒回 VP8）
+                    val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                     pc.setLocalDescription(SilentSdpObserver, munged)
                     WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
                     Log.d(TAG, "🔄 ICE Restart Offer 已发送 $pcId (${cur + 1}/$MAX_ICE_RETRIES)")
@@ -634,7 +634,7 @@ class P2PManager(private val context: Context) {
                 pc.createOffer(object : SdpObserver {
                     override fun onCreateSuccess(sdp: SessionDescription?) {
                         if (sdp == null) return
-                        val munged = SessionDescription(sdp.type, forceH264InVideoSection(sdp.description))
+                        val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                         pc.setLocalDescription(SilentSdpObserver, munged)
                         WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
                         Log.d(TAG, "🔀 已切中继并发送 ICE Restart Offer → $pcId reason=$reason")
@@ -724,6 +724,15 @@ class P2PManager(private val context: Context) {
     }
 
     // MARK: - SDP codec 限定（对齐 iOS preferredCodec=H264，见 createViewerSession 处注释）
+
+    /**
+     * ⭐ H265：三处 Offer（首发/ICE重试/切中继）统一走这里按会话编码分派。
+     *   H264 会话 → 原 forceH264InVideoSection 不动；H265 会话 → H265Support.mungeOfferH265
+     *   （限定 H265，Offer 无 H265 时自动回落 H264，逻辑全在 H265Support.kt）。
+     */
+    private fun mungeOfferForCodec(sdp: String): String =
+        if (H265Support.isH265Session()) H265Support.mungeOfferH265(sdp)
+        else forceH264InVideoSection(sdp)
 
     /**
      * 把 m=video 段限定为 H264（含其关联 RTX）：

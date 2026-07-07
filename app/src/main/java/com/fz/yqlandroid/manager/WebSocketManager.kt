@@ -550,6 +550,8 @@ class WebSocketManager private constructor() {
             "streamPushIp" to streamPushIp,
             "connectstype" to connectstype,
             "connectMode" to connectMode,
+            // ⭐ H265：P2P 实际生效编码（"h264"/"h265"），PC 据此选择解码管线（与 iOS 一致）
+            "videoCodec" to H265Support.effectiveCodec,
             "p2pViewerCount" to P2PManager.currentViewerCount,
             "kbps" to publishingKbps,
             "fps" to publishingFps,

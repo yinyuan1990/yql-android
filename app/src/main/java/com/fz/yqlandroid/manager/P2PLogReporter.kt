@@ -176,7 +176,8 @@ object P2PLogReporter {
         }
         try {
             val json = JSONObject().apply {
-                put("prefix", PREFIX)
+                // ⭐ H265：H265 会话日志与 H264 分开（Android-p2p → Android-p2p-h265，后端分文件落盘）
+                put("prefix", H265Support.logUploadPrefix(PREFIX))
                 put("streamId", if (streamId.isEmpty()) "unknown" else streamId)
                 put("content", content)
             }

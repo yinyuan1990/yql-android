@@ -198,6 +198,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val encoderFactory = ColorTaggingVideoEncoderFactory(baseEncoderFactory) {
             onEncoderMotionSurge()
         }
+        // ⭐ H265：注册编码器能力（探测是否带 H265 硬编，逻辑在 H265Support.kt）
+        H265Support.registerSupportedCodecs(baseEncoderFactory.supportedCodecs.map { it.name })
         val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
         
         peerConnectionFactory = PeerConnectionFactory.builder()
@@ -698,11 +700,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         if (connectMode == "p2p") {
             currentConnMode = ConnMode.P2P
             effectiveConnectstype = 1
+            // ⭐ H265：仅 P2P 按登录页「P2P编码」选项定案（全部逻辑在 H265Support.kt）
+            H265Support.decideForP2P(appContext)
             startP2PPublish()
             return
         }
         currentConnMode = ConnMode.SRS
         effectiveConnectstype = 0
+        // ⭐ H265：非 P2P（SRS）永远 H264
+        H265Support.forceH264ForNonP2P()
         
         println("jfh [推流] ═══════════════════════════════════════")
         println("jfh [推流] 🚀 开始推流")
