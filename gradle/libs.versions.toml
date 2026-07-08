@@ -3,9 +3,11 @@ accompanistPermissions = "0.34.0"
 securityCrypto = "1.1.0-alpha06"
 agp = "8.9.1"
 cameraCore = "1.5.3"
-# 1.1.1(老libwebrtc)的H265没有标准RTP打包器(RFC 7798)，发的是generic私有封装(1字节头+Annex-B)，
-# PC GStreamer rtph265depay 解不出→黑屏。1.3.10 基于 M137+，带标准 H265 打包器（对齐 iOS M144）。
-streamWebrtc = "1.3.10"
+# H265 黑屏根因：getstream fork(1.1.1/1.3.10 实测均是)的 H265 只有编解码器补丁，RTP 打包
+# 仍走 generic 私有封装(1字节头+Annex-B)，PC GStreamer rtph265depay 解不出→黑屏。
+# 换 webrtc-sdk(LiveKit) fork：与 iOS 同源同里程碑(iOS=144.7559.10)，其 H265 RTP 打包(RFC 7798)
+# 已被 iOS↔PC 链路验证互通。包名同为 org.webrtc，API 兼容。
+webrtcSdk = "144.7559.09"
 gson = "2.10.1"
 kotlin = "2.0.21"
 coreKtx = "1.17.0"
@@ -30,7 +32,7 @@ androidx-camera-view = { module = "androidx.camera:camera-view", version.ref = "
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
 androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigationCompose" }
-stream-webrtc = { module = "io.getstream:stream-webrtc-android", version.ref = "streamWebrtc" }
+stream-webrtc = { module = "io.github.webrtc-sdk:android", version.ref = "webrtcSdk" }
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
