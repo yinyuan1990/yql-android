@@ -259,9 +259,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         } else videoSender?.let { sender ->
             val params = sender.parameters
             if (params.encodings.isNotEmpty()) {
+                // ⭐ 码率稳定：min=max 钉死（叠加自适应阶梯缩放），BWE 不漂移
+                val pinned = maxOf(200, (targetKbps * adaptiveBitrateScale()).toInt())
                 params.encodings[0].maxFramerate = targetFps
-                params.encodings[0].maxBitrateBps = targetKbps * 1000
-                params.encodings[0].minBitrateBps = currentMinBitrateKbps * 1000
+                params.encodings[0].maxBitrateBps = pinned * 1000
+                params.encodings[0].minBitrateBps = pinned * 1000
                 sender.parameters = params
             }
         }
@@ -697,6 +699,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //   其它（"srs"/缺省）→ SRS。互斥，一次会话只走一条链路。
         val connectMode = appContext?.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
             ?.getString("connect_mode", "srs")?.lowercase() ?: "srs"
+        bitrateScaleIdx = 0   // 新推流会话：码率阶梯回满档（自适应从头开始）
         if (connectMode == "p2p") {
             currentConnMode = ConnMode.P2P
             effectiveConnectstype = 1
@@ -883,16 +886,16 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     override val p2pFactory: PeerConnectionFactory? get() = peerConnectionFactory
     override val p2pLocalVideoTrack: VideoTrack? get() = localVideoTrack
     override fun p2pBitrateRangeKbps(): Pair<Int, Int> {
-        // currentBitrateKbps/currentMinBitrateKbps 已含热控缩放与画质百分比
-        var maxK = maxOf(200, currentBitrateKbps)
-        var minK = maxOf(100, minOf(currentMinBitrateKbps, maxK))
-        // ⭐ §25.5-1：选中路径=TURN 中继时整体钳到 relayMaxKbps，
-        //   防止高档位把中继灌崩（min 也一起钳，否则 libwebrtc 被下限焊死无法退让）。
-        if (p2pPathIsRelay && maxK > relayMaxKbps) {
-            maxK = relayMaxKbps
-            minK = minOf(minK, relayMaxKbps * 6 / 10)   // 下限同步压到上限的 60%
+        // ⭐ 2026-07-09 用户算法「码率稳定」：min=max=目标值钉死，libwebrtc BWE 不得在区间内
+        //   上下漂移（此前 min~max 区间导致码率随 BWE 波动）。弱网退让全部交给自适应阶梯：
+        //   先降帧保画质 → 帧率到最低后 bitrateScaleIdx 一档档降码率 → 恢复时反向。
+        // currentBitrateKbps 已含热控缩放与画质百分比
+        var target = maxOf(200, (currentBitrateKbps * adaptiveBitrateScale()).toInt())
+        // ⭐ §25.5-1：选中路径=TURN 中继时钳到 relayMaxKbps，防止高档位把中继灌崩
+        if (p2pPathIsRelay && target > relayMaxKbps) {
+            target = relayMaxKbps
         }
-        return Pair(minK, maxK)
+        return Pair(target, target)
     }
     override fun p2pTargetFps(): Int {
         val maxPushFps = currentLadder[currentProfile]?.maxPushFps ?: 60
@@ -1091,11 +1094,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val params = sender.parameters
         if (params.encodings.isEmpty()) return
         
-        // 🔥 与iOS一致：使用 min~max 码率区间（允许WebRTC向下自适应），并锁定分辨率靠降帧对抗拥塞
-        // 🌡️ 叠加热控约束：码率乘缩放系数、帧率不超过热档位上限
-        val thermalMaxKbps = maxOf(300, (currentBitrateKbps * thermalBitrateScale).toInt())
-        params.encodings[0].maxBitrateBps = thermalMaxKbps * 1000
-        params.encodings[0].minBitrateBps = minOf(currentMinBitrateKbps, thermalMaxKbps) * 1000
+        // ⭐ 2026-07-09 用户算法「码率稳定」：min=max 钉死目标码率（含热控与自适应阶梯缩放），
+        //   BWE 不得在区间内漂移；弱网退让 = 先降帧、帧率最低后由 bitrateScaleIdx 一档档降码率
+        val targetKbps = maxOf(300, (currentBitrateKbps * thermalBitrateScale * adaptiveBitrateScale()).toInt())
+        params.encodings[0].maxBitrateBps = targetKbps * 1000
+        params.encodings[0].minBitrateBps = targetKbps * 1000
         params.encodings[0].maxFramerate = minOf(currentFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
         
         // scaleDown：从采集分辨率缩放到目标输出（与iOS一致）
@@ -1111,7 +1114,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     
     fun setMaxBitrateKbps(kbps: Int) {
         currentBitrateKbps = kbps
-        currentMinBitrateKbps = maxOf(100, (kbps * 0.6).toInt())  // 🔥 min≈60%max，允许向下自适应
+        currentMinBitrateKbps = kbps  // ⭐ 码率稳定：min=max 钉死，弱网退让走自适应阶梯（先降帧后降码率）
         // ⭐ P2P：只写码率、不碰帧率（解耦，避免「调码率改了 fps」——iOS §21.5 的坑）
         if (currentConnMode == ConnMode.P2P) {
             p2pManager.applyBitrateToAllSessions()
@@ -1120,8 +1123,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val sender = videoSender ?: return
         val params = sender.parameters
         if (params.encodings.isEmpty()) return
-        params.encodings[0].maxBitrateBps = currentBitrateKbps * 1000
-        params.encodings[0].minBitrateBps = currentMinBitrateKbps * 1000
+        val pinned = maxOf(200, (currentBitrateKbps * adaptiveBitrateScale()).toInt())
+        params.encodings[0].maxBitrateBps = pinned * 1000
+        params.encodings[0].minBitrateBps = pinned * 1000
         sender.parameters = params
     }
     
@@ -1189,6 +1193,32 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private val cooldownAfterUpMs: Long = 2000    // 升帧后冷却2秒（iOS 同值）
     // ⭐ 帧率档位表（iOS §21.5 加密阶梯）：直接切档不逐步微调，每步降幅≤1/3，弱网过渡平滑
     private val fpsLadder: IntArray = intArrayOf(60, 45, 30, 24, 20, 15)
+
+    // ⭐ 码率阶梯（2026-07-09 用户算法：弱网【先降帧保画质，帧率到阶梯最低后才降码率】；
+    //   恢复时【先回码率到100%，再升帧】——后降的先恢复。每一档都是钉死的稳定值：
+    //   编码器 min=max=目标码率，libwebrtc BWE 无法在区间内漂移 → 码率稳定不跳变）
+    private val bitrateScaleLadder = doubleArrayOf(1.0, 0.8, 0.65, 0.5, 0.4)
+    @Volatile private var bitrateScaleIdx = 0   // 0=满码率档
+
+    /** 当前自适应码率缩放（1.0=满档）。所有下发编码器码率的地方统一乘它 */
+    private fun adaptiveBitrateScale(): Double = bitrateScaleLadder[bitrateScaleIdx]
+
+    /** 码率阶梯变化后立即落到编码器（P2P 全会话 / SRS videoSender），min=max 钉死 */
+    private fun applyAdaptiveBitrate(reason: String) {
+        val pct = (adaptiveBitrateScale() * 100).toInt()
+        Log.d("meidui", "⚠️ 码率修改源=自适应$reason → ${pct}%档（帧率已在${adaptiveFps}fps；码率钉死min=max不漂移）")
+        if (currentConnMode == ConnMode.P2P) {
+            p2pManager.applyBitrateToAllSessions()
+        } else videoSender?.let { sender ->
+            val params = sender.parameters
+            if (params.encodings.isNotEmpty()) {
+                val target = maxOf(200, (currentBitrateKbps * thermalBitrateScale * adaptiveBitrateScale()).toInt())
+                params.encodings[0].maxBitrateBps = target * 1000
+                params.encodings[0].minBitrateBps = target * 1000
+                sender.parameters = params
+            }
+        }
+    }
     
     // 状态
     private val lossRateHistory = mutableListOf<Double>()
@@ -1266,6 +1296,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     Log.d(TAG, "⬇️ [降帧] $oldFps→${adaptiveFps}fps (RTT=${rttMs}ms 丢包=${String.format("%.1f", avgLoss * 100)}%)")
                     // ⭐ 触发依据带全（用户排查「黑背景降帧是不是网络导致」）：rttBad/lossBad 谁触发一眼可见
                     Log.d("meidui", "⚠️ fps修改源=自适应降帧 $oldFps→${adaptiveFps}fps [依据: RTT=${rttMs}ms(bad=$isRttBad,阈值>${rttDownThreshold}) 3s均丢包=${String.format("%.2f", avgLoss * 100)}%(bad=$isLossBad,阈值>3%)]")
+                } else if (bitrateScaleIdx < bitrateScaleLadder.size - 1) {
+                    // ⭐ 用户算法第二阶段：帧率已到阶梯最低仍弱网 → 这时才降码率（一步一档）
+                    bitrateScaleIdx++
+                    lastFpsChangeTime = now
+                    lastFpsDirectionDown = true
+                    applyAdaptiveBitrate("降码率(帧率已最低${adaptiveFps}fps)")
                 }
                 highLossCounter = 0
             }
@@ -1273,15 +1309,23 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             lowLossCounter++
             highLossCounter = 0
             if (lowLossCounter >= upgradeHoldSec) {
-                // ⭐ iOS 阶梯升帧：切到上一档，且【封顶 maxFps=后端下发目标】（网络好也不超过设定值）
-                val newFps = minOf(maxFps, fpsLadder.lastOrNull { it > adaptiveFps } ?: fpsLadder.first())
-                if (newFps != adaptiveFps && newFps > adaptiveFps) {
-                    adaptiveFps = newFps
-                    fpsChanged = true
+                if (bitrateScaleIdx > 0) {
+                    // ⭐ 用户算法恢复顺序（后降的先恢复）：先把码率一档档回满，再考虑升帧
+                    bitrateScaleIdx--
                     lastFpsChangeTime = now
                     lastFpsDirectionDown = false
-                    Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps=后端目标, RTT=${rttMs}ms)")
-                    Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps (上限$maxFps=min(后端目标$targetOutputFps,热控))")
+                    applyAdaptiveBitrate("回升码率")
+                } else {
+                    // ⭐ iOS 阶梯升帧：切到上一档，且【封顶 maxFps=后端下发目标】（网络好也不超过设定值）
+                    val newFps = minOf(maxFps, fpsLadder.lastOrNull { it > adaptiveFps } ?: fpsLadder.first())
+                    if (newFps != adaptiveFps && newFps > adaptiveFps) {
+                        adaptiveFps = newFps
+                        fpsChanged = true
+                        lastFpsChangeTime = now
+                        lastFpsDirectionDown = false
+                        Log.d(TAG, "⬆️ [升帧] $oldFps→${adaptiveFps}fps (上限${maxFps}fps=后端目标, RTT=${rttMs}ms)")
+                        Log.d("meidui", "⚠️ fps修改源=自适应升帧 $oldFps→${adaptiveFps}fps (上限$maxFps=min(后端目标$targetOutputFps,热控))")
+                    }
                 }
                 lowLossCounter = 0
             }
@@ -1569,6 +1613,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
                                     "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
                                     "adFps=$adaptiveFps/目标$targetOutputFps " +
+                                    "brScale=${(adaptiveBitrateScale() * 100).toInt()}% " +
                                     "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs} " +
                                     // ⭐ [H265 黑屏诊断] kf=累计关键帧 pli/fir=累计收到的关键帧请求。
                                     //   正常应见：起流 kf≥1，PC 每发 PLI 后 kf +1；kf 恒 0 = 编码器没吐过关键帧
