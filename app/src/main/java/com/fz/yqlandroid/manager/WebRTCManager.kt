@@ -1427,6 +1427,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     var nackCount: Long = 0         // 收到的 NACK（对端要求重传）次数
                     var qualityLimit = "-"          // 质量受限原因：none/bandwidth/cpu（=WebRTC 为什么降质）
                     var totalPacketSendDelay = 0.0  // 累计发包排队延迟（秒）——攒帧时会飙升
+                    // ⭐ [H265 黑屏诊断] 关键帧链路：keyFramesEncoded=编码器累计吐出的关键帧；
+                    //   pliCount/firCount=收到对端(PC)的关键帧请求次数。kf 不涨 + pli 在涨 =
+                    //   编码器不响应关键帧请求（Android H265 黑屏的候选根因之一）。
+                    var keyFramesEncoded: Long = 0
+                    var pliCount: Long = 0
+                    var firCount: Long = 0
                     // ⭐ [meidui 诊断] P2P fps=0 排查②：区分「stats里根本没视频outbound-rtp」vs「有但无fps字段」
                     var sawVideoOutbound = false
                     var hasFpsField = false
@@ -1453,6 +1459,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             (stats.members["nackCount"] as? Number)?.let { nackCount = it.toLong() }
                             (stats.members["totalPacketSendDelay"] as? Number)?.let { totalPacketSendDelay = it.toDouble() }
                             (stats.members["qualityLimitationReason"] as? String)?.let { qualityLimit = it }
+                            (stats.members["keyFramesEncoded"] as? Number)?.let { keyFramesEncoded = it.toLong() }
+                            (stats.members["pliCount"] as? Number)?.let { pliCount = it.toLong() }
+                            (stats.members["firCount"] as? Number)?.let { firCount = it.toLong() }
                         }
                         if (stats.type == "remote-inbound-rtp") {
                             (stats.members["packetsLost"] as? Number)?.let { packetsLost = it.toLong() }
@@ -1560,7 +1569,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
                                     "nack+=$nackDelta rtt=${rttMs}ms loss=${"%.2f".format(instantLoss * 100)}% " +
                                     "adFps=$adaptiveFps/目标$targetOutputFps " +
-                                    "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs}")
+                                    "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs} " +
+                                    // ⭐ [H265 黑屏诊断] kf=累计关键帧 pli/fir=累计收到的关键帧请求。
+                                    //   正常应见：起流 kf≥1，PC 每发 PLI 后 kf +1；kf 恒 0 = 编码器没吐过关键帧
+                                    "kf=$keyFramesEncoded pli=$pliCount fir=$firCount")
                             // ⭐ [meidui 诊断] P2P 推送 fps=0 定性：一行说清卡在哪一层
                             if (currentConnMode == ConnMode.P2P && fps == 0) {
                                 val reason = when {

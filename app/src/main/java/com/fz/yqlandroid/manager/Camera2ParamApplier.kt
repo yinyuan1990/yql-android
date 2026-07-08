@@ -184,8 +184,19 @@ object Camera2ParamApplier {
         try {
             val fps = p.targetFps ?: return
             if (fps <= 0) return
-            // 手动快门(AE OFF)时帧率由 SENSOR_EXPOSURE_TIME 决定，AE 区间无效，跳过
-            if (p.shutterCjfps != null && p.shutterCjfps > 0) return
+            // 手动快门(AE OFF)时 AE 帧率区间无效，帧率由 SENSOR_FRAME_DURATION 决定。
+            // 🔥 2026-07-08 修复「采集按 30 没生效」：此前这里直接 return、帧间隔没人设 →
+            //    传感器跑满(实测 frameDur=16.7ms≈60fps，尽管 aeRange 钉了[30,30])。
+            //    现在手动快门下显式钉 SENSOR_FRAME_DURATION=1/fps 秒（与手动曝光同属
+            //    MANUAL_SENSOR 能力，快门能生效的机型这个也生效）。曝光时间若超过帧间隔，
+            //    HAL 会自动拉长实际帧间隔（快门优先，符合预期）。
+            if (p.shutterCjfps != null && p.shutterCjfps > 0) {
+                val frameDurNs = 1_000_000_000L / fps
+                b.set(CaptureRequest.SENSOR_FRAME_DURATION, frameDurNs)
+                Log.d("meidui", "🎞️ 手动快门(AE OFF)钉采集帧率: SENSOR_FRAME_DURATION=" +
+                        "${frameDurNs / 1_000_000}ms → ${fps}fps（AE区间在手动模式无效，此值才是真帧率）")
+                return
+            }
             val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
             val exact = ranges.firstOrNull { it.lower == fps && it.upper == fps }
             val fixedAbove = ranges
