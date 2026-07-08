@@ -3,7 +3,9 @@ accompanistPermissions = "0.34.0"
 securityCrypto = "1.1.0-alpha06"
 agp = "8.9.1"
 cameraCore = "1.5.3"
-streamWebrtc = "1.1.1"
+# 1.1.1(老libwebrtc)的H265没有标准RTP打包器(RFC 7798)，发的是generic私有封装(1字节头+Annex-B)，
+# PC GStreamer rtph265depay 解不出→黑屏。1.3.10 基于 M137+，带标准 H265 打包器（对齐 iOS M144）。
+streamWebrtc = "1.3.10"
 gson = "2.10.1"
 kotlin = "2.0.21"
 coreKtx = "1.17.0"
