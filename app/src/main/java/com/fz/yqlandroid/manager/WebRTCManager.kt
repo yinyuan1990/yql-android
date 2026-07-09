@@ -136,6 +136,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ PC 观看端连接状态（每秒回调）：P2P=有 ICE 已连接的观看会话；
     //   SRS/通用=最近 6s 内收到过 PC 的 VIEWER_HEARTBEAT（PC 出画面才发心跳）。
     var onPcConnectedUpdate: ((Boolean) -> Unit)? = null
+    // ⭐ 切网重连中（P2P）：拆会话+HANGUP 后等 PC 重连，UI 左上角显示"网络切换重连中…"；PC 心跳恢复即清除
+    var onReconnectingUpdate: ((Boolean) -> Unit)? = null
+    @Volatile private var p2pReconnecting: Boolean = false
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -680,6 +683,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         // 🔄 WS 重连成功 → 推流健康检查（两种模式统一，见 publishHealthCheck）
         WebSocketManager.instance.onReconnected = { onWebSocketReconnected() }
+        // ⭐ 切网重连：置"重连中"（UI 左上角显示），PC 心跳恢复后在统计循环里清除
+        p2pManager.onNetworkSwitchReconnect = {
+            p2pReconnecting = true
+            scope.launch(Dispatchers.Main) { onReconnectingUpdate?.invoke(true) }
+        }
         // 📶 §21.27 网络切换监听（统一入口，P2P/SRS 共用；切网 → publishHealthCheck 同一出口）
         startNetworkMonitoring()
         autoRecoverEnabled = true   // 开始推流即恢复自动自愈（睡眠/被踢时会关掉）
@@ -1428,9 +1436,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         val pcConnected = if (currentConnMode == ConnMode.P2P)
                             p2pManager.connectedViewerPeerConnections.isNotEmpty() || heartbeatAlive
                         else heartbeatAlive
+                        // ⭐ PC 连接恢复 = 切网重连完成，清除"重连中"
+                        if (pcConnected && p2pReconnecting) p2pReconnecting = false
+                        val reconnectingNow = p2pReconnecting && !pcConnected
                         withContext(Dispatchers.Main) {
                             onCapFpsUpdate?.invoke(capFpsUi)
                             onPcConnectedUpdate?.invoke(pcConnected)
+                            onReconnectingUpdate?.invoke(reconnectingNow)
                         }
                     }
                 }

@@ -160,23 +160,23 @@ class P2PManager(private val context: Context) {
             Log.d("meidui", "📶 [P2P切网] WS断开中，Offer 不发（防黑洞），等 WS 重连后统一 ICE Restart")
             return
         }
+        // ⭐ 2026-07-09 修「切网后必须手动重登 PC 才出画面」根因（对标 iOS）：
+        //   观看端恒为 PC GStreamer，其 webrtcbin 不支持在旧实例上 ICE Restart（收新 ufrag 的
+        //   re-offer 不会重启 libnice/重新收集候选 → 卡死）。切网【不再尝试 ICE Restart】，
+        //   一律拆会话 + HANGUP(network_switch_reconnect)，由 PC 整体重建 pipeline + 重发 REQUEST。
         val sessions = synchronized(viewerSessions) { viewerSessions.toMap() }
-        Log.d("meidui", "📶 [P2P切网] 开始处理 ${sessions.size} 个会话: ${sessionStatesSummary()}")
-        for ((pcId, pc) in sessions) {
-            // 切网是「新一次」重连，重置该会话的 ICE 重试计数
+        Log.d("meidui", "📶 [P2P切网] 拆除并让 PC 重连 ${sessions.size} 个会话(不做ICE Restart): ${sessionStatesSummary()}")
+        for ((pcId, _) in sessions) {
             iceRetryCount[pcId] = 0
-            val state = pc.connectionState()
-            if (state == PeerConnection.PeerConnectionState.CLOSED ||
-                state == PeerConnection.PeerConnectionState.FAILED) {
-                // 无法 ICE Restart：拆掉并让 PC 重新发起
-                removeViewerSession(pcId, notifyPC = false)
-                WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
-            } else {
-                if (isOnCellular) forceRelayPeerIds.add(pcId)
-                retryIceConnection(pcId, pc)
-            }
+            if (isOnCellular) forceRelayPeerIds.add(pcId)   // 蜂窝：PC 重建后手机新 Offer 走 relay
+            removeViewerSession(pcId, notifyPC = false)
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
         }
+        onNetworkSwitchReconnect?.invoke()   // 通知上层置"重连中"（StreamingScreen 左上角显示）
     }
+
+    /** ⭐ 切网触发重连回调（WebRTCManager 用于置"重连中"给 UI，PC 心跳恢复后清除） */
+    var onNetworkSwitchReconnect: (() -> Unit)? = null
 
     // MARK: - 传输策略
 

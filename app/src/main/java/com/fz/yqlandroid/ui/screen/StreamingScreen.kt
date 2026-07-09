@@ -107,6 +107,7 @@ fun StreamingScreen(
     var currentKbps by remember { mutableIntStateOf(0) }
     var currentCapFps by remember { mutableIntStateOf(0) }  // ⭐ 相机实际采集帧率（左上角显示）
     var pcConnected by remember { mutableStateOf(false) }   // ⭐ PC 观看端是否已连接（左上角显示）
+    var reconnecting by remember { mutableStateOf(false) }  // ⭐ 切网重连中（左上角显示"网络切换重连中…"）
     
     // 右侧面板 - 显示同步数据（后端下发 + WebRTC实际值）
     var zoomValue by remember { mutableFloatStateOf(1.0f) }
@@ -134,6 +135,10 @@ fun StreamingScreen(
         // ⭐ PC 观看端连接状态（P2P=ICE 已连会话；SRS=VIEWER_HEARTBEAT 6s 内有心跳）
         webRTCManager.onPcConnectedUpdate = { connected ->
             pcConnected = connected
+        }
+        // ⭐ 切网重连中：拆会话+HANGUP 后等 PC 重连，PC 心跳恢复后回调 false
+        webRTCManager.onReconnectingUpdate = { r ->
+            reconnecting = r
         }
         
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
@@ -596,6 +601,22 @@ fun StreamingScreen(
                         color = if (pcConnected) Color(0xFF4CAF50) else Color(0xFFBDBDBD),
                         fontSize = 12.sp
                     )
+                    // ⭐ 切网重连中（P2P）：过程可视化，PC 心跳恢复后自动消失
+                    if (reconnecting && !pcConnected) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFFC107))
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "网络切换重连中…",
+                            color = Color(0xFFFFC107),
+                            fontSize = 12.sp
+                        )
+                    }
                 }
             }
         }
