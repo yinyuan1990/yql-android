@@ -495,24 +495,25 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // 🔥 5档预设：width/height=就近采集分辨率，fps=该分辨率实际可用帧率(60优先)，scaleDown=1.0（直接采集不缩放；low 档除外）
         currentLadder = mapOf(
             LadderProfile.LOW to lowPreset,
+            // ⭐ 2026-07-10 用户要求下调各档 max（min 按原 60% 比例同步调整）
             LadderProfile.P4K to LadderPreset(
                 width = p4kCap.width, height = p4kCap.height,
-                fps = fpsFor(p4kCap), maxKbps = 7500, minKbps = 4500,
+                fps = fpsFor(p4kCap), maxKbps = 4000, minKbps = 2400,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.HIGH to LadderPreset(
                 width = highCap.width, height = highCap.height,
-                fps = fpsFor(highCap), maxKbps = 5500, minKbps = 3300,
+                fps = fpsFor(highCap), maxKbps = 3500, minKbps = 2100,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.STANDARD to LadderPreset(
                 width = stdCap.width, height = stdCap.height,
-                fps = fpsFor(stdCap), maxKbps = 4500, minKbps = 2700,
+                fps = fpsFor(stdCap), maxKbps = 3000, minKbps = 1800,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = false
             ),
             LadderProfile.ULTRA to LadderPreset(
                 width = ultraCap.width, height = ultraCap.height,
-                fps = fpsFor(ultraCap), maxKbps = 5500, minKbps = 3300,
+                fps = fpsFor(ultraCap), maxKbps = 3500, minKbps = 2100,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = true
             )
         )
