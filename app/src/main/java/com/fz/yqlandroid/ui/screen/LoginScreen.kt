@@ -59,7 +59,8 @@ fun LoginScreen(
     // ⭐ 连接方式（与 iOS 登录页一致：用户手选、记住上次选择、覆盖后端下发）："srs" | "p2p"
     var selectedConnectMode by remember { mutableStateOf("srs") }
     // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
-    var selectedCodec by remember { mutableStateOf("h264") }
+    // ⭐ 2026-07-11：默认 H265（设备不支持时 H265Support.decideForP2P 自动回退 H264）
+    var selectedCodec by remember { mutableStateOf("h265") }
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
@@ -78,8 +79,8 @@ fun LoginScreen(
         }
         // ⭐ 恢复上次选择的连接方式（与 iOS ConnectModeOption.lastSelected 一致，默认 SRS）
         selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
-        // ⭐ H265：恢复上次选择的 P2P 编码（默认 H264）
-        selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h264") ?: "h264"
+        // ⭐ H265：恢复上次选择的 P2P 编码（2026-07-11 默认改 H265，不支持自动回退 H264）
+        selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h265") ?: "h265"
     }
     
     // 渐变背景
@@ -276,7 +277,8 @@ fun LoginScreen(
                             color = Color(0xFF1A1A1A)
                         )
                         Spacer(modifier = Modifier.width(12.dp))
-                        listOf("srs" to "SRS", "p2p" to "P2P").forEach { (mode, label) ->
+                        // ⭐ 2026-07-11：SRS=多人线路、P2P=单人线路（仅改显示名，mode 值仍是 srs/p2p）
+                        listOf("srs" to "多人线路", "p2p" to "单人线路").forEach { (mode, label) ->
                             val selected = selectedConnectMode == mode
                             Box(
                                 modifier = Modifier

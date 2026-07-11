@@ -579,11 +579,12 @@ fun StreamingScreen(
                         .background(if (isStreaming) Color(0xFF4CAF50) else Color(0xFFFF5722))
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                // ⭐ H265：状态条前缀显示当前编码（H265 橙色醒目 / H264 白色，与 iOS 左上角一致）
+                // ⭐ 2026-07-11 用户要求：左上角只显示「码率 + PC是否连接」，
+                //   编码/采集fps/推流fps 一律隐藏（未推流时仍显示连接状态文案）。
                 Text(
-                    text = if (isStreaming) "${com.fz.yqlandroid.manager.H265Support.codecLabel()} · 采集${currentCapFps} · 推${currentFps}fps · ${currentKbps}kbps"
+                    text = if (isStreaming) "${currentKbps}kbps"
                            else connectionStatus,
-                    color = if (isStreaming && com.fz.yqlandroid.manager.H265Support.isH265Session()) Color(0xFFFFB74D) else Color.White,
+                    color = Color.White,
                     fontSize = 12.sp
                 )
                 // ⭐ PC 观看端连接状态（绿=PC 已连接出画面，灰=无 PC 观看）
