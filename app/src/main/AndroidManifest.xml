@@ -11,6 +11,10 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- 🔌 外接OTG摄像头（UVC，第四十八章）：USB Host 能力声明（非必须，不支持OTG的机型仍可装） -->
+    <!-- 不加 USB_DEVICE_ATTACHED 静态 intent-filter：避免插线自动拉起App，权限走 USBMonitor 运行时弹窗 -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     
     <!-- 麦克风权限 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />

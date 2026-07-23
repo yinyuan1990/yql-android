@@ -82,6 +82,10 @@ dependencies {
     
     // ========== ML Kit 二维码扫描 ==========
     implementation(libs.mlkit.barcode.scanning)
+
+    // ========== 外接OTG摄像头 UVC (第四十八章，AUSBC 社区维护分支，JitPack) ==========
+    // ernestp/AndroidUSBCamera 3.5.3：Android 16 + 16KB页对齐已支持（原库 jiangdongguo 停更）
+    implementation("com.github.ernestp.AndroidUSBCamera:libausbc:3.5.3")
     
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

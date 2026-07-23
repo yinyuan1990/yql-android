@@ -70,10 +70,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ P2P 多会话管理（connect_mode == "p2p" 时启用，与 SRS 互斥）
     val p2pManager = P2PManager(context)
     
+    // ⭐ 摄像头模式（第四十八章）：登录页选择，"builtin"=自带(Camera2) / "otg"=外接UVC。
+    //    startPreview 时读定并在采集会话期间不变；OTG 实现全部在 manager/uvc/ 包。
+    @Volatile var usingOtgCamera: Boolean = false
+        private set
+
     // WebRTC 核心组件
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
-    private var videoCapturer: CameraVideoCapturer? = null
+    private var videoCapturer: VideoCapturer? = null   // 自带=CameraVideoCapturer / 外接=UvcVideoCapturer（第四十八章）
     private var videoSource: VideoSource? = null
     private var localVideoTrack: VideoTrack? = null
     private var videoSender: RtpSender? = null
@@ -610,8 +615,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         Log.d(TAG, "🎬 启动预览...")
         
         videoSource = peerConnectionFactory!!.createVideoSource(false)
-        videoCapturer = createCameraCapturer(isFrontCamera)
-        Log.d(TAG, "🎬 startPreview: capturer=${videoCapturer?.javaClass?.simpleName}, 目标采集=${currentWidth}x${currentHeight}@${captureFps()}(推送目标${currentFps}), front=$isFrontCamera")
+        // ⭐ 第四十八章：摄像头模式分流（登录页手选，存 token_prefs.camera_mode）——OTG 的唯一分流点，
+        //    后面的 SurfaceTextureHelper/CountingObserver/videoSource/编码/推流链路两种模式完全共用
+        usingOtgCamera = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            .getString("camera_mode", "builtin") == "otg"
+        videoCapturer = if (usingOtgCamera) {
+            Log.d("meidui", "🔌 [OTG] 摄像头模式=外接OTG → UvcVideoCapturer（Camera2 链路不启动）")
+            com.fz.yqlandroid.manager.uvc.UvcVideoCapturer(context)
+        } else {
+            createCameraCapturer(isFrontCamera)
+        }
+        Log.d(TAG, "🎬 startPreview: capturer=${videoCapturer?.javaClass?.simpleName}, 目标采集=${currentWidth}x${currentHeight}@${captureFps()}(推送目标${currentFps}), front=$isFrontCamera, otg=$usingOtgCamera")
         
         videoCapturer?.let { capturer ->
             val surfaceTextureHelper = SurfaceTextureHelper.create(
@@ -1689,6 +1703,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // MARK: - 摄像头切换
     
     fun switchCamera() {
+        // ⭐ OTG 外接摄像头无前后摄概念：忽略切换指令（PC 零改动，指令到这里安全落地）
+        if (usingOtgCamera) {
+            Log.d("meidui", "🔌 [OTG] 收到切换摄像头指令 → OTG模式忽略（外接单摄）")
+            return
+        }
         (videoCapturer as? CameraVideoCapturer)?.switchCamera(object : CameraVideoCapturer.CameraSwitchHandler {
             override fun onCameraSwitchDone(isFront: Boolean) {
                 isFrontCamera = isFront
@@ -2000,6 +2019,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val ptype = config["ptype"] as? String ?: ""
         Log.d(TAG, "📋 [后端配置] ptype=$ptype, config=$config")
         
+        // ⭐ 第四十八章：OTG 外接摄像头模式下，Camera2 专属指令统一忽略（PC 零改动，不报错不崩）。
+        //    档位(type)/推送fps/码率/关键帧照常生效（作用在编码器/UVC 就近协商，与镜头类型无关）。
+        if (usingOtgCamera && ptype in listOf(
+                "direction", "zoom", "cjfps", "focus",
+                "test_brightness", "white_balance", "applyWhiteBalance")) {
+            Log.d("meidui", "🔌 [OTG] 忽略Camera2专属指令 ptype=$ptype（外接UVC摄像头不支持）")
+            return
+        }
+
         when (ptype) {
             // 档位切换
             "type" -> {
@@ -2243,6 +2271,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 供各 setter 与切档/切摄像头后重放调用。
      */
     fun applyCameraParams(): Boolean {
+        // ⭐ OTG 外接摄像头没有 Camera2 会话：直接视为成功，重试环不空转、日志不刷失败告警。
+        //    变焦/快门/对焦/白平衡/AE区间等 Camera2 参数对 UVC 摄像头天然不适用（第四十八章）。
+        if (usingOtgCamera) return true
         val params = Camera2ParamApplier.Params(
             exposureEv = null,   // 滤镜已移除：不再做 AE 曝光补偿（颜色调整走 PC 端）
             focus = _currentFocus,
@@ -2255,7 +2286,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // ⭐ 用采集帧率（档位60）而非推送目标：否则推送30时 AE 被钉 [30,30]，采集被硬拉回30，解耦失效
             targetFps = captureFps()
         )
-        return Camera2ParamApplier.apply(videoCapturer, params)
+        return Camera2ParamApplier.apply(videoCapturer as? CameraVideoCapturer, params)
     }
 
     /**

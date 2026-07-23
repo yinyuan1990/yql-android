@@ -61,6 +61,8 @@ fun LoginScreen(
     // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
     // ⭐ 2026-07-11：默认 H265（设备不支持时 H265Support.decideForP2P 自动回退 H264）
     var selectedCodec by remember { mutableStateOf("h265") }
+    // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android，记住上次选择
+    var selectedCameraMode by remember { mutableStateOf("builtin") }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
     var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
     
@@ -83,6 +85,8 @@ fun LoginScreen(
         selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
         // ⭐ H265：恢复上次选择的 P2P 编码（2026-07-11 默认改 H265，不支持自动回退 H264）
         selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h265") ?: "h265"
+        // ⭐ 摄像头模式（第四十八章）：恢复上次选择，默认自带
+        selectedCameraMode = prefs.getString("selected_camera_mode", "builtin") ?: "builtin"
         // ⭐ 强制更新检查（公共接口，失败放行不拦门）
         forceUpdate = com.fz.yqlandroid.manager.AppUpdateManager.checkForceUpdate(context)
     }
@@ -338,6 +342,42 @@ fun LoginScreen(
                             }
                         }
                     }
+
+                    // ⭐ 摄像头模式选择（第四十八章）：自带(Camera2) / 外接OTG(UVC)，样式照抄连接方式
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 30.dp),
+                        color = Color(0xFFF0F0F0)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "摄像头",
+                            fontSize = 16.sp,
+                            color = Color(0xFF1A1A1A)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        listOf("builtin" to "自带", "otg" to "外接OTG").forEach { (mode, label) ->
+                            val selected = selectedCameraMode == mode
+                            Box(
+                                modifier = Modifier
+                                    .padding(end = 8.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
+                                    .clickable { selectedCameraMode = mode }
+                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontSize = 14.sp,
+                                    color = if (selected) Color.White else Color(0xFF666666)
+                                )
+                            }
+                        }
+                    }
                 }
             }
             
@@ -391,6 +431,8 @@ fun LoginScreen(
                                         putString("selected_connect_mode", selectedConnectMode)
                                         // ⭐ H265：记住本次选择的 P2P 编码
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, selectedCodec)
+                                        // ⭐ 摄像头模式（第四十八章）：记住本次选择
+                                        putString("selected_camera_mode", selectedCameraMode)
                                         apply()
                                     }
                                     
@@ -412,6 +454,8 @@ fun LoginScreen(
                                         
                                         // ⭐ 连接方式与 P2P 配置（与iOS一致：以用户在登录页的手动选择为准，覆盖后端下发）
                                         putString("connect_mode", selectedConnectMode)
+                                        // ⭐ 摄像头模式运行时决策值（WebRTCManager.startPreview 读取，第四十八章）
+                                        putString("camera_mode", selectedCameraMode)
                                         // ⭐ H265：P2P 编码运行时决策值（WebRTCManager.startPublish → H265Support.decideForP2P 读取）
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, selectedCodec)
                                         putBoolean("force_relay", response.forceRelay ?: false)
