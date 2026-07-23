@@ -61,6 +61,8 @@ fun LoginScreen(
     // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
     // ⭐ 2026-07-11：默认 H265（设备不支持时 H265Support.decideForP2P 自动回退 H264）
     var selectedCodec by remember { mutableStateOf("h265") }
+    // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
+    var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
@@ -81,6 +83,8 @@ fun LoginScreen(
         selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
         // ⭐ H265：恢复上次选择的 P2P 编码（2026-07-11 默认改 H265，不支持自动回退 H264）
         selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h265") ?: "h265"
+        // ⭐ 强制更新检查（公共接口，失败放行不拦门）
+        forceUpdate = com.fz.yqlandroid.manager.AppUpdateManager.checkForceUpdate(context)
     }
     
     // 渐变背景
@@ -555,5 +559,32 @@ fun LoginScreen(
                 modifier = Modifier.padding(bottom = 20.dp)
             )
         }
+    }
+
+    // ⭐ 强制更新弹窗：不可关闭（无 dismissButton、onDismissRequest 空实现），只能去更新
+    forceUpdate?.let { fu ->
+        AlertDialog(
+            onDismissRequest = { /* 强制更新，不可关闭 */ },
+            title = { Text("发现新版本") },
+            text = {
+                Text("当前版本 ${fu.currentVersion} 已停止支持，请更新到 ${fu.minVersion} 及以上版本后继续使用。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    try {
+                        context.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse(fu.downloadUrl)
+                            )
+                        )
+                    } catch (e: Exception) {
+                        println("jfh [强更] 打开下载地址失败: ${e.message}")
+                    }
+                }) {
+                    Text("立即更新", color = Color(0xFF65AEF7), fontWeight = FontWeight.Medium)
+                }
+            }
+        )
     }
 }
