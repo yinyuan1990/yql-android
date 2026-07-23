@@ -263,35 +263,44 @@ class P2PManager(private val context: Context) {
         val type = message["type"] as? String ?: return
         val fromDevice = message["fromDevice"] as? String ?: ""
 
-        when (type) {
-            "VIEWER_CONNECTED" -> Log.d(TAG, "✅ PC $fromDevice 已收到画面")
-            "VIEWER_DISCONNECTED" -> Log.d(TAG, "🔌 PC $fromDevice 断开")
-            "WEBRTC_REQUEST" -> {
-                peerNetworkType[fromDevice] = (message["networkType"] as? String) ?: "unknown"
-                applyLanPrecheck(fromDevice, message)   // §25.7e：建会话前定直连/中继
-                if (!isReadyForViewers) {
-                    WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
-                    return
+        // ⭐ 崩溃修复（跨线程 use-after-free）：本方法由 WebSocketManager 在 OkHttp 读线程调用，
+        //   而所有 PeerConnection 的创建/访问/释放本类都约定「主线程访问」（见 viewerSessions 声明处）。
+        //   旧代码直接在 WS 线程里 createViewerSession / setRemoteDescription / pc.close()，
+        //   同一批 pc 又被 Observer 里的 mainScope.launch{ addIceCandidate / iceConnectionState / retryIce }
+        //   在主线程并发触碰 → PC 切网/重启发来 HANGUP 时 WS 线程 close() 释放 native 对象，主线程排队的
+        //   ICE 回调打到已释放 pc → SIGSEGV（libjingle_peerconnection_so.so）。
+        //   统一 hop 到 mainScope，让信令与 ICE/Observer 处理在同一线程串行，彻底消除 native 竞态。
+        mainScope.launch {
+            when (type) {
+                "VIEWER_CONNECTED" -> Log.d(TAG, "✅ PC $fromDevice 已收到画面")
+                "VIEWER_DISCONNECTED" -> Log.d(TAG, "🔌 PC $fromDevice 断开")
+                "WEBRTC_REQUEST" -> {
+                    peerNetworkType[fromDevice] = (message["networkType"] as? String) ?: "unknown"
+                    applyLanPrecheck(fromDevice, message)   // §25.7e：建会话前定直连/中继
+                    if (!isReadyForViewers) {
+                        WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
+                        return@launch
+                    }
+                    createViewerSession(fromDevice)
                 }
-                createViewerSession(fromDevice)
-            }
-            "WEBRTC_SDP" -> {
-                val sdpType = message["sdpType"] as? String ?: ""
-                val sdp = message["sdp"] as? String ?: ""
-                if (sdpType == "answer") handleRemoteAnswer(sdp, fromDevice)
-            }
-            "WEBRTC_ICE" -> handleRemoteIce(message, fromDevice)
-            "WEBRTC_HANGUP" -> {
-                // ⭐ §23.2 竞态保护：会话刚创建（<1s）就收到 HANGUP = PC 针对「上一个会话」的挂断
-                //   乱序迟到（PC 先 HANGUP 再 REQUEST，服务器转发顺序不保证）。无条件移除会把
-                //   正在 createOffer 的新会话干掉 → Offer 发到死会话 → 首开白等 15s+。
-                val createdAt = synchronized(viewerSessions) { sessionCreatedAt[fromDevice] } ?: 0L
-                val ageMs = System.currentTimeMillis() - createdAt
-                if (createdAt > 0 && ageMs < 1000) {
-                    Log.w(TAG, "🛡️ 忽略 HANGUP($fromDevice)：会话仅 ${ageMs}ms 前创建，判定为旧会话残留信令")
-                    Log.d("meidui", "🛡️ [P2P] 忽略旧会话残留 HANGUP(from=$fromDevice, 会话年龄=${ageMs}ms)")
-                } else {
-                    removeViewerSession(fromDevice, notifyPC = false)
+                "WEBRTC_SDP" -> {
+                    val sdpType = message["sdpType"] as? String ?: ""
+                    val sdp = message["sdp"] as? String ?: ""
+                    if (sdpType == "answer") handleRemoteAnswer(sdp, fromDevice)
+                }
+                "WEBRTC_ICE" -> handleRemoteIce(message, fromDevice)
+                "WEBRTC_HANGUP" -> {
+                    // ⭐ §23.2 竞态保护：会话刚创建（<1s）就收到 HANGUP = PC 针对「上一个会话」的挂断
+                    //   乱序迟到（PC 先 HANGUP 再 REQUEST，服务器转发顺序不保证）。无条件移除会把
+                    //   正在 createOffer 的新会话干掉 → Offer 发到死会话 → 首开白等 15s+。
+                    val createdAt = synchronized(viewerSessions) { sessionCreatedAt[fromDevice] } ?: 0L
+                    val ageMs = System.currentTimeMillis() - createdAt
+                    if (createdAt > 0 && ageMs < 1000) {
+                        Log.w(TAG, "🛡️ 忽略 HANGUP($fromDevice)：会话仅 ${ageMs}ms 前创建，判定为旧会话残留信令")
+                        Log.d("meidui", "🛡️ [P2P] 忽略旧会话残留 HANGUP(from=$fromDevice, 会话年龄=${ageMs}ms)")
+                    } else {
+                        removeViewerSession(fromDevice, notifyPC = false)
+                    }
                 }
             }
         }
