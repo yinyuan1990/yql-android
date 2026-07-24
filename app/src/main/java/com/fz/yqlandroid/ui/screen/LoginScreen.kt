@@ -1,11 +1,16 @@
 package com.fz.yqlandroid.ui.screen
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -67,6 +72,9 @@ fun LoginScreen(
     var selectedCameraMode by remember { mutableStateOf("builtin") }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
     var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
+    // ⭐ 设备号弹框（点击设备号显示完整 ID + 复制）
+    var showDeviceIdDialog by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
@@ -112,10 +120,11 @@ fun LoginScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())   // ⭐ 整页可滚动：选项多时小屏也能划到底
                 .padding(horizontal = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Spacer(modifier = Modifier.height(80.dp))
+            Spacer(modifier = Modifier.height(60.dp))
             
             // Logo
             Image(
@@ -605,16 +614,48 @@ fun LoginScreen(
                 }
             }
             
-            Spacer(modifier = Modifier.weight(1f))
+            // ⭐ 滚动容器内不能用 weight(1f)（无界高度会崩），改固定间距
+            Spacer(modifier = Modifier.height(28.dp))
             
-            // 设备ID显示（调试用）
+            // 设备ID显示：点击弹框看完整 ID 并可复制
             Text(
-                text = "设备ID: ${deviceId.take(8)}...",
+                text = "设备ID: ${deviceId.take(8)}…（点击查看/复制）",
                 fontSize = 12.sp,
                 color = Color(0xFF999999),
-                modifier = Modifier.padding(bottom = 20.dp)
+                modifier = Modifier
+                    .padding(bottom = 20.dp)
+                    .clickable { showDeviceIdDialog = true }
             )
         }
+    }
+
+    // ⭐ 设备号弹框：完整 ID + 复制按钮
+    if (showDeviceIdDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeviceIdDialog = false },
+            title = { Text("设备ID") },
+            text = {
+                Text(
+                    text = deviceId,
+                    fontSize = 14.sp,
+                    color = Color(0xFF333333)
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    clipboard.setText(AnnotatedString(deviceId))
+                    Toast.makeText(context, "设备ID已复制", Toast.LENGTH_SHORT).show()
+                    showDeviceIdDialog = false
+                }) {
+                    Text("复制", color = Color(0xFF65AEF7), fontWeight = FontWeight.Medium)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeviceIdDialog = false }) {
+                    Text("关闭")
+                }
+            }
+        )
     }
 
     // ⭐ 强制更新弹窗：不可关闭（无 dismissButton、onDismissRequest 空实现），只能去更新
