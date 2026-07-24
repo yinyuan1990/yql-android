@@ -740,8 +740,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             effectiveConnectstype = 1
             // ⭐ H265：仅 P2P 按登录页「P2P编码」选项定案（全部逻辑在 H265Support.kt）
             H265Support.decideForP2P(appContext)
-            startP2PPublish()
-            publishStarting = false   // P2P 就绪等 REQUEST，建立流程结束
+            startP2PPublish()   // ⚠️ 异步：publishStarting 由 startP2PPublish 的 scope.launch finally 清零，
+                                //    绝不能在这里同步清（否则 isPublishing 还没置起、窗口没堵住 → 并发双 startPreview）
             return
         }
         currentConnMode = ConnMode.SRS
@@ -855,25 +855,32 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         onConnectionStateChanged?.invoke("P2P 等待观看端...")
         
         scope.launch {
-            // 确保预览/采集已就绪（视频轨是 P2P 会话的源）
-            if (!isPreviewRunning) {
-                withContext(Dispatchers.Main) { startPreview() }
-            }
-            withContext(Dispatchers.Main) {
-                // 信令接入：WS 收到 /topic/device/{id}/webrtc → P2PManager
-                // （onReconnected 已在 startPublish 统一挂到 onWebSocketReconnected，P2P 分支内会做 ICE Restart）
-                WebSocketManager.instance.onWebRTCSignaling = { msg -> p2pManager.handleSignaling(msg) }
-                
-                p2pManager.dataSource = this@WebRTCManager
-                p2pManager.start()
-                
-                isPublishing = true
-                WebSocketManager.isPublishingFlag = 1
-                onConnectionStateChanged?.invoke("P2P 就绪")
-                
-                // 统计/自适应与 SRS 同一套（statsPeerConnection 会自动取 P2P 会话）
-                startStats()
-                println("jfh [P2P] ✅ 就绪，等待 PC 发起 WEBRTC_REQUEST")
+            try {
+                // 确保预览/采集已就绪（视频轨是 P2P 会话的源）
+                if (!isPreviewRunning) {
+                    withContext(Dispatchers.Main) { startPreview() }
+                }
+                withContext(Dispatchers.Main) {
+                    // 信令接入：WS 收到 /topic/device/{id}/webrtc → P2PManager
+                    // （onReconnected 已在 startPublish 统一挂到 onWebSocketReconnected，P2P 分支内会做 ICE Restart）
+                    WebSocketManager.instance.onWebRTCSignaling = { msg -> p2pManager.handleSignaling(msg) }
+                    
+                    p2pManager.dataSource = this@WebRTCManager
+                    p2pManager.start()
+                    
+                    isPublishing = true
+                    WebSocketManager.isPublishingFlag = 1
+                    onConnectionStateChanged?.invoke("P2P 就绪")
+                    
+                    // 统计/自适应与 SRS 同一套（statsPeerConnection 会自动取 P2P 会话）
+                    startStats()
+                    println("jfh [P2P] ✅ 就绪，等待 PC 发起 WEBRTC_REQUEST")
+                }
+            } finally {
+                // ⭐ 与 SRS 一致：建立流程结束才解除重入守卫。P2P 的 startPreview 也在此窗口内，
+                //   过早清零会让并发的第二次 startPublish 再跑一遍 startPreview → 双 videoSource/capturer
+                //   （OTG 还双开 USB 相机）→ 偶发崩溃。
+                publishStarting = false
             }
         }
     }
