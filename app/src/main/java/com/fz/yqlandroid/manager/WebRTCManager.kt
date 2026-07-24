@@ -690,11 +690,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     
     // MARK: - 推流
     
+    // ⭐ 重入守卫（修 SRS 400 竞态）：isPublishing 要等 POST 成功(Step7)才置 true，
+    //   而 SRS 的 POST 是异步的、耗时 1~3s；这段窗口里若「网络可用/WS重连」健康检查看到
+    //   publishing=false 又拉起一次 startPublish，就会并发发两路 POST → SRS 同流重复 publish 回 400。
+    //   本标志在 startPublish 一进来即置位、建立流程结束(成功/失败/P2P)清零，堵住该窗口。
+    @Volatile private var publishStarting = false
+
     fun startPublish(serverIP: String, appName: String, key: String) {
-        if (isPublishing) {
-            println("jfh [推流] ⚠️ 已在推流中，跳过")
+        if (isPublishing || publishStarting) {
+            println("jfh [推流] ⚠️ 已在推流中/正在建立，跳过（防并发重复推流→SRS 400）")
             return
         }
+        publishStarting = true
         
         // 先记录参数（RESET_PUBLISH/唤醒重推流依赖 srsIP/baseStreamKey 非空，P2P 模式同样要记）
         srsIP = serverIP
@@ -734,6 +741,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // ⭐ H265：仅 P2P 按登录页「P2P编码」选项定案（全部逻辑在 H265Support.kt）
             H265Support.decideForP2P(appContext)
             startP2PPublish()
+            publishStarting = false   // P2P 就绪等 REQUEST，建立流程结束
             return
         }
         currentConnMode = ConnMode.SRS
@@ -827,6 +835,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 withContext(Dispatchers.Main) {
                     onConnectionStateChanged?.invoke("推流失败: ${e.message}")
                 }
+            } finally {
+                publishStarting = false   // 建立流程结束（成功/失败都清），重入守卫解除
             }
         }
     }
@@ -871,6 +881,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun stopPublish() {
         Log.d(TAG, "🔴 停止推流...")
         
+        publishStarting = false   // 停流即解除建立守卫（scheduleSrsRepublish 的 stop→start 依赖此）
         keyframeJob?.cancel()
         statsJob?.cancel()
         
@@ -1906,6 +1917,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 Log.d(TAG, "🔄 [$source] 推流健康检查: publishing=$isPublishing mode=$currentConnMode")
                 Log.d("meidui", "⚠️ $source → 推流健康检查 publishing=$isPublishing mode=$currentConnMode")
                 recoverCaptureIfNeeded(source)
+                if (publishStarting) {
+                    // ⭐ 初次推流正在建立中（POST 未回）→ 绝不并发再推（否则 SRS 同流重复 publish 回 400）
+                    Log.d("meidui", "⏭️ [$source] 推流正在建立中(publishStarting)，跳过健康检查重推")
+                    return@withContext
+                }
                 if (!isPublishing) {
                     // 之前推过流（参数还在）→ 自动恢复推流
                     if (srsIP.isNotEmpty() && baseStreamKey.isNotEmpty()) {
