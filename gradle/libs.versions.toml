@@ -9,7 +9,10 @@ cameraCore = "1.5.3"
 # 已被 iOS↔PC 链路验证互通。包名同为 org.webrtc，API 兼容。
 webrtcSdk = "144.7559.09"
 gson = "2.10.1"
-kotlin = "2.0.21"
+# ⭐ 2.2.10：AUSBC 3.5.3（第四十八章 OTG）用 Kotlin 2.2 编译（metadata 2.2.0），
+#   2.0.x 编译器读不了其 kotlin_module → "incompatible version of Kotlin" 编译失败；
+#   且其传递依赖 kotlin-stdlib 2.2.10。kotlin-compose 插件同引用跟随升级。
+kotlin = "2.2.10"
 coreKtx = "1.17.0"
 junit = "4.13.2"
 junitVersion = "1.3.0"
