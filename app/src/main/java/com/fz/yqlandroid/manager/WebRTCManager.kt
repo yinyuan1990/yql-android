@@ -980,6 +980,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 override fun onSignalingChange(state: PeerConnection.SignalingState?) {}
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
                     Log.d(TAG, "📡 ICE状态: $state")
+                    // ⭐ [meidui 诊断] SRS 推流 ICE 全过程上 meidui（走 P2P日志后台通道可抓）：
+                    //   CHECKING 后卡死不到 CONNECTED = 手机↔SRS 的 UDP 打不通（SRS 无 TURN 兜底）。
+                    Log.d("meidui", "📡 [SRS] ICE状态=$state")
                     when (state) {
                         PeerConnection.IceConnectionState.CONNECTED -> onConnectionStateChanged?.invoke("已连接")
                         PeerConnection.IceConnectionState.DISCONNECTED -> onConnectionStateChanged?.invoke("连接断开")
@@ -1079,23 +1082,35 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             val responseBody = response.body?.string()
             
             println("jfh [推流] 📥 SRS响应: HTTP${response.code}, body长度=${responseBody?.length ?: 0}")
+            // ⭐ [meidui 诊断] SRS 推流握手上 meidui（走 P2P日志后台通道可抓，println 是 System.out 抓不到）
+            Log.d("meidui", "📡 [SRS] POST /rtc/v1/publish HTTP=${response.code} bodyLen=${responseBody?.length ?: 0} url=$apiUrl")
             
             if (response.isSuccessful && responseBody != null) {
                 val result = gson.fromJson(responseBody, Map::class.java)
                 val code = (result["code"] as? Double)?.toInt() ?: -1
                 if (code == 0) {
                     println("jfh [推流] ✅ SRS返回code=0, Answer获取成功")
-                    result["sdp"] as? String
+                    val answerSdp = result["sdp"] as? String
+                    // ⭐ 打出 Answer 里 SRS 下发的 ICE candidate IP：若是内网IP(10./172./192.168.)手机连不到 → ICE 必失败
+                    val cands = Regex("a=candidate:[^\\r\\n]*").findAll(answerSdp ?: "")
+                        .map { it.value }.toList()
+                    val ips = Regex("(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})").findAll(answerSdp ?: "")
+                        .map { it.value }.distinct().toList()
+                    Log.d("meidui", "📡 [SRS] Answer code=0, candidate数=${cands.size}, SRS下发IP=${ips.joinToString(",")}（若为内网IP则手机连不上→ICE FAILED，需改SRS candidate为公网IP）")
+                    answerSdp
                 } else {
                     println("jfh [推流] ❌ SRS错误码: $code")
+                    Log.d("meidui", "📡 [SRS] ❌ Answer错误码 code=$code body=${responseBody.take(200)}")
                     null
                 }
             } else {
                 println("jfh [推流] ❌ SRS HTTP失败: ${response.code}, body=$responseBody")
+                Log.d("meidui", "📡 [SRS] ❌ HTTP失败=${response.code} body=${responseBody?.take(200)}")
                 null
             }
         } catch (e: Exception) {
             println("jfh [推流] ❌ SRS异常: ${e.message}")
+            Log.d("meidui", "📡 [SRS] ❌ POST异常: ${e.message}")
             e.printStackTrace()
             null
         }
