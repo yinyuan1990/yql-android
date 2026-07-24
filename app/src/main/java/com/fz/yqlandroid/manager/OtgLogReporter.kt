@@ -37,8 +37,12 @@ object OtgLogReporter {
     private const val MAX_BATCH_BYTES = 256 * 1024
     private const val MAX_BUFFER_LINES = 5000          // 网络异常时防内存膨胀
     private const val REPLAY_LINES = 500               // 开采时回放的历史行数
-    /** 上报的 logcat 标签（其余标签不采，防止刷爆） */
-    private val CAPTURE_TAGS = listOf("meidui", "jfh", "UvcVideoCapturer", "UvcDeviceMonitor")
+    /** 上报的 logcat 标签（其余标签不采，防止刷爆）。
+     *  ⭐ 含 AUSBC/libuvc 的 native 标签（UVCCamera/UVCPreview/libUVCCamera/CameraUVC/USBMonitor）——
+     *    「相机开流成功但无帧」的根因日志（isoc 传输失败/带宽不足/MJPEG不兼容）都在这些 tag 下。 */
+    private val CAPTURE_TAGS = listOf(
+        "meidui", "jfh", "UvcVideoCapturer", "UvcDeviceMonitor",
+        "UVCCamera", "UVCPreview", "libUVCCamera", "libuvc", "CameraUVC", "USBMonitor", "UVCButtonCallback")
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)

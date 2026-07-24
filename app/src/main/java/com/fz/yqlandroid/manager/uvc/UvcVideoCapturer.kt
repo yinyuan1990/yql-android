@@ -39,7 +39,20 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         private const val TAG = "UvcVideoCapturer"
         // libuvc setPreviewSize 的帧率协商区间下限（上限取 max(30, 请求fps)）
         private const val MIN_FPS = 1
+        // 开流后多久没帧就切下一策略（ms）
+        private const val NO_FRAME_TIMEOUT_MS = 2500L
     }
+
+    // ⭐ 开流策略：native「开流成功但无帧」时依次降级重试（不同摄像头/OTG供电下兼容性差异大）
+    private data class StreamStrategy(val format: Int, val bandwidth: Float, val name: String)
+    private fun strategies() = listOf(
+        StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.DEFAULT_BANDWIDTH, "MJPEG@1.0"),
+        StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, 0.5f, "MJPEG@0.5"),
+        StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, UVCCamera.DEFAULT_BANDWIDTH, "YUYV@1.0"),
+        StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, 0.3f, "YUYV@0.3")
+    )
+    @Volatile private var noFrameRetry = 0
+    private var noFrameWatchdog: Runnable? = null
 
     private val appContext = context.applicationContext
 
@@ -66,6 +79,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     // NV21 字节数组复用池（1080p30 每秒 ~45MB，若每帧新分配 GC 压力巨大）
     private val bufferPool = ArrayBlockingQueue<ByteArray>(4)
     @Volatile private var badFrameLogged = false
+
+    // ⭐ [诊断] IFrameCallback 原始命中数（在任何 early-return 之前自增）——用于「开流后无帧」看门狗
+    //   区分：native 根本没送帧（计数不涨）vs 送了但被我方丢弃（计数涨但 capFps=0）。
+    @Volatile private var frameCbCount = 0L
 
     // MARK: - VideoCapturer 接口
 
@@ -114,6 +131,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         uvcHandler?.post {
             val cam = uvcCamera ?: return@post
             try {
+                noFrameRetry = 0   // 新的格式请求：从最优策略重新开始降级
                 stopStreamLocked(cam)
                 startStreamLocked(cam)
             } catch (e: Exception) {
@@ -170,23 +188,55 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         }
     }
 
-    /** 就近选一个 UVC 支持的分辨率并开流（优先 MJPEG，失败回退 YUYV） */
+    /** 按当前重试档位选 格式/带宽 开流；开流后装「无帧看门狗」，2.5s 没帧自动切下一档重开 */
     private fun startStreamLocked(camera: UVCCamera) {
-        val negotiated = try {
-            negotiateAndStart(camera, UVCCamera.FRAME_FORMAT_MJPEG)
+        frameCbCount = 0
+        val list = strategies()
+        val st = list[minOf(noFrameRetry, list.size - 1)]
+        try {
+            val (w, h) = negotiateAndStart(camera, st.format, st.bandwidth)
+            frameWidth = w
+            frameHeight = h
+            badFrameLogged = false
+            bufferPool.clear()
+            streamRunning = true
+            Log.d("meidui", "🔌 [OTG] 开流策略=${st.name} 尺寸=${w}x${h}，${NO_FRAME_TIMEOUT_MS}ms后检查有无帧")
         } catch (e: Exception) {
-            Log.w(TAG, "MJPEG 开流失败(${e.message})，回退 YUYV")
-            Log.d("meidui", "🔌 [OTG] MJPEG开流失败(${e.message})，回退YUYV（USB2.0下YUYV高分辨率帧率会很低）")
-            negotiateAndStart(camera, UVCCamera.FRAME_FORMAT_YUYV)
+            streamRunning = false
+            Log.d("meidui", "🔌 [OTG] ❌ 开流失败(${st.name}): ${e.message}")
         }
-        frameWidth = negotiated.first
-        frameHeight = negotiated.second
-        badFrameLogged = false
-        bufferPool.clear()
-        streamRunning = true
+        scheduleNoFrameWatchdog(camera)   // 无论成功/失败都装看门狗：失败或0帧都会切下一档
     }
 
-    private fun negotiateAndStart(camera: UVCCamera, frameFormat: Int): Pair<Int, Int> {
+    /** 开流后 2.5s 检查 IFrameCallback 是否真的在吐帧；0 帧则切下一策略重开（有限次） */
+    private fun scheduleNoFrameWatchdog(camera: UVCCamera) {
+        val handler = uvcHandler ?: return
+        noFrameWatchdog?.let { handler.removeCallbacks(it) }
+        val r = Runnable {
+            if (!capturing || uvcCamera !== camera) return@Runnable
+            if (frameCbCount > 0) {
+                noFrameRetry = 0   // 成功出帧：重置档位，后续切档/重开从最优策略开始
+                Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 ${frameWidth}x${frameHeight}")
+                return@Runnable
+            }
+            noFrameRetry++
+            if (noFrameRetry >= strategies().size) {
+                Log.d("meidui", "🔌 [OTG] ❌ 所有 格式/带宽 策略均0帧：该UVC设备与本机isoc/MJPEG不兼容，或OTG口供电不足（换带独立供电的OTG口再试）")
+                return@Runnable
+            }
+            Log.d("meidui", "🔌 [OTG] ⚠️ 开流后${NO_FRAME_TIMEOUT_MS}ms内0帧(native未回调IFrameCallback) → 切换到策略[${noFrameRetry}]重开")
+            try {
+                stopStreamLocked(camera)
+                startStreamLocked(camera)
+            } catch (e: Exception) {
+                Log.d("meidui", "🔌 [OTG] 切策略重开失败: ${e.message}")
+            }
+        }
+        noFrameWatchdog = r
+        handler.postDelayed(r, NO_FRAME_TIMEOUT_MS)
+    }
+
+    private fun negotiateAndStart(camera: UVCCamera, frameFormat: Int, bandwidth: Float): Pair<Int, Int> {
         // 该格式支持的分辨率里选与请求值最接近的（按面积差 + 宽高比差）
         val sizes = try {
             camera.getSupportedSizeList(frameFormat)?.filterIsInstance<com.jiangdg.utils.Size>()
@@ -202,15 +252,17 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val h = target?.height ?: requestedHeight
         camera.setFrameCallback(null, 0)
         try { camera.stopPreview() } catch (_: Exception) {}
-        camera.setPreviewSize(w, h, MIN_FPS, maxOf(30, requestedFps), frameFormat, UVCCamera.DEFAULT_BANDWIDTH)
+        camera.setPreviewSize(w, h, MIN_FPS, maxOf(30, requestedFps), frameFormat, bandwidth)
         camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         camera.startPreview()
-        Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=${if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"}")
+        Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=${if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"} bw=$bandwidth")
         return w to h
     }
 
     private fun stopStreamLocked(camera: UVCCamera) {
         streamRunning = false
+        noFrameWatchdog?.let { uvcHandler?.removeCallbacks(it) }
+        noFrameWatchdog = null
         try { camera.setFrameCallback(null, 0) } catch (_: Exception) {}
         try { camera.stopPreview() } catch (_: Exception) {}
     }
@@ -239,6 +291,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     // MARK: - 帧回调（native 采集线程调用）
 
     private val frameCallback = IFrameCallback { frame ->
+        frameCbCount++   // ⭐ 在任何 early-return 之前自增：看门狗据此判断 native 是否真在吐帧
         val obs = observer ?: return@IFrameCallback
         if (!capturing || !streamRunning) return@IFrameCallback
         val w = frameWidth
