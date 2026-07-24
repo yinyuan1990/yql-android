@@ -302,7 +302,18 @@ fun RegisterScreen(
                 }
                 
                 HorizontalDivider(color = Color(0xFFF0F0F0))
-                
+
+                // ⭐ 提示：管理密码=绑定电脑用的独立密码，可与登录密码一致（加大加粗醒目提示）
+                Text(
+                    text = "💡 绑定电脑使用的独立密码，可以和登录密码一致",
+                    color = Color(0xFFFF7A00),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp)
+                )
+
                 Spacer(modifier = Modifier.height(20.dp))
                 
                 // 错误提示

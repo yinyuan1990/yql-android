@@ -254,6 +254,7 @@ fun AppNavHost(
         ) { backStackEntry ->
             val from = backStackEntry.arguments?.getString("from") ?: "login"
             val fromProfile = from == "profile"
+            val bindCtx = androidx.compose.ui.platform.LocalContext.current
             QRScannerScreen(
                 appViewModel = appViewModel,
                 onNavigateBack = {
@@ -271,7 +272,9 @@ fun AppNavHost(
                         // 🔥 从 Profile 进入：绑定成功后回到 Profile
                         navController.popBackStack()
                     } else {
-                        navController.navigate(Screen.Streaming.route) {
+                        // ⭐ 绑定成功后回登录页重新登录（绑定改变了账号状态，重登拉取最新绑定/权限）
+                        android.widget.Toast.makeText(bindCtx, "绑定成功，请重新登录", android.widget.Toast.LENGTH_LONG).show()
+                        navController.navigate(Screen.Login.route) {
                             popUpTo(Screen.QRScanner.route) { inclusive = true }
                         }
                     }
