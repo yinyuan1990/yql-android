@@ -621,6 +621,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             .getString("camera_mode", "builtin") == "otg"
         videoCapturer = if (usingOtgCamera) {
             Log.d("meidui", "🔌 [OTG] 摄像头模式=外接OTG → UvcVideoCapturer（Camera2 链路不启动）")
+            // ⭐ 第四十八章b：OTG 模式日志上报（摄像头占用USB口没法连adb，日志推后端「OTG日志」页）。
+            //   streamKey 在 startPublish 里先于 startPreview 生成，这里通常已非空；纯预览场景兜底生成会话ID。
+            OtgLogReporter.start(streamKey)
             com.fz.yqlandroid.manager.uvc.UvcVideoCapturer(context)
         } else {
             createCameraCapturer(isFrontCamera)
@@ -669,6 +672,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun stopPreview() {
         Log.d(TAG, "🔴 停止预览...")
         
+        // ⭐ 第四十八章b：OTG 日志上报随采集会话结束（stop 内部先冲刷剩余批次）
+        if (usingOtgCamera) OtgLogReporter.stop()
         try { localVideoTrack?.removeSink(localRenderer!!) } catch (_: Exception) {}
         try { videoCapturer?.stopCapture() } catch (_: Exception) {}
         try { videoCapturer?.dispose() } catch (_: Exception) {}
