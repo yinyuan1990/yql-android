@@ -1841,6 +1841,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 cameraDead = true
                 Log.e(TAG, "📷❌ 相机错误: $error")
                 Log.d("meidui", "⚠️ 相机错误(cameraDead=true): $error")
+                // ⭐ 2026-07-24 前台自愈：CAMERA_IN_USE 等打开失败此前只置标记不恢复
+                //   （恢复只挂在回前台/WS重连），前台推流中相机死了就永远 capFps=0。
+                scheduleCaptureRecovery("相机错误:${error?.take(60)}")
             }
             override fun onCameraDisconnected() {
                 cameraDead = true
@@ -1864,6 +1867,52 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             override fun onCameraClosed() {}
         }
         return enumerator.createCapturer(target, events)
+    }
+
+    // MARK: - 🔄 相机错误前台自愈（2026-07-24）
+
+    @Volatile private var captureRecoveryScheduled = false
+    @Volatile private var lastCaptureRecoveryMs = 0L
+
+    /**
+     * ⭐ 相机错误自愈——修「CAMERA_IN_USE 后永远 capFps=0」。
+     * 根因：启动 800ms 后 applyInitialConfig 切档触发 changeCaptureFormat（异步关旧会话+立即开新会话），
+     * Camera2 的 cameraDevice.close() 在系统侧是异步的，新 openCamera 偶尔撞上未关完的旧设备 →
+     * CameraService 报 CAMERA_IN_USE("Camera 0 is already open")，WebRTC 内部重试耗尽后 onCameraError。
+     * 此前 onCameraError 只置 cameraDead 标记、无任何恢复动作（恢复只挂在「回前台/WS重连」入口），
+     * 前台推流中相机一死推流就永远黑屏（ICE 正常、capFps=0）。
+     * 现在错误后延迟 2s 重开采集会话——届时旧设备必已关完，重开必成；5s 节流+单飞防错误风暴空转；
+     * 若重开仍失败会再次走 onCameraError → 再排队（间隔受节流保护）。
+     */
+    private fun scheduleCaptureRecovery(reason: String) {
+        if (!isPreviewRunning || !autoRecoverEnabled) return
+        val now = System.currentTimeMillis()
+        if (captureRecoveryScheduled || now - lastCaptureRecoveryMs < 5_000) {
+            Log.d("meidui", "⏭️ [相机自愈] 已排队/节流中，跳过($reason)")
+            return
+        }
+        captureRecoveryScheduled = true
+        lastCaptureRecoveryMs = now
+        Log.d("meidui", "🔄 [相机自愈] $reason → 2s后重开采集会话")
+        scope.launch {
+            delay(2000)
+            captureRecoveryScheduled = false
+            if (!cameraDead || !isPreviewRunning) return@launch   // 期间已自行恢复/已停流
+            withContext(Dispatchers.Main) {
+                try {
+                    try { videoCapturer?.stopCapture() } catch (_: Exception) {}
+                    val capFps = captureFps()
+                    videoCapturer?.startCapture(currentWidth, currentHeight, capFps)
+                    appliedCaptureFps = capFps
+                    Log.d("meidui", "✅ [相机自愈] 已重开采集 ${currentWidth}x${currentHeight}@${capFps}fps")
+                    // 硬件参数主触发在 onFirstFrameAvailable；这里留兜底 + 观看端秒出画面
+                    applyCameraParamsWithRetry("相机自愈", initialDelayMs = 500)
+                    forceKeyframe()
+                } catch (e: Exception) {
+                    Log.d("meidui", "⚠️ [相机自愈] 重开失败: ${e.message}（若再报相机错误将按节流重试）")
+                }
+            }
+        }
     }
 
     // MARK: - 🔄 断线自动恢复推流（2026-07-02）
