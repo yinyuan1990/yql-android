@@ -1058,7 +1058,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private suspend fun postOfferToSRS(offerSdp: String): String? = withContext(Dispatchers.IO) {
         try {
             // 🔥 与iOS一致：使用 http + 端口1985
-            val apiUrl = "http://$srsIP:1985/rtc/v1/publish/"
+            // ⭐ H265（第四十九章）：SRS 6.0 的 RTC H265 协商由 API 请求参数 codec=hevc 开启
+            //   （srs_app_rtc_api.cpp: r->query_get("codec")；不带则走 H264 分支，纯 H265 Offer 被 400 拒——实测坐实）
+            val apiUrl = if (H265Support.isH265Session())
+                "http://$srsIP:1985/rtc/v1/publish/?codec=hevc"
+            else
+                "http://$srsIP:1985/rtc/v1/publish/"
             var streamUrl = "webrtc://$srsIP/$app/$streamKey"
             
             // 🔥 获取推流Token（与iOS一致：POST username + streamName）
