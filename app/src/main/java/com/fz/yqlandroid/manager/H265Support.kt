@@ -10,7 +10,10 @@ import android.util.Log
  * 设计原则（用户要求）：
  *   1. 不散落在 WebRTCManager / P2PManager / LoginScreen 里，旧类只留一行钩子。
  *   2. H265 日志与 H264 完全分开：上报前缀 Android-p2p → Android-p2p-h265（后端白名单已加）。
- *   3. 只对 P2P 生效：SRS 链路永远 H264，不受本文件影响。
+ *   3. P2P 与 SRS 各自独立选择编码（第四十九章）：
+ *      - P2P：key p2p_video_codec，默认 h265（历史行为，不动）；
+ *      - SRS：key srs_video_codec，默认 h264（新增，SRS 服务器 6.0.184 已 --h265=on）。
+ *      两者互不影响；SRS 会话也会像 P2P 一样对 Offer 做 codec munge。
  *
  * 生效链路：
  *   登录页 P2P 选中时出现「P2P编码 H264/H265」二级选项
@@ -29,10 +32,14 @@ object H265Support {
 
     private const val TAG = "H265Support"
 
-    /** 登录页 UI 记忆 key（login_prefs） */
+    /** 登录页 UI 记忆 key（login_prefs）——P2P 编码 */
     const val PREFS_UI_KEY = "selected_video_codec"
-    /** 运行时决策 key（token_prefs，登录成功时写入，与 connect_mode 同处） */
+    /** 运行时决策 key（token_prefs，登录成功时写入，与 connect_mode 同处）——P2P 编码 */
     const val PREFS_RUNTIME_KEY = "p2p_video_codec"
+    /** 登录页 UI 记忆 key（login_prefs）——SRS 编码（第四十九章新增，默认 h264） */
+    const val PREFS_UI_KEY_SRS = "selected_video_codec_srs"
+    /** 运行时决策 key（token_prefs）——SRS 编码 */
+    const val PREFS_RUNTIME_KEY_SRS = "srs_video_codec"
 
     /** 编码器工厂是否带 H265（WebRTCManager.initialize 时注册探测） */
     @Volatile var sdkSupportsH265 = false
@@ -73,7 +80,25 @@ object H265Support {
         return effectiveCodec
     }
 
-    // ---------- 钩子 3：SRS 分支调（非 P2P 永远 H264） ----------
+    // ---------- 钩子 3a：SRS 分支调（第四十九章：SRS 也可选 H265，默认 h264） ----------
+
+    /** SRS 推流前按登录页 SRS 编码选择定案。选 H265 但硬编不支持 → 回落 H264 并打日志。 */
+    fun decideForSrs(context: Context?): String {
+        val selected = context?.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            ?.getString(PREFS_RUNTIME_KEY_SRS, "h264")?.lowercase() ?: "h264"
+        effectiveCodec = if (selected == "h265") {
+            if (sdkSupportsH265) {
+                log("✅ SRS 会话编码 → H265（Offer 将限定 H265，SRS 6.0.184 已支持，PC 需按上报建 H265 管线）")
+                "h265"
+            } else {
+                log("⚠️ SRS 选了 H265 但编码器不支持，回落 H264")
+                "h264"
+            }
+        } else "h264"
+        return effectiveCodec
+    }
+
+    // ---------- 钩子 3b：非推流场景兜底（保留兼容） ----------
 
     fun forceH264ForNonP2P() {
         effectiveCodec = "h264"

@@ -746,8 +746,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
         currentConnMode = ConnMode.SRS
         effectiveConnectstype = 0
-        // ⭐ H265：非 P2P（SRS）永远 H264
-        H265Support.forceH264ForNonP2P()
+        // ⭐ H265（第四十九章）：SRS 也按登录页「SRS编码」选项定案（独立 key srs_video_codec，默认 h264）。
+        //   H265 会话下方 Step5 会像 P2P 一样对 Offer 做 mungeOfferH265；CONFIG_STATE.videoCodec 如实上报。
+        H265Support.decideForSrs(appContext)
         
         println("jfh [推流] ═══════════════════════════════════════")
         println("jfh [推流] 🚀 开始推流")
@@ -791,12 +792,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 println("jfh [推流] Step5: 创建Offer...")
                 val offer = createOffer()
                 if (offer != null) {
-                    println("jfh [推流] Step5: ✅ Offer已创建, SDP长度=${offer.description.length}")
-                    peerConnection?.setLocalDescription(SdpObserverAdapter(), offer)
+                    // ⭐ H265（第四十九章）：H265 会话把 SRS Offer 也限定成 H265（同 P2P 的 munge），
+                    //   否则 Offer 里 H265 未必首选、SRS 可能仍回 H264。H264 会话保持原样（旧行为不变）。
+                    val sdpToUse = if (H265Support.isH265Session()) {
+                        SessionDescription(offer.type, H265Support.mungeOfferH265(offer.description))
+                    } else offer
+                    println("jfh [推流] Step5: ✅ Offer已创建, codec=${H265Support.effectiveCodec}, SDP长度=${sdpToUse.description.length}")
+                    peerConnection?.setLocalDescription(SdpObserverAdapter(), sdpToUse)
                     
                     // Step 6: 发送到SRS
                     println("jfh [推流] Step6: POST到SRS https://$srsIP/rtc/v1/publish/ ...")
-                    val answer = postOfferToSRS(offer.description)
+                    val answer = postOfferToSRS(sdpToUse.description)
                     if (answer != null) {
                         println("jfh [推流] Step6: ✅ SRS返回Answer, 长度=${answer.length}")
                         

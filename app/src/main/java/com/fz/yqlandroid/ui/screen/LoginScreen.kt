@@ -61,6 +61,8 @@ fun LoginScreen(
     // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
     // ⭐ 2026-07-11：默认 H265（设备不支持时 H265Support.decideForP2P 自动回退 H264）
     var selectedCodec by remember { mutableStateOf("h265") }
+    // ⭐ SRS 编码（第四十九章）：与 P2P 独立记忆，默认 h264（SRS 服务器 6.0.184 已支持 H265）
+    var selectedCodecSrs by remember { mutableStateOf("h264") }
     // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android，记住上次选择
     var selectedCameraMode by remember { mutableStateOf("builtin") }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
@@ -85,6 +87,8 @@ fun LoginScreen(
         selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
         // ⭐ H265：恢复上次选择的 P2P 编码（2026-07-11 默认改 H265，不支持自动回退 H264）
         selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h265") ?: "h265"
+        // ⭐ SRS 编码（第四十九章）：默认 h264
+        selectedCodecSrs = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY_SRS, "h264") ?: "h264"
         // ⭐ 摄像头模式（第四十八章）：恢复上次选择，默认自带
         selectedCameraMode = prefs.getString("selected_camera_mode", "builtin") ?: "builtin"
         // ⭐ 强制更新检查（公共接口，失败放行不拦门）
@@ -305,8 +309,9 @@ fun LoginScreen(
                         }
                     }
 
-                    // ⭐ H265：P2P 二级选项——编码 H264/H265（仅 P2P 选中时显示，与 iOS CodecOptionChips 一致）
-                    if (selectedConnectMode == "p2p") {
+                    // ⭐ 编码二级选项 H264/H265（第四十九章：P2P 与 SRS 都显示，各自独立记忆；SRT/单人=P2P 沿用旧逻辑）
+                    if (selectedConnectMode == "p2p" || selectedConnectMode == "srs") {
+                        val isP2PCodec = selectedConnectMode == "p2p"
                         HorizontalDivider(
                             modifier = Modifier.padding(start = 30.dp),
                             color = Color(0xFFF0F0F0)
@@ -318,19 +323,22 @@ fun LoginScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "P2P编码",
+                                text = if (isP2PCodec) "单人编码" else "多人编码",
                                 fontSize = 16.sp,
                                 color = Color(0xFF1A1A1A)
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             listOf("h264" to "H264", "h265" to "H265").forEach { (codec, label) ->
-                                val selected = selectedCodec == codec
+                                val curCodec = if (isP2PCodec) selectedCodec else selectedCodecSrs
+                                val selected = curCodec == codec
                                 Box(
                                     modifier = Modifier
                                         .padding(end = 8.dp)
                                         .clip(RoundedCornerShape(14.dp))
                                         .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
-                                        .clickable { selectedCodec = codec }
+                                        .clickable {
+                                            if (isP2PCodec) selectedCodec = codec else selectedCodecSrs = codec
+                                        }
                                         .padding(horizontal = 16.dp, vertical = 6.dp)
                                 ) {
                                     Text(
@@ -431,6 +439,8 @@ fun LoginScreen(
                                         putString("selected_connect_mode", selectedConnectMode)
                                         // ⭐ H265：记住本次选择的 P2P 编码
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, selectedCodec)
+                                        // ⭐ SRS 编码（第四十九章）：记住本次选择
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY_SRS, selectedCodecSrs)
                                         // ⭐ 摄像头模式（第四十八章）：记住本次选择
                                         putString("selected_camera_mode", selectedCameraMode)
                                         apply()
@@ -458,6 +468,8 @@ fun LoginScreen(
                                         putString("camera_mode", selectedCameraMode)
                                         // ⭐ H265：P2P 编码运行时决策值（WebRTCManager.startPublish → H265Support.decideForP2P 读取）
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, selectedCodec)
+                                        // ⭐ SRS 编码运行时决策值（第四十九章，WebRTCManager.startPublish → decideForSrs 读取）
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY_SRS, selectedCodecSrs)
                                         putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         response.iceServers?.let {
