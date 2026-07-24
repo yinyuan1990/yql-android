@@ -1,7 +1,9 @@
 package com.fz.yqlandroid.manager.uvc
 
 import android.content.Context
+import android.graphics.PixelFormat
 import android.hardware.usb.UsbDevice
+import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -10,6 +12,7 @@ import android.util.Log
 import com.jiangdg.usb.USBMonitor
 import com.jiangdg.uvc.IFrameCallback
 import com.jiangdg.uvc.UVCCamera
+import android.view.Surface
 import org.webrtc.CapturerObserver
 import org.webrtc.NV21Buffer
 import org.webrtc.SurfaceTextureHelper
@@ -63,6 +66,13 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     private var uvcHandler: Handler? = null
 
     private var uvcCamera: UVCCamera? = null
+
+    // ⭐ 哑预览窗口：jiangdg libuvc 的 startPreview 必须有预览窗口(Surface)才起取流线程，
+    //   否则 native 报 "window does not exist" 且 IFrameCallback 永不触发（capFps=0）。
+    //   用 ImageReader 造一个自动排空的窗口占位（我们不读它的内容，帧走 IFrameCallback）。
+    private var dummyReader: ImageReader? = null
+    private var dummyReaderW = 0
+    private var dummyReaderH = 0
 
     // WebRTC 请求的目标格式（UVC 侧就近协商）
     @Volatile private var requestedWidth = 1280
@@ -236,6 +246,29 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         handler.postDelayed(r, NO_FRAME_TIMEOUT_MS)
     }
 
+    /** 造/复用一个自动排空的 ImageReader 哑预览窗口（尺寸变了才重建）。必须持续排空，
+     *  否则窗口缓冲队列满 → native 取流线程在绘制处阻塞 → 连带停发 IFrameCallback。 */
+    private fun ensureDummySurface(w: Int, h: Int): Surface {
+        val cur = dummyReader
+        if (cur != null && dummyReaderW == w && dummyReaderH == h) return cur.surface
+        releaseDummySurface()
+        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+        reader.setOnImageAvailableListener({ r ->
+            try { r.acquireLatestImage()?.close() } catch (_: Exception) {}
+        }, uvcHandler)
+        dummyReader = reader
+        dummyReaderW = w
+        dummyReaderH = h
+        return reader.surface
+    }
+
+    private fun releaseDummySurface() {
+        try { dummyReader?.close() } catch (_: Exception) {}
+        dummyReader = null
+        dummyReaderW = 0
+        dummyReaderH = 0
+    }
+
     private fun negotiateAndStart(camera: UVCCamera, frameFormat: Int, bandwidth: Float): Pair<Int, Int> {
         // 该格式支持的分辨率里选与请求值最接近的（按面积差 + 宽高比差）
         val sizes = try {
@@ -253,6 +286,8 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         camera.setFrameCallback(null, 0)
         try { camera.stopPreview() } catch (_: Exception) {}
         camera.setPreviewSize(w, h, MIN_FPS, maxOf(30, requestedFps), frameFormat, bandwidth)
+        // ⭐ 关键修复：挂哑预览窗口，否则 native startPreview 因无窗口不起流线程 → 无帧
+        camera.setPreviewDisplay(ensureDummySurface(w, h))
         camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         camera.startPreview()
         Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=${if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"} bw=$bandwidth")
@@ -274,6 +309,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             Log.w(TAG, "destroy UVC camera failed: ${e.message}")
         }
         uvcCamera = null
+        releaseDummySurface()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
     }
 
