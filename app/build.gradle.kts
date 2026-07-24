@@ -86,6 +86,10 @@ dependencies {
     // ========== 外接OTG摄像头 UVC (第四十八章，AUSBC 社区维护分支，JitPack) ==========
     // ernestp/AndroidUSBCamera 3.5.3：Android 16 + 16KB页对齐已支持（原库 jiangdongguo 停更）
     implementation("com.github.ernestp.AndroidUSBCamera:libausbc:3.5.3")
+    // ⚠️ libuvc 必须显式声明：libausbc 的 POM 把它标成 runtime scope（编译期不在 classpath），
+    //   而 UvcDeviceMonitor/UvcVideoCapturer 直接用了它里面的 com.jiangdg.usb.USBMonitor /
+    //   com.jiangdg.uvc.UVCCamera / com.jiangdg.utils.* → 不加就 "Unresolved reference 'usb'" 编译失败。
+    implementation("com.github.ernestp.AndroidUSBCamera:libuvc:3.5.3")
     
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

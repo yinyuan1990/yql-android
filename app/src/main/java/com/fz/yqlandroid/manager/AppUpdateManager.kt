@@ -13,7 +13,8 @@ import java.util.concurrent.TimeUnit
 /**
  * App 强制更新检查（配置在总后台「App更新配置」，与 iOS 同一接口同一语义）。
  *
- * 公共接口 GET /api/config/app-update（/api/config/** permitAll，无需登录），
+ * 公共接口 GET /api/config/app-update（后端 /api/config 段整体 permitAll，无需登录），
+ * ⚠️ 注释里别写 "/api/config/星星" 这种带 斜杠+星 的路径通配——Kotlin 块注释可嵌套，会把整个文件吞成注释。
  * 返回 { "config": "{\"android\":{\"enabled\",\"minVersion\",\"downloadUrl\"},\"ios\":{...}}" }。
  * 本地 versionName < minVersion 且 enabled=true → 登录页弹「不可关闭」的强更弹窗跳 downloadUrl。
  * 网络失败/解析失败一律放行（不能因为接口抖动把用户锁在门外）。
