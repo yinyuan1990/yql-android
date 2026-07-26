@@ -328,6 +328,29 @@ fun StreamingScreen(
                 }
             }
         }
+
+        // ⭐ 第四十八章：OTG 模式能力叠显（软/硬件可调参数+上下限，供 PC 调节面板改造对照）。
+        //   OTG 占用 USB 口无法连 adb，直接叠到画面层最直观；同内容也打进 meidui 日志 → 后端「OTG日志」。
+        //   仅 OTG 开流后有内容（UvcCapabilityStore），自带摄像头模式恒为空、不显示。
+        val otgCapLines by com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.lines.collectAsState()
+        if (otgCapLines.isNotEmpty()) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 90.dp, start = 8.dp, end = 8.dp)
+                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+            ) {
+                otgCapLines.forEach { line ->
+                    Text(
+                        text = line,
+                        color = if (line.contains("✗")) Color(0xFFFFB74D) else Color(0xFF9CFF9C),
+                        fontSize = 10.sp,
+                        lineHeight = 13.sp
+                    )
+                }
+            }
+        }
         
         // ===== 顶部导航栏（与iOS一致） =====
         AnimatedVisibility(

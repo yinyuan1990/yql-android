@@ -188,7 +188,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             val camera = UVCCamera()
             camera.open(ctrlBlock)
             uvcCamera = camera
+            currentDeviceName = device.productName ?: device.deviceName
             startStreamLocked(camera)
+            dumpCapabilitiesLocked(camera)   // ⭐ 能力枚举 → 画面层叠显 + OTG日志
             Log.d("meidui", "🔌 [OTG] ✅ UVC相机已开流: ${device.productName ?: device.deviceName} → ${frameWidth}x${frameHeight}")
         } catch (e: Exception) {
             Log.e(TAG, "打开UVC相机失败: ${e.message}")
@@ -227,6 +229,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             if (frameCbCount > 0) {
                 noFrameRetry = 0   // 成功出帧：重置档位，后续切档/重开从最优策略开始
                 Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 ${frameWidth}x${frameHeight}")
+                dumpCapabilitiesLocked(camera)   // 出帧确认后刷新能力快照（协商尺寸/当前值已最终定）
                 return@Runnable
             }
             noFrameRetry++
@@ -310,7 +313,75 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         }
         uvcCamera = null
         releaseDummySurface()
+        UvcCapabilityStore.clear()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
+    }
+
+    // MARK: - ⭐ 能力枚举（第四十八章：OTG 可调参数/上下限 → 画面层叠显 + OTG 日志，供 PC 调节面板改造对照）
+
+    @Volatile private var currentDeviceName: String? = null
+
+    /**
+     * 枚举该 UVC 设备的软/硬件可调能力并发布：
+     * - 软件侧：MJPEG/YUYV 各自支持的分辨率列表（PC「档位」= 就近协商到这些尺寸）
+     * - 硬件侧：jiangdg libuvc 暴露的控制项，统一 **百分比 0~100**（库内部映射到设备各自的绝对 min~max），
+     *   是否支持由 UVC 能力位掩码（checkSupportFlag）决定，逐台设备不同。
+     * - 明确不适用项：前后摄 direction、快门 cjfps（库无曝光时间接口）。
+     * 必须在 uvcThread 上调（updateCameraParams/getXxx 走 native）。
+     */
+    private fun dumpCapabilitiesLocked(camera: UVCCamera) {
+        val lines = mutableListOf<String>()
+        try {
+            camera.updateCameraParams()   // 读能力位掩码 + 各控制项的绝对 min/max（百分比映射的基础）
+            lines += "OTG设备: ${currentDeviceName ?: "?"}"
+            lines += "协商: ${frameWidth}x${frameHeight} (请求${requestedWidth}x${requestedHeight}@${requestedFps}fps 策略=${strategies()[minOf(noFrameRetry, strategies().size - 1)].name})"
+
+            fun sizesOf(fmt: Int, name: String) {
+                val s = try {
+                    camera.getSupportedSizeList(fmt)?.filterIsInstance<com.jiangdg.utils.Size>()
+                        ?.filter { it.width > 0 && it.height > 0 }
+                } catch (_: Exception) { null }
+                lines += if (!s.isNullOrEmpty())
+                    "$name(${s.size}): " + s.joinToString(" ") { "${it.width}x${it.height}" }
+                else "$name: 无"
+            }
+            sizesOf(UVCCamera.FRAME_FORMAT_MJPEG, "MJPEG分辨率")
+            sizesOf(UVCCamera.FRAME_FORMAT_YUYV, "YUYV分辨率")
+
+            fun sup(flag: Int): Boolean = try { camera.checkSupportFlag(flag.toLong()) } catch (_: Exception) { false }
+            fun pct(name: String, flag: Int, get: () -> Int) {
+                lines += if (sup(flag)) {
+                    val cur = try { get() } catch (_: Exception) { -1 }
+                    "$name: ✅ 0~100% 当前=${cur}%"
+                } else "$name: ✗不支持"
+            }
+            pct("变焦zoom", UVCCamera.CTRL_ZOOM_ABS) { camera.zoom }
+            lines += if (sup(UVCCamera.CTRL_FOCUS_AUTO)) {
+                val af = try { camera.autoFocus } catch (_: Exception) { null }
+                "自动对焦AF: ✅ 当前=${if (af == true) "开" else "关"}"
+            } else "自动对焦AF: ✗不支持"
+            pct("手动对焦focus", UVCCamera.CTRL_FOCUS_ABS) { camera.focus }
+            lines += if (sup(UVCCamera.PU_WB_TEMP_AUTO)) {
+                val awb = try { camera.autoWhiteBlance } catch (_: Exception) { null }
+                "自动白平衡AWB: ✅ 当前=${if (awb == true) "开" else "关"}"
+            } else "自动白平衡AWB: ✗不支持"
+            pct("白平衡色温wb", UVCCamera.PU_WB_TEMP) { camera.whiteBlance }
+            pct("亮度brightness", UVCCamera.PU_BRIGHTNESS) { camera.brightness }
+            pct("对比度contrast", UVCCamera.PU_CONTRAST) { camera.contrast }
+            pct("饱和度saturation", UVCCamera.PU_SATURATION) { camera.saturation }
+            pct("色调hue", UVCCamera.PU_HUE) { camera.hue }
+            pct("锐度sharpness", UVCCamera.PU_SHARPNESS) { camera.sharpness }
+            pct("伽马gamma", UVCCamera.PU_GAMMA) { camera.gamma }
+            pct("增益gain", UVCCamera.PU_GAIN) { camera.gain }
+            lines += if (sup(UVCCamera.PU_POWER_LF)) "抗频闪powerline: ✅ 0=关/1=50Hz/2=60Hz" else "抗频闪powerline: ✗不支持"
+            // 与自带摄像头面板的差异项（PC 面板改造要点）
+            lines += if (sup(UVCCamera.CTRL_AE_ABS)) "快门cjfps: ✗设备支持曝光时间但库无接口" else "快门cjfps: ✗不支持"
+            lines += "前后摄direction: ✗OTG不适用 | 推送fps/码率bitrate/档位type: ✅软件侧照常"
+        } catch (e: Exception) {
+            lines += "能力枚举失败: ${e.message}"
+        }
+        UvcCapabilityStore.set(lines)
+        lines.forEach { Log.d("meidui", "🔌 [OTG能力] $it") }
     }
 
     /** 在 uvc 线程同步执行（stopCapture/dispose 要求返回前帧已停） */
