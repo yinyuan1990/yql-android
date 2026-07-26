@@ -30,9 +30,17 @@ object UvcCapabilityStore {
 
     /**
      * 一档分辨率 = PC 面板上的一个"档位"（设备枚举出几个就是几个，不再是固定 5 档）。
-     * [maxKbps] 由 [OtgBitratePlan] 按像素率等比算出，PC 面板据此显示"码率 x% ≈ y kbps"。
+     * [maxKbps]    由 [OtgBitratePlan] 按像素率等比算出，PC 面板据此显示"码率 x% ≈ y kbps"。
+     * [encodable]  硬件编码器吃不吃得下这个尺寸（见 [EncoderSizeLimits]）。
+     *              false 的档位 PC 面板不给选——采集没问题但编码器一帧不出，选了必黑。
      */
-    data class SizeOption(val width: Int, val height: Int, val maxFps: Int, val maxKbps: Int = 0)
+    data class SizeOption(
+        val width: Int,
+        val height: Int,
+        val maxFps: Int,
+        val maxKbps: Int = 0,
+        val encodable: Boolean = true
+    )
 
     /** 一台 UVC 设备的完整能力快照。[version] 变化即表示能力变了（换设备/重新协商），PC 据此决定是否重建面板 */
     data class Caps(
@@ -43,6 +51,14 @@ object UvcCapabilityStore {
         val controls: List<Control>,
         val version: Long
     )
+
+    /**
+     * 当前生效的推送帧率 / 码率百分比。
+     * 这两项设备侧才是真值（初始值来自后端下发的配置，不是 PC 面板的缺省），
+     * 随能力快照一起上报，PC 面板照着显示而不是自己猜一个。
+     */
+    @Volatile var pushFps: Int = 0
+    @Volatile var bitratePct: Int = 0
 
     private val _lines = MutableStateFlow<List<String>>(emptyList())
     val lines: StateFlow<List<String>> = _lines

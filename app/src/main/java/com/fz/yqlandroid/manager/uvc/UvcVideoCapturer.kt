@@ -200,10 +200,30 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         }
     }
 
+    /**
+     * 记下"这个尺寸用 MJPEG 谈不拢"，下次切回来直接从 YUYV 起步。
+     *
+     * 实测（2026-07-26）：某些尺寸设备虽然列在 MJPEG 支持列表里，协商却必失败
+     * （`Failed to set preview size` / `could not negotiate with camera:err=-51`），
+     * 要等两次 2.5s 看门狗超时才降到 YUYV —— 切一次档位黑 7 秒。记住之后直接跳过。
+     */
+    private val mjpegBlacklist = mutableSetOf<String>()
+
+    private fun sizeKey(w: Int, h: Int) = "${w}x$h"
+
+    /** YUYV 在策略表里的起始下标（前面都是 MJPEG 档） */
+    private fun firstYuyvIndex(): Int =
+        strategies().indexOfFirst { it.format == UVCCamera.FRAME_FORMAT_YUYV }.coerceAtLeast(0)
+
     /** 按当前重试档位选 格式/带宽 开流；开流后装「无帧看门狗」，2.5s 没帧自动切下一档重开 */
     private fun startStreamLocked(camera: UVCCamera) {
         frameCbCount = 0
         val list = strategies()
+        // 该尺寸已知 MJPEG 谈不拢 → 直接从 YUYV 起步，不再白等两轮看门狗
+        if (noFrameRetry == 0 && mjpegBlacklist.contains(sizeKey(requestedWidth, requestedHeight))) {
+            noFrameRetry = firstYuyvIndex()
+            Log.d("meidui", "🔌 [OTG] ${requestedWidth}x${requestedHeight} 已知 MJPEG 谈不拢 → 直接用 YUYV 开流")
+        }
         val st = list[minOf(noFrameRetry, list.size - 1)]
         try {
             val (w, h) = negotiateAndStart(camera, st.format, st.bandwidth)
@@ -216,6 +236,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         } catch (e: Exception) {
             streamRunning = false
             Log.d("meidui", "🔌 [OTG] ❌ 开流失败(${st.name}): ${e.message}")
+            if (st.format == UVCCamera.FRAME_FORMAT_MJPEG) {
+                mjpegBlacklist.add(sizeKey(requestedWidth, requestedHeight))
+            }
         }
         scheduleNoFrameWatchdog(camera)   // 无论成功/失败都装看门狗：失败或0帧都会切下一档
     }
@@ -236,6 +259,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             if (noFrameRetry >= strategies().size) {
                 Log.d("meidui", "🔌 [OTG] ❌ 所有 格式/带宽 策略均0帧：该UVC设备与本机isoc/MJPEG不兼容，或OTG口供电不足（换带独立供电的OTG口再试）")
                 return@Runnable
+            }
+            // 这一档 MJPEG 起流了却不出帧，同样拉黑：下次切回该尺寸直接走 YUYV
+            if (strategies()[minOf(noFrameRetry - 1, strategies().size - 1)].format == UVCCamera.FRAME_FORMAT_MJPEG) {
+                mjpegBlacklist.add(sizeKey(requestedWidth, requestedHeight))
             }
             Log.d("meidui", "🔌 [OTG] ⚠️ 开流后${NO_FRAME_TIMEOUT_MS}ms内0帧(native未回调IFrameCallback) → 切换到策略[${noFrameRetry}]重开")
             try {
@@ -321,6 +348,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         uvcCamera = null
         releaseDummySurface()
         defaultControlValues.clear()
+        mjpegBlacklist.clear()
         UvcCapabilityStore.clear()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
     }
@@ -411,8 +439,16 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             lines += "能力枚举失败: ${e.message}"
         }
         // 每档分辨率的码率上限：以"枚举出的最大分辨率 = 现有最高档码率"为锚，按像素率等比算
-        val sizesWithKbps = OtgBitratePlan.annotate(sizes)
-        sizesWithKbps.forEach { lines += "  码率上限 ${it.width}x${it.height}@${it.maxFps} → ${it.maxKbps}kbps" }
+        // 同时标出硬件编码器吃不下的档位（低于最小分辨率的选了必黑，PC 面板不给选）
+        val codec = com.fz.yqlandroid.manager.H265Support.effectiveCodec
+        val sizesWithKbps = OtgBitratePlan.annotate(sizes).map {
+            it.copy(encodable = EncoderSizeLimits.isEncodable(codec, it.width, it.height))
+        }
+        lines += EncoderSizeLimits.describe(codec)
+        sizesWithKbps.forEach {
+            lines += "  码率上限 ${it.width}x${it.height}@${it.maxFps} → ${it.maxKbps}kbps" +
+                    if (it.encodable) "" else "  ⛔编码器不支持此尺寸(选了必黑，已屏蔽)"
+        }
         val caps = UvcCapabilityStore.Caps(
             deviceName = currentDeviceName ?: "",
             width = frameWidth,

@@ -636,16 +636,20 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     fun setOtgQualityPercentage(percentage: Int) {
         otgQualityPercent = percentage.coerceIn(10, 100)
+        com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.bitratePct = otgQualityPercent
         applyOtgBitrate()
     }
 
     /** 按「当前分辨率的码率上限 × 当前百分比」下发码率 */
     private fun applyOtgBitrate() {
         val caps = com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.caps.value
-        val ceiling = if (caps != null && caps.sizes.isNotEmpty())
-            com.fz.yqlandroid.manager.uvc.OtgBitratePlan.ceilingFor(
-                caps.sizes, currentWidth, currentHeight, currentFps)
-        else com.fz.yqlandroid.manager.uvc.OtgBitratePlan.ANCHOR_KBPS
+        // ⚠️ 天花板必须取能力快照里**这一档的 maxKbps**（上报给 PC 的就是它），
+        //   不能拿实时 currentFps 现算：热控/自适应一压帧率，天花板就跟着缩水，
+        //   PC 面板显示"本档上限 1000kbps"而设备实际按 667 算，两边对不上；
+        //   而且帧率降了码率再降 = 双重惩罚，编码器自己的码控本就会处理。
+        val entry = caps?.sizes?.firstOrNull { it.width == currentWidth && it.height == currentHeight }
+        val ceiling = entry?.maxKbps?.takeIf { it > 0 }
+            ?: com.fz.yqlandroid.manager.uvc.OtgBitratePlan.ceilingFor(currentWidth, currentHeight, 0)
         val targetKbps = (ceiling * otgQualityPercent / 100)
             .coerceAtLeast(com.fz.yqlandroid.manager.uvc.OtgBitratePlan.MIN_KBPS)
         setMaxBitrateKbps(targetKbps)
@@ -2628,6 +2632,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    编码器 maxFramerate 丢帧（预览 sink 在丢帧之前仍满帧）。这里只做一次校验，
         //    把可能被旧逻辑降下去的采集帧率恢复到档位帧率（相同值不会重开相机）。
         ensureCaptureFps(source)
+
+        // OTG：把生效值同步进能力快照，PC 面板照真值显示（别让面板自己猜一个缺省）
+        if (usingOtgCamera) com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.pushFps = targetFps
 
         Log.d(TAG, "🎬 推送FPS[$source]: 请求${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
         Log.d("meidui", "⚠️ fps修改源=$source ${pushFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")

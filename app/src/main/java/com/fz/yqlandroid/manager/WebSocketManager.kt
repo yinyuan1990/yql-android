@@ -620,10 +620,16 @@ class WebSocketManager private constructor() {
                 "width" to caps.width,
                 "height" to caps.height,
                 "version" to caps.version,
+                // 当前生效的推送帧率/码率：设备侧才是真值（初始值来自后端下发的配置），
+                // PC 面板照它显示，不要自己猜一个缺省
+                "pushFps" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.pushFps,
+                "bitratePct" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.bitratePct,
                 // 档位列表 = 设备枚举出的分辨率（几档就是几档）
+                // encodable=false 的档位硬件编码器吃不下，选了必黑，PC 不给选
                 "sizes" to caps.sizes.map {
                     mapOf("width" to it.width, "height" to it.height,
-                          "maxFps" to it.maxFps, "maxKbps" to it.maxKbps)
+                          "maxFps" to it.maxFps, "maxKbps" to it.maxKbps,
+                          "encodable" to it.encodable)
                 },
                 // 硬件可调项（PC 只渲染 supported=true 的）
                 "controls" to caps.controls.map {
