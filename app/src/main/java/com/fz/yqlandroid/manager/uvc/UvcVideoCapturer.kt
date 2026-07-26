@@ -88,7 +88,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     // NV21 字节数组复用池（1080p30 每秒 ~45MB，若每帧新分配 GC 压力巨大）
     private val bufferPool = ArrayBlockingQueue<ByteArray>(4)
-    @Volatile private var badFrameLogged = false
+    @Volatile private var badFrameCount = 0L
 
     // ⭐ [诊断] IFrameCallback 原始命中数（在任何 early-return 之前自增）——用于「开流后无帧」看门狗
     //   区分：native 根本没送帧（计数不涨）vs 送了但被我方丢弃（计数涨但 capFps=0）。
@@ -209,7 +209,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             val (w, h) = negotiateAndStart(camera, st.format, st.bandwidth)
             frameWidth = w
             frameHeight = h
-            badFrameLogged = false
+            badFrameCount = 0
             bufferPool.clear()
             streamRunning = true
             Log.d("meidui", "🔌 [OTG] 开流策略=${st.name} 尺寸=${w}x${h}，${NO_FRAME_TIMEOUT_MS}ms后检查有无帧")
@@ -293,7 +293,14 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         camera.setPreviewDisplay(ensureDummySurface(w, h))
         camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         camera.startPreview()
-        Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=${if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"} bw=$bandwidth")
+        val fmtName = if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"
+        Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=$fmtName bw=$bandwidth")
+        // ⭐ 第五十章：请求值与协商值不一致要看得见 —— PC 面板选了 160x120，
+        //   但该格式的支持列表里没有这一档时，这里会就近落到别的尺寸（PC 显示的档位就"没生效"）。
+        if (w != requestedWidth || h != requestedHeight) {
+            Log.d("meidui", "🔌 [OTG] ⚠️ 协商偏移: 请求${requestedWidth}x${requestedHeight} → 实际${w}x${h}" +
+                    "（$fmtName 支持列表里没有请求的那一档，已就近选取）")
+        }
         return w to h
     }
 
@@ -313,6 +320,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         }
         uvcCamera = null
         releaseDummySurface()
+        defaultControlValues.clear()
         UvcCapabilityStore.clear()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
     }
@@ -413,6 +421,14 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             controls = controls,
             version = System.currentTimeMillis()
         )
+        // 首次枚举（相机刚打开）时把各项当前值记为出厂缺省，供「还原」回落
+        if (defaultControlValues.isEmpty()) {
+            controls.filter { it.supported && it.cur >= 0 }.forEach { defaultControlValues[it.key] = it.cur }
+            if (defaultControlValues.isNotEmpty()) {
+                Log.d("meidui", "🔌 [OTG] 已记录出厂缺省: " +
+                        defaultControlValues.entries.joinToString(" ") { "${it.key}=${it.value}" })
+            }
+        }
         UvcCapabilityStore.set(lines, caps)
         lines.forEach { Log.d("meidui", "🔌 [OTG能力] $it") }
         // 能力一变就主动推给 PC（PC 据此重建面板），不等 PC 来问
@@ -421,6 +437,30 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     /** 能力快照刷新回调 —— WebRTCManager 挂上去，用于主动上报 PC */
     @Volatile var onCapsUpdated: (() -> Unit)? = null
+
+    /**
+     * 相机刚打开时各控制项的原始值 = 该设备的**出厂缺省**，「还原」就回落到这里。
+     * 比 PC 侧猜一个"中间值"发下来靠谱：每台 UVC 设备的缺省点位都不一样（有的亮度缺省 50%、
+     * 有的 32%），猜错就等于把画面调坏。相机关闭时清空。
+     */
+    private val defaultControlValues = mutableMapOf<String, Int>()
+
+    /** ⭐ 第五十章：「还原」—— 把所有支持的硬件项回落到开机时记下的出厂缺省，然后重推能力快照 */
+    fun resetControlsToDefault() {
+        val caps = UvcCapabilityStore.caps.value
+        if (uvcCamera == null || caps == null) {
+            Log.d("meidui", "🔌 [OTG还原] 忽略：相机未打开或无能力快照")
+            return
+        }
+        var n = 0
+        caps.controls.filter { it.supported }.forEach { c ->
+            val def = defaultControlValues[c.key] ?: return@forEach
+            if (applyControl(c.key, def)) n++
+        }
+        Log.d("meidui", "🔌 [OTG还原] 已回落 $n 项到出厂缺省")
+        // 等下发落地后重新枚举一次，PC 面板的滑条随 controls[].cur 归位
+        uvcHandler?.postDelayed({ uvcCamera?.let { dumpCapabilitiesLocked(it) } }, 300)
+    }
 
     /**
      * ⭐ 第五十章：应用 PC 经 `otg_ctrl` 下发的 UVC 硬件控制项。
@@ -506,9 +546,16 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val h = frameHeight
         val expected = w * h * 3 / 2
         if (w <= 0 || h <= 0 || frame.remaining() < expected) {
-            if (!badFrameLogged) {
-                badFrameLogged = true
-                Log.d("meidui", "🔌 [OTG] ⚠️ 帧尺寸异常: remaining=${frame.remaining()} expected=$expected (${w}x${h})，丢弃")
+            // ⭐ 第五十章：这里原来只打一次日志就永久静默——一旦尺寸持续对不上，
+            //   帧就被全部丢掉、画面永远出不来，而日志里只有孤零零一行，没法定位。
+            //   现在每 60 帧打一次，并反推 native 实际给的分辨率（按 NV21 1.5 字节/像素猜同宽高比的解），
+            //   小分辨率黑屏就是靠这行定性。
+            badFrameCount++
+            if (badFrameCount % 60 == 1L) {
+                val remain = frame.remaining()
+                val guessPixels = remain * 2 / 3
+                Log.d("meidui", "🔌 [OTG] ⚠️ 帧尺寸不符#$badFrameCount: native给了 ${remain}字节" +
+                        "(≈${guessPixels}像素)，我方按协商值 ${w}x${h} 期望 ${expected}字节 → 全部丢弃(画面必黑)")
             }
             return@IFrameCallback
         }

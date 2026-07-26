@@ -603,11 +603,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             Log.d("meidui", "🔌 [OTG档位] 当前不是 OTG 模式，忽略 ${width}x${height}")
             return
         }
-        val capFps = if (fps > 0) fps else maxOf(1, currentFps)
+        // ⭐ 采集帧率封顶 60：小分辨率的 UVC 采集上限常见 120fps，但推流侧编码器最高 60，
+        //   真按 120 采集只是白烧电和发热（对齐 iOS「采集60·推30」的思路）。
+        val capFps = (if (fps > 0) fps else maxOf(1, currentFps)).coerceIn(1, OTG_MAX_CAPTURE_FPS)
         val changed = (width != currentWidth || height != currentHeight)
         currentWidth = width
         currentHeight = height
-        if (fps > 0) currentFps = minOf(fps, thermalFpsCap).coerceAtLeast(1)
+        if (fps > 0) currentFps = minOf(capFps, thermalFpsCap).coerceAtLeast(1)
 
         if (isPreviewRunning) {
             try {
@@ -625,6 +627,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         setEncodingParameters()
         forceKeyframe()
     }
+
+    /** OTG 采集帧率上限：推流侧编码器最高 60，采集再高只是白发热 */
+    private val OTG_MAX_CAPTURE_FPS = 60
 
     /** OTG 码率百分比（0~100）。天花板来自 [OtgBitratePlan]，与自带摄像头的 ladder 无关 */
     private var otgQualityPercent: Int = 100
@@ -1244,8 +1249,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         params.encodings[0].maxFramerate = minOf(currentFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
         
         // scaleDown：从采集分辨率缩放到目标输出（与iOS一致）
+        // ⭐ 第五十章：OTG 一律不缩放。ladder 的 scaleDown 是按自带摄像头分辨率算的
+        //   （low 档能到 2.25），套到 UVC 就近协商出的尺寸上会把 320x240 直接缩成
+        //   142x107 之类的怪尺寸 —— 低于很多硬件 H264 编码器的最小尺寸/对齐要求，
+        //   编码器直接不出流 = 小分辨率黑屏。OTG 的协商尺寸本身就是目标尺寸。
         val preset = currentLadder[currentProfile]
-        params.encodings[0].scaleResolutionDownBy = if (preset != null && preset.scaleDown > 1.0) preset.scaleDown else 1.0
+        params.encodings[0].scaleResolutionDownBy =
+            if (!usingOtgCamera && preset != null && preset.scaleDown > 1.0) preset.scaleDown else 1.0
         
         // 🔥 MAINTAIN_RESOLUTION：拥塞时降帧不降分辨率
         params.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION

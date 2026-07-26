@@ -22,6 +22,7 @@ import com.fz.yqlandroid.manager.WebRTCManager
  * | `otg_bitrate`    | `{bitrate}`          | 码率百分比 0~100 |
  * | `otg_ctrl`       | `{key,value}`        | 硬件可调项，key/值域见能力快照 controls |
  * | `otg_get_caps`   | `{}`                 | 请求重推一次能力快照 |
+ * | `otg_reset`      | `{}`                 | 硬件项还原到出厂缺省（相机打开时记下的原始值） |
  */
 class OtgConfigRouter(private val mgr: WebRTCManager) {
 
@@ -86,6 +87,14 @@ class OtgConfigRouter(private val mgr: WebRTCManager) {
             "otg_get_caps" -> {
                 Log.d(LOG, "🔌 [OTG] PC 请求能力快照 → 重推一次")
                 onCapsRequested?.invoke()
+            }
+
+            "otg_reset" -> {
+                // 还原：硬件项回落到相机打开时记下的**出厂缺省**（每台设备缺省点位不同，
+                // 不能由 PC 猜一个中间值发下来）。回落完会自动重推能力快照。
+                Log.d(LOG, "🔌 [OTG] PC 请求还原硬件项 → 回落出厂缺省")
+                mgr.otgCapturer()?.resetControlsToDefault()
+                    ?: Log.d(LOG, "🔌 [OTG还原] 忽略：当前不是 OTG 采集器")
             }
 
             else -> Log.d(LOG, "🔌 [OTG] 未知 otg_ ptype=$ptype，忽略（config=$config）")
