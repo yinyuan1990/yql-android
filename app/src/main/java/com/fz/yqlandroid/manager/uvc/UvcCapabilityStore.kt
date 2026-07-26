@@ -4,16 +4,59 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * ⭐ 第四十八章：OTG(UVC) 相机能力快照——供画面层叠显。
+ * ⭐ 第四十八章 / 第五十章：OTG(UVC) 相机能力快照。
  *
- * 背景：OTG 摄像头占用 USB 口无法连 adb，PC 端调节面板改造需要知道该 UVC 设备
- * 实际支持哪些 软件/硬件 参数及上下限。UvcVideoCapturer 开流后枚举能力写入这里，
- * StreamingScreen 在 OTG 模式把它叠显到预览画面上（同时也打进 meidui 日志 → OTG 日志上报后端）。
+ * 两份数据同源、用途不同：
+ * - [lines]：人读文本，`StreamingScreen` 叠显在预览画面上（OTG 占用 USB 口无法 adb），
+ *   同时打进 meidui 日志 → 后端「OTG日志」。
+ * - [caps]：结构化快照，经 CONFIG_STATE/CAMERA_CAPS 上报 PC，PC 据此**动态生成**调节面板
+ *   （支持哪几项就长哪几个控件，不支持的不渲染，而不是渲染成灰的按钮）。
+ *
+ * 逐台 UVC 设备能力不同，所有硬件控制项统一百分比 0~100（jiangdg libuvc 内部映射到设备各自的绝对 min~max）。
  */
 object UvcCapabilityStore {
+
+    /** 单个可调项。type: "pct"=0~100 百分比滑条 / "bool"=开关 / "enum"=分段选择 */
+    data class Control(
+        val key: String,
+        val label: String,
+        val type: String,
+        val supported: Boolean,
+        val cur: Int,
+        val min: Int = 0,
+        val max: Int = 100,
+        val options: List<String> = emptyList()
+    )
+
+    /** 一档分辨率 = PC 面板上的一个"档位"（设备枚举出几个就是几个，不再是固定 5 档） */
+    data class SizeOption(val width: Int, val height: Int, val maxFps: Int)
+
+    /** 一台 UVC 设备的完整能力快照。[version] 变化即表示能力变了（换设备/重新协商），PC 据此决定是否重建面板 */
+    data class Caps(
+        val deviceName: String,
+        val width: Int,
+        val height: Int,
+        val sizes: List<SizeOption>,
+        val controls: List<Control>,
+        val version: Long
+    )
+
     private val _lines = MutableStateFlow<List<String>>(emptyList())
     val lines: StateFlow<List<String>> = _lines
 
-    fun set(newLines: List<String>) { _lines.value = newLines }
-    fun clear() { _lines.value = emptyList() }
+    private val _caps = MutableStateFlow<Caps?>(null)
+    val caps: StateFlow<Caps?> = _caps
+
+    /** PC 侧比对用：0 = 当前无 OTG 能力（未开流/自带摄像头模式） */
+    val version: Long get() = _caps.value?.version ?: 0L
+
+    fun set(newLines: List<String>, newCaps: Caps?) {
+        _lines.value = newLines
+        _caps.value = newCaps
+    }
+
+    fun clear() {
+        _lines.value = emptyList()
+        _caps.value = null
+    }
 }

@@ -331,6 +331,8 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
      */
     private fun dumpCapabilitiesLocked(camera: UVCCamera) {
         val lines = mutableListOf<String>()
+        val controls = mutableListOf<UvcCapabilityStore.Control>()
+        val sizes = mutableListOf<UvcCapabilityStore.SizeOption>()
         try {
             camera.updateCameraParams()   // 读能力位掩码 + 各控制项的绝对 min/max（百分比映射的基础）
             lines += "OTG设备: ${currentDeviceName ?: "?"}"
@@ -341,7 +343,17 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                     camera.getSupportedSizeList(fmt)?.filterIsInstance<com.jiangdg.utils.Size>()
                         ?.filter { it.width > 0 && it.height > 0 }
                 } catch (_: Exception) { null }
-                // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，省略）
+                // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，记 0）
+                s?.forEach { sz ->
+                    val maxFps = sz.fps?.maxOrNull()?.toInt() ?: 0
+                    // 同尺寸两种格式都支持时只保留一条（取 fps 上限更高的），PC 档位列表按尺寸去重
+                    val exist = sizes.indexOfFirst { it.width == sz.width && it.height == sz.height }
+                    if (exist < 0) {
+                        sizes += UvcCapabilityStore.SizeOption(sz.width, sz.height, maxFps)
+                    } else if (maxFps > sizes[exist].maxFps) {
+                        sizes[exist] = sizes[exist].copy(maxFps = maxFps)
+                    }
+                }
                 lines += if (!s.isNullOrEmpty())
                     "$name(${s.size}): " + s.joinToString(" ") { sz ->
                         val maxFps = sz.fps?.maxOrNull()?.toInt() ?: 0
@@ -353,39 +365,121 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             sizesOf(UVCCamera.FRAME_FORMAT_YUYV, "YUYV分辨率")
 
             fun sup(flag: Int): Boolean = try { camera.checkSupportFlag(flag.toLong()) } catch (_: Exception) { false }
-            fun pct(name: String, flag: Int, get: () -> Int) {
-                lines += if (sup(flag)) {
-                    val cur = try { get() } catch (_: Exception) { -1 }
-                    "$name: ✅ 0~100% 当前=${cur}%"
-                } else "$name: ✗不支持"
+            fun pct(key: String, name: String, flag: Int, get: () -> Int) {
+                val ok = sup(flag)
+                val cur = if (ok) (try { get() } catch (_: Exception) { -1 }) else -1
+                controls += UvcCapabilityStore.Control(key, name, "pct", ok, cur)
+                lines += if (ok) "$name($key): ✅ 0~100% 当前=${cur}%" else "$name($key): ✗不支持"
             }
-            pct("变焦zoom", UVCCamera.CTRL_ZOOM_ABS) { camera.zoom }
-            lines += if (sup(UVCCamera.CTRL_FOCUS_AUTO)) {
-                val af = try { camera.autoFocus } catch (_: Exception) { null }
-                "自动对焦AF: ✅ 当前=${if (af == true) "开" else "关"}"
-            } else "自动对焦AF: ✗不支持"
-            pct("手动对焦focus", UVCCamera.CTRL_FOCUS_ABS) { camera.focus }
-            lines += if (sup(UVCCamera.PU_WB_TEMP_AUTO)) {
-                val awb = try { camera.autoWhiteBlance } catch (_: Exception) { null }
-                "自动白平衡AWB: ✅ 当前=${if (awb == true) "开" else "关"}"
-            } else "自动白平衡AWB: ✗不支持"
-            pct("白平衡色温wb", UVCCamera.PU_WB_TEMP) { camera.whiteBlance }
-            pct("亮度brightness", UVCCamera.PU_BRIGHTNESS) { camera.brightness }
-            pct("对比度contrast", UVCCamera.PU_CONTRAST) { camera.contrast }
-            pct("饱和度saturation", UVCCamera.PU_SATURATION) { camera.saturation }
-            pct("色调hue", UVCCamera.PU_HUE) { camera.hue }
-            pct("锐度sharpness", UVCCamera.PU_SHARPNESS) { camera.sharpness }
-            pct("伽马gamma", UVCCamera.PU_GAMMA) { camera.gamma }
-            pct("增益gain", UVCCamera.PU_GAIN) { camera.gain }
-            lines += if (sup(UVCCamera.PU_POWER_LF)) "抗频闪powerline: ✅ 0=关/1=50Hz/2=60Hz" else "抗频闪powerline: ✗不支持"
-            // 与自带摄像头面板的差异项（PC 面板改造要点）
+            fun bool(key: String, name: String, flag: Int, get: () -> Boolean?) {
+                val ok = sup(flag)
+                val cur = if (ok) (try { get() } catch (_: Exception) { null }) else null
+                controls += UvcCapabilityStore.Control(key, name, "bool", ok, if (cur == true) 1 else 0, 0, 1)
+                lines += if (ok) "$name($key): ✅ 当前=${if (cur == true) "开" else "关"}" else "$name($key): ✗不支持"
+            }
+            pct("zoom", "变焦", UVCCamera.CTRL_ZOOM_ABS) { camera.zoom }
+            bool("autoFocus", "自动对焦AF", UVCCamera.CTRL_FOCUS_AUTO) { camera.autoFocus }
+            pct("focus", "手动对焦", UVCCamera.CTRL_FOCUS_ABS) { camera.focus }
+            bool("autoWhiteBalance", "自动白平衡AWB", UVCCamera.PU_WB_TEMP_AUTO) { camera.autoWhiteBlance }
+            pct("whiteBalance", "白平衡色温", UVCCamera.PU_WB_TEMP) { camera.whiteBlance }
+            pct("brightness", "亮度", UVCCamera.PU_BRIGHTNESS) { camera.brightness }
+            pct("contrast", "对比度", UVCCamera.PU_CONTRAST) { camera.contrast }
+            pct("saturation", "饱和度", UVCCamera.PU_SATURATION) { camera.saturation }
+            pct("hue", "色调", UVCCamera.PU_HUE) { camera.hue }
+            pct("sharpness", "锐度", UVCCamera.PU_SHARPNESS) { camera.sharpness }
+            pct("gamma", "伽马", UVCCamera.PU_GAMMA) { camera.gamma }
+            pct("gain", "增益", UVCCamera.PU_GAIN) { camera.gain }
+            val plOk = sup(UVCCamera.PU_POWER_LF)
+            controls += UvcCapabilityStore.Control(
+                "powerline", "抗频闪", "enum", plOk,
+                cur = if (plOk) (readPowerline(camera) ?: 0) else 0,
+                min = 0, max = 2, options = listOf("关", "50Hz", "60Hz")
+            )
+            lines += if (plOk) "抗频闪(powerline): ✅ 0=关/1=50Hz/2=60Hz" else "抗频闪(powerline): ✗不支持"
+            // 与自带摄像头面板的差异项（PC 面板据此不渲染对应控件）
             lines += if (sup(UVCCamera.CTRL_AE_ABS)) "快门cjfps: ✗设备支持曝光时间但库无接口" else "快门cjfps: ✗不支持"
-            lines += "前后摄direction: ✗OTG不适用 | 推送fps/码率bitrate/档位type: ✅软件侧照常"
+            lines += "前后摄direction: ✗OTG不适用 | 推送fps/码率/档位(按分辨率): ✅走 otg_ 独立通道"
         } catch (e: Exception) {
             lines += "能力枚举失败: ${e.message}"
         }
-        UvcCapabilityStore.set(lines)
+        val caps = UvcCapabilityStore.Caps(
+            deviceName = currentDeviceName ?: "",
+            width = frameWidth,
+            height = frameHeight,
+            sizes = sizes,
+            controls = controls,
+            version = System.currentTimeMillis()
+        )
+        UvcCapabilityStore.set(lines, caps)
         lines.forEach { Log.d("meidui", "🔌 [OTG能力] $it") }
+        // 能力一变就主动推给 PC（PC 据此重建面板），不等 PC 来问
+        try { onCapsUpdated?.invoke() } catch (_: Exception) {}
+    }
+
+    /** 能力快照刷新回调 —— WebRTCManager 挂上去，用于主动上报 PC */
+    @Volatile var onCapsUpdated: (() -> Unit)? = null
+
+    /**
+     * ⭐ 第五十章：应用 PC 经 `otg_ctrl` 下发的 UVC 硬件控制项。
+     *
+     * 值域与能力快照一致：pct 类 0~100 百分比（库内部映射到设备绝对 min~max）、
+     * bool 类 0/1、powerline 0/1/2。native 调用一律回 uvcThread。
+     * 设备不支持的项 PC 面板本就不渲染，这里按能力位再挡一次（双保险）。
+     *
+     * @return true=已排进下发队列；false=无相机/不支持
+     */
+    fun applyControl(key: String, value: Int): Boolean {
+        val camera = uvcCamera ?: run {
+            Log.d("meidui", "🔌 [OTG控制] $key=$value 忽略：UVC相机未打开")
+            return false
+        }
+        val supported = UvcCapabilityStore.caps.value
+            ?.controls?.firstOrNull { it.key == key }?.supported ?: false
+        if (!supported) {
+            Log.d("meidui", "🔌 [OTG控制] $key=$value 忽略：该设备不支持此项")
+            return false
+        }
+        uvcHandler?.post {
+            try {
+                when (key) {
+                    "zoom" -> camera.zoom = value
+                    "focus" -> camera.focus = value
+                    "autoFocus" -> camera.autoFocus = value != 0
+                    "autoWhiteBalance" -> camera.autoWhiteBlance = value != 0
+                    "whiteBalance" -> camera.whiteBlance = value
+                    "brightness" -> camera.brightness = value
+                    "contrast" -> camera.contrast = value
+                    "saturation" -> camera.saturation = value
+                    "hue" -> camera.hue = value
+                    "sharpness" -> camera.sharpness = value
+                    "gamma" -> camera.gamma = value
+                    "gain" -> camera.gain = value
+                    "powerline" -> writePowerline(camera, value)
+                    else -> {
+                        Log.d("meidui", "🔌 [OTG控制] 未知控制项 $key，忽略")
+                        return@post
+                    }
+                }
+                Log.d("meidui", "🔌 [OTG控制] ✅ $key=$value 已下发")
+            } catch (e: Exception) {
+                Log.d("meidui", "🔌 [OTG控制] ❌ $key=$value 失败: ${e.message}")
+            }
+        }
+        return true
+    }
+
+    // 抗频闪读写走反射：该接口在 libuvc 各分支命名/存在与否不统一，用反射避免编译期绑死
+    private fun readPowerline(camera: UVCCamera): Int? = try {
+        camera.javaClass.getMethod("getPowerlineFrequency").invoke(camera) as? Int
+    } catch (_: Throwable) { null }
+
+    private fun writePowerline(camera: UVCCamera, value: Int) {
+        try {
+            camera.javaClass.getMethod("setPowerlineFrequency", Int::class.javaPrimitiveType)
+                .invoke(camera, value)
+        } catch (t: Throwable) {
+            Log.d("meidui", "🔌 [OTG控制] powerline 该库版本无接口: ${t.message}")
+        }
     }
 
     /** 在 uvc 线程同步执行（stopCapture/dispose 要求返回前帧已停） */

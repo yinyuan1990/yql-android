@@ -75,6 +75,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     @Volatile var usingOtgCamera: Boolean = false
         private set
 
+    // ⭐ 第五十章：OTG 独立配置通道（`otg_` 前缀）。与自带摄像头的 ptype 分家，详见 OtgConfigRouter。
+    private val otgRouter = com.fz.yqlandroid.manager.uvc.OtgConfigRouter(this)
+
+    /** 当前采集器是 OTG 采集器时返回之，否则 null（供 OTG 路由下发硬件控制项） */
+    fun otgCapturer(): com.fz.yqlandroid.manager.uvc.UvcVideoCapturer? =
+        videoCapturer as? com.fz.yqlandroid.manager.uvc.UvcVideoCapturer
+
     // WebRTC 核心组件
     private var peerConnectionFactory: PeerConnectionFactory? = null
     private var peerConnection: PeerConnection? = null
@@ -582,6 +589,41 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         Log.d(TAG, "🎯 档位切换: ${profileName(profile)} → 采集${currentWidth}x${currentHeight}@${currentFps}fps, 码率${currentMinBitrateKbps}-${currentBitrateKbps}kbps, scale=${"%.2f".format(preset.scaleDown)}")
     }
     
+    /**
+     * ⭐ 第五十章：OTG 档位切换 —— 档位就是**设备枚举出来的一档分辨率**（`otg_resolution`）。
+     *
+     * 与 [applyProfile] 分开写：自带摄像头是"5 个固定档位 → 各自就近选设备分辨率"，
+     * OTG 是"设备有几档就是几档，PC 直接指名要哪个尺寸"，中间没有档位映射这一层。
+     * 落地环节（切采集格式 / 重算编码参数 / 补关键帧）复用既有实现。
+     *
+     * @param fps 该分辨率的目标采集帧率；<=0 表示沿用当前值（PC 不指定时）
+     */
+    fun applyOtgResolution(width: Int, height: Int, fps: Int) {
+        if (!usingOtgCamera) {
+            Log.d("meidui", "🔌 [OTG档位] 当前不是 OTG 模式，忽略 ${width}x${height}")
+            return
+        }
+        val capFps = if (fps > 0) fps else maxOf(1, currentFps)
+        val changed = (width != currentWidth || height != currentHeight)
+        currentWidth = width
+        currentHeight = height
+        if (fps > 0) currentFps = minOf(fps, thermalFpsCap).coerceAtLeast(1)
+
+        if (isPreviewRunning) {
+            try {
+                // UVC 侧重新协商（不支持的尺寸由 UvcVideoCapturer 就近选，日志里能看到实际协商值）
+                videoCapturer?.changeCaptureFormat(width, height, capFps)
+                Log.d("meidui", "🔌 [OTG档位] → ${width}x${height}@${capFps}fps（尺寸变化=$changed）")
+            } catch (e: Exception) {
+                Log.d("meidui", "🔌 [OTG档位] ❌ 切换失败: ${e.message}")
+            }
+        } else {
+            Log.d("meidui", "🔌 [OTG档位] 预览未启动，记下 ${width}x${height}@${capFps}fps，开流时生效")
+        }
+        setEncodingParameters()
+        forceKeyframe()
+    }
+
     private fun profileName(profile: LadderProfile): String = when (profile) {
         LadderProfile.P4K -> "超高清(p4k)"
         LadderProfile.ULTRA -> "超高帧(ultra)"
@@ -624,7 +666,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // ⭐ 第四十八章b：OTG 模式日志上报（摄像头占用USB口没法连adb，日志推后端「OTG日志」页）。
             //   streamKey 在 startPublish 里先于 startPreview 生成，这里通常已非空；纯预览场景兜底生成会话ID。
             OtgLogReporter.start(streamKey)
-            com.fz.yqlandroid.manager.uvc.UvcVideoCapturer(context)
+            com.fz.yqlandroid.manager.uvc.UvcVideoCapturer(context).also { cap ->
+                // ⭐ 第五十章：UVC 能力枚举完 → 主动推给 PC（PC 据此动态生成 OTG 调节面板）。
+                //   PC 也可随时发 otg_get_caps 再要一次（面板打开/设备上线/切换账号）。
+                cap.onCapsUpdated = { WebSocketManager.instance.sendOtgCaps() }
+                otgRouter.onCapsRequested = { WebSocketManager.instance.sendOtgCaps() }
+            }
         } else {
             createCameraCapturer(isFrontCamera)
         }
@@ -2122,12 +2169,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val ptype = config["ptype"] as? String ?: ""
         Log.d(TAG, "📋 [后端配置] ptype=$ptype, config=$config")
         
-        // ⭐ 第四十八章：OTG 外接摄像头模式下，Camera2 专属指令统一忽略（PC 零改动，不报错不崩）。
-        //    档位(type)/推送fps/码率/关键帧照常生效（作用在编码器/UVC 就近协商，与镜头类型无关）。
+        // ⭐ 第五十章：OTG 走 `otg_` 前缀的独立通道（分辨率/fps/码率/硬件项），任何模式下都先给它。
+        //    分开的理由：OTG 档位=设备枚举出的分辨率列表（逐台不同、可能 7 档），与自带摄像头
+        //    那套固定 5 档不是一回事，混在同一批 ptype 里必然互相污染。
+        if (otgRouter.handle(ptype, config)) return
+
+        // ⭐ 第四十八章：OTG 模式下，自带摄像头(Camera2)那套老 ptype 一律忽略——PC 对 OTG 设备
+        //    改发 otg_ 前缀，这里只兜住老版本 PC / 后端回放的残留指令，不报错不崩。
+        //    通用项（关键帧请求）不受影响，继续往下走。
         if (usingOtgCamera && ptype in listOf(
-                "direction", "zoom", "cjfps", "focus",
+                "type", "fps", "bitrate", "direction", "zoom", "cjfps", "focus",
                 "test_brightness", "white_balance", "applyWhiteBalance")) {
-            Log.d("meidui", "🔌 [OTG] 忽略Camera2专属指令 ptype=$ptype（外接UVC摄像头不支持）")
+            Log.d("meidui", "🔌 [OTG] 忽略自带摄像头通道指令 ptype=$ptype（OTG 请用 otg_ 前缀）")
             return
         }
 
@@ -2285,6 +2338,16 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      */
     fun applyInitialConfig(config: ThinRemoteConfig) {
         Log.d(TAG, "📋 [初始配置] 应用全部初始参数: type=${config.type}, dir=${config.direction}, zoom=${config.zoom}, fps=${config.fps}, cjfps=${config.cjfps}, bitrate=${config.bitrate}, focus=${config.focus}")
+
+        // ⭐ 第五十章：OTG 模式只吃"与镜头无关"的两项（推送fps / 码率），且直接调实现、不过老 ptype
+        //    通道。档位不在这里定——OTG 档位=设备分辨率，要等 UVC 枚举完由 PC 按能力快照下发
+        //    otg_resolution；在此之前先用 UvcVideoCapturer 的就近协商结果跑着。
+        if (usingOtgCamera) {
+            config.bitrate?.let { setQualityPercentage(it) }
+            config.fps?.let { setTargetFps(it) }
+            Log.d("meidui", "🔌 [OTG] 初始配置只应用 fps/码率；档位等 PC 按能力快照发 otg_resolution")
+            return
+        }
 
         // 1) 档位（会更新采集分辨率/编码参数）
         applyRemoteConfig(mapOf("ptype" to "type", "type" to config.type))
@@ -2479,15 +2542,21 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 设置目标推送FPS
      * 后端下发的FPS需要除以4（与iOS一致）
      */
-    fun setTargetFps(backendFps: Int) {
-        val pushFps = backendFps / 4
+    fun setTargetFps(backendFps: Int) = setPushFps(backendFps / 4, "后端set_fps(${backendFps}÷4)")
+
+    /**
+     * 推送帧率落地（**推送口径真实值，不再 ÷4**）。
+     * 自带摄像头走 [setTargetFps] 兜那条 ÷4 的历史协议；OTG 走 `otg_fps` 直接调本函数
+     * （第五十章：OTG 通道与老通道分家，但"落到编码器"这段实现共用，不重复造轮子）。
+     */
+    fun setPushFps(pushFps: Int, source: String = "otg_fps") {
         val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
         // ⭐ 回声抑制：这条 set_fps 若=我们刚经 sendFpsUpdate 上报的自适应值（10s 窗口内），
         //   是后端的回声、不是用户/PC 的新指令——只让编码器与该值一致（本来就一致），
         //   【不】下调 targetOutputFps（升帧封顶），否则自适应降一次帧就永远回不去（单向棘轮）。
         val isAdaptiveEcho = pushFps == adaptiveEchoFps && System.currentTimeMillis() < adaptiveEchoUntilMs
         if (isAdaptiveEcho) {
-            Log.d("meidui", "🔁 set_fps=$backendFps(÷4=${pushFps}fps) 判定为自适应上报回声，targetOutputFps保持${targetOutputFps}fps不动")
+            Log.d("meidui", "🔁 [$source] ${pushFps}fps 判定为自适应上报回声，targetOutputFps保持${targetOutputFps}fps不动")
             return
         }
         // ⭐ 记录后端目标（= iOS targetOutputFPS）：自适应升帧的封顶值。
@@ -2525,10 +2594,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    iOS 相机恒按档位帧率采集、FrameThrottler 只节流推送；Android 等价方案 =
         //    编码器 maxFramerate 丢帧（预览 sink 在丢帧之前仍满帧）。这里只做一次校验，
         //    把可能被旧逻辑降下去的采集帧率恢复到档位帧率（相同值不会重开相机）。
-        ensureCaptureFps("set_fps")
+        ensureCaptureFps(source)
 
-        Log.d(TAG, "🎬 推送FPS: 后端${backendFps}/4=${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
-        Log.d("meidui", "⚠️ fps修改源=后端set_fps 后端${backendFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")
+        Log.d(TAG, "🎬 推送FPS[$source]: 请求${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
+        Log.d("meidui", "⚠️ fps修改源=$source ${pushFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")
     }
     
     /**

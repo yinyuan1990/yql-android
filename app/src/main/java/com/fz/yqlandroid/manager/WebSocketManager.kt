@@ -364,6 +364,9 @@ class WebSocketManager private constructor() {
                     // 状态回传，忽略
                 }
 
+                // ⭐ 第五十章：自己发出去的 OTG 能力快照会回到同一 topic，忽略
+                "OTG_CAPS" -> { }
+
                 // ⭐ PC 拉流心跳（PC 出画面时每秒一条）→ 记录时间戳供「PC 已连接」显示
                 "VIEWER_HEARTBEAT" -> {
                     lastViewerHeartbeatAtMs = System.currentTimeMillis()
@@ -547,6 +550,10 @@ class WebSocketManager private constructor() {
             "networkType" to getNetworkType(),
             "publishStatus" to isPublishingFlag,
             "streamKey" to publishingStreamKey,
+            // ⭐ 第五十章：摄像头模式 + OTG 能力版本号（各几字节，随心跳常带）。
+            //   PC 靠 cameraMode 决定走 otg_ 独立通道；capsVersion 变了才去要一次完整能力快照。
+            "cameraMode" to (tokenPrefs?.getString("camera_mode", "builtin") ?: "builtin"),
+            "otgCapsVersion" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.version,
             "streamPushIp" to streamPushIp,
             "connectstype" to connectstype,
             "connectMode" to connectMode,
@@ -592,6 +599,46 @@ class WebSocketManager private constructor() {
         sendStompMessage(destination, json)
     }
     
+    /**
+     * ⭐ 第五十章：上报 OTG(UVC) 能力快照 → PC 动态生成调节面板。
+     *
+     * 单发（不挂在每秒心跳上，包大得多）：UVC 开流枚举完主动推一次；PC 发 `otg_get_caps` 再补推。
+     * 走的是与 CONFIG_STATE 同一条 STOMP 长连接、同一个 `/config` topic，只是 type 不同。
+     */
+    fun sendOtgCaps() {
+        val id = deviceId ?: return
+        val caps = com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.caps.value ?: run {
+            println("wb [WS] ⏭️ sendOtgCaps: 当前无 OTG 能力快照（未开流/自带摄像头模式）")
+            return
+        }
+        val payload = mapOf(
+            "type" to "OTG_CAPS",
+            "deviceId" to id,
+            "caps" to mapOf(
+                "cameraMode" to "otg",
+                "deviceName" to caps.deviceName,
+                "width" to caps.width,
+                "height" to caps.height,
+                "version" to caps.version,
+                // 档位列表 = 设备枚举出的分辨率（几档就是几档）
+                "sizes" to caps.sizes.map {
+                    mapOf("width" to it.width, "height" to it.height, "maxFps" to it.maxFps)
+                },
+                // 硬件可调项（PC 只渲染 supported=true 的）
+                "controls" to caps.controls.map {
+                    mapOf(
+                        "key" to it.key, "label" to it.label, "type" to it.type,
+                        "supported" to it.supported, "cur" to it.cur,
+                        "min" to it.min, "max" to it.max, "options" to it.options
+                    )
+                }
+            ),
+            "timestamp" to SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(Date())
+        )
+        sendStompMessage("/topic/device/$id/config", gson.toJson(payload))
+        println("wb [WS] 📤 OTG能力快照已上报: ${caps.sizes.size}档分辨率, ${caps.controls.count { it.supported }}项可调, ver=${caps.version}")
+    }
+
     /**
      * 获取电池电量 (0~100)
      */
