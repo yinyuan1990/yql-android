@@ -151,6 +151,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ 切网重连中（P2P）：拆会话+HANGUP 后等 PC 重连，UI 左上角显示"网络切换重连中…"；PC 心跳恢复即清除
     var onReconnectingUpdate: ((Boolean) -> Unit)? = null
     @Volatile private var p2pReconnecting: Boolean = false
+    // ⭐ §52.6：P2P 判定出「与观看端不在同一 WiFi」→ 上层停推流、退登录页、提示改用多人线路
+    var onNotSameWifi: (() -> Unit)? = null
+    @Volatile private var notSameWifiHandled = false
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val gson = Gson()
@@ -937,6 +940,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         println("jfh [P2P] 🚀 启动 P2P 直连模式（不连 SRS，等待 PC 观看请求）")
         println("jfh [P2P]    档位: ${profileName(currentProfile)}, 采集: ${currentWidth}x${currentHeight}@${captureFps()}fps · 推送目标${currentFps}fps")
         println("jfh [P2P] ═══════════════════════════════════════")
+        notSameWifiHandled = false   // ⭐ §52.6：新一轮推流重新判定同 WiFi
         onConnectionStateChanged?.invoke("P2P 等待观看端...")
         
         scope.launch {
@@ -1551,8 +1555,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     //   单向操作：会话期内不切回直连（pcId 进 forceRelayPeerIds），拆会话自动清除。
     //   relaySwitchGapMs：两次触发的最小间隔。软切(ICE Restart)生效要几秒，期间路径仍显示直连，
     //   若每秒重触发会被 P2PManager 误判「软切无效」而提前硬切拆会话（网页内核观看端会断播）。
-    private var lastRelaySwitchMs: Long = 0
-    private val relaySwitchGapMs = 8_000L
+    //   ⚠️ 2026-07-27 §52.6：判定沿用，但**动作已从「切中继」改为「退登录页提示改用多人线路」**，
+    //      下面两个限频字段随之成为死变量（保留以备回滚）。
+    @Suppress("unused") private var lastRelaySwitchMs: Long = 0
+    @Suppress("unused") private val relaySwitchGapMs = 8_000L
     
     private fun startStats() {
         statsJob?.cancel()
@@ -1714,16 +1720,19 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         }
                     }
 
-                    // ⭐ §25.7 链路择优（简化版）：非同 WiFi（选中路径不是 host↔host）→ 立即切中继。
-                    //   两侧候选类型都已知才判定；relaySwitchGapMs 限频，给软切(ICE Restart)生效时间，
-                    //   仍未生效才由 P2PManager 升级硬切。
-                    if (currentConnMode == ConnMode.P2P && activePairId != null && !pathIsRelay &&
+                    // ⭐ §52.6（替代原 §25.7 的「切中继」）：非同 WiFi（选中路径不是 host↔host）
+                    //   → 停止推流并退回登录页，提示改用多人线路(SRS)。
+                    //   原来是切 TURN 中继，但中继下码率被钳到 relayMaxKbps，且路径与 SRS 完全相同却
+                    //   拿不到 SRS 的服务端重传/GOP cache/一对多分发——是最差的一档组合。
+                    //   判定沿用已有的 pathIsLan，不新造检测。后端显式 forceRelay 时不干预。
+                    if (currentConnMode == ConnMode.P2P && activePairId != null && !notSameWifiHandled &&
+                        !p2pManager.forceRelay &&
                         localType != null && remoteType != null && !pathIsLan) {
-                        val nowMs = System.currentTimeMillis()
-                        if (nowMs - lastRelaySwitchMs >= relaySwitchGapMs) {
-                            lastRelaySwitchMs = nowMs
-                            Log.d("meidui", "[线路] 🔀非同WiFi直连(本端=$localType 远端=$remoteType) → 立即切中继")
-                            p2pManager.switchAllSessionsToRelay("non_lan_${localType}_$remoteType")
+                        notSameWifiHandled = true
+                        Log.d("meidui", "[线路] 🚫非同WiFi(本端=$localType 远端=$remoteType) → 退出 P2P，提示改用多人线路")
+                        // 本回调跑在 WebRTC 信令线程；停流/Toast/导航必须回主线程
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            onNotSameWifi?.invoke()
                         }
                     }
                     

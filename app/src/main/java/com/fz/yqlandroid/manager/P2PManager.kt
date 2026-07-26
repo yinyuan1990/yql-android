@@ -75,7 +75,8 @@ class P2PManager(private val context: Context) {
 
     private val prefs get() = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
     private val maxViewers: Int get() = prefs.getInt("max_p2p_viewers", 4).let { if (it > 0) it else 4 }
-    private val forceRelay: Boolean get() = prefs.getBoolean("force_relay", false)
+    // 后端下发的强制中继开关。§52.6 的「非同 WiFi 退登录页」在此开关打开时不干预，故需对 WebRTCManager 可见。
+    val forceRelay: Boolean get() = prefs.getBoolean("force_relay", false)
 
     /** 已连接（ICE connected/completed）的观看会话，供 WebRTCManager 采集码率/网络 stats。 */
     val connectedViewerPeerConnections: List<PeerConnection>

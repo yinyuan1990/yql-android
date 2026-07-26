@@ -140,6 +140,22 @@ fun StreamingScreen(
         webRTCManager.onReconnectingUpdate = { r ->
             reconnecting = r
         }
+        // ⭐ §52.6 与观看端不在同一 WiFi：P2P 只有局域网直连才有优势，跨网走中继全面劣于 SRS。
+        //   停推流 → 把下次登录的默认线路改成多人线路 → 退回登录页并提示。
+        webRTCManager.onNotSameWifi = {
+            webRTCManager.stopPublish()
+            keepAliveManager.stop()
+            WebSocketManager.instance.disconnect()
+            context.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
+                .edit()
+                .putString("selected_connect_mode", "srs")
+                .putString("connect_mode", "srs")
+                .apply()
+            android.widget.Toast.makeText(
+                context, "不在同一 WiFi，请选择「多人线路」", android.widget.Toast.LENGTH_LONG
+            ).show()
+            onLogout()
+        }
         
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
         WebSocketManager.instance.onConfigUpdate = { config ->
