@@ -341,8 +341,12 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                     camera.getSupportedSizeList(fmt)?.filterIsInstance<com.jiangdg.utils.Size>()
                         ?.filter { it.width > 0 && it.height > 0 }
                 } catch (_: Exception) { null }
+                // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，省略）
                 lines += if (!s.isNullOrEmpty())
-                    "$name(${s.size}): " + s.joinToString(" ") { "${it.width}x${it.height}" }
+                    "$name(${s.size}): " + s.joinToString(" ") { sz ->
+                        val maxFps = sz.fps?.maxOrNull()?.toInt() ?: 0
+                        if (maxFps > 0) "${sz.width}x${sz.height}@$maxFps" else "${sz.width}x${sz.height}"
+                    }
                 else "$name: 无"
             }
             sizesOf(UVCCamera.FRAME_FORMAT_MJPEG, "MJPEG分辨率")
