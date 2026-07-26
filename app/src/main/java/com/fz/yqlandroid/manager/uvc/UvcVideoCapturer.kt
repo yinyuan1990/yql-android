@@ -40,8 +40,23 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     companion object {
         private const val TAG = "UvcVideoCapturer"
-        // libuvc setPreviewSize 的帧率协商区间下限（上限取 max(30, 请求fps)）
+        // libuvc setPreviewSize 的帧率协商区间下限
         private const val MIN_FPS = 1
+
+        /**
+         * ⭐ 设备**没声明**每档 fps 时，向 libuvc 请求的帧率上限（探测用）。
+         *
+         * 死循环曾经是这样的：jiangdg 的 `getSupportedSizeList()` 在部分设备/版本上不填
+         * `Size.fps`（实测日志里全是 `@0`，同一尺寸还会重复出现两条——那其实是两个不同帧率的
+         * 帧描述符）→ PC 拿不到 fps 只能兜底 30 → 我们照着只请求 1~30 → libuvc 自然挑 30fps
+         * 那个描述符 → 看起来就是"这摄像头只支持 30fps"。同一台设备插 Windows 能看到 120，
+         * 因为 Windows 是直接读 UVC 描述符的。
+         *
+         * 所以设备没声明时就按这个上限往高了要，再用 [measuredFps] 实测拿到多少。
+         * 取 60 而不是 120：推流侧编码器最高就 60（见 WebRTCManager.OTG_MAX_CAPTURE_FPS），
+         * 采到 120 也推不出去，只是白发热。要放开改这一个数即可。
+         */
+        private const val PROBE_MAX_FPS = 60
         // 开流后多久没帧就切下一策略（ms）
         private const val NO_FRAME_TIMEOUT_MS = 2500L
     }
@@ -93,6 +108,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     // ⭐ [诊断] IFrameCallback 原始命中数（在任何 early-return 之前自增）——用于「开流后无帧」看门狗
     //   区分：native 根本没送帧（计数不涨）vs 送了但被我方丢弃（计数涨但 capFps=0）。
     @Volatile private var frameCbCount = 0L
+
+    /** 当前协商档位的**实测**帧率（设备不声明 fps 时唯一的真实来源），随能力快照上报 PC */
+    @Volatile private var measuredFps = 0
 
     // MARK: - VideoCapturer 接口
 
@@ -218,6 +236,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     /** 按当前重试档位选 格式/带宽 开流；开流后装「无帧看门狗」，2.5s 没帧自动切下一档重开 */
     private fun startStreamLocked(camera: UVCCamera) {
         frameCbCount = 0
+        measuredFps = 0        // 换档重测，别把上一档的实测值带过来
         val list = strategies()
         // 该尺寸已知 MJPEG 谈不拢 → 直接从 YUYV 起步，不再白等两轮看门狗
         if (noFrameRetry == 0 && mjpegBlacklist.contains(sizeKey(requestedWidth, requestedHeight))) {
@@ -251,7 +270,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             if (!capturing || uvcCamera !== camera) return@Runnable
             if (frameCbCount > 0) {
                 noFrameRetry = 0   // 成功出帧：重置档位，后续切档/重开从最优策略开始
-                Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 ${frameWidth}x${frameHeight}")
+                // ⭐ 实测帧率：设备不声明 fps 时，这是唯一能拿到真实值的办法
+                measuredFps = (frameCbCount * 1000 / NO_FRAME_TIMEOUT_MS).toInt()
+                Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 " +
+                        "${frameWidth}x${frameHeight} → 实测${measuredFps}fps")
                 dumpCapabilitiesLocked(camera)   // 出帧确认后刷新能力快照（协商尺寸/当前值已最终定）
                 return@Runnable
             }
@@ -313,15 +335,27 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             }
         val w = target?.width ?: requestedWidth
         val h = target?.height ?: requestedHeight
+
+        // 该档设备声明的 fps 上限（多数设备/版本这里是 null —— 见 PROBE_MAX_FPS 的说明）
+        val declaredFps = try { target?.fps?.maxOrNull()?.toInt() ?: 0 } catch (_: Exception) { 0 }
+        val wantMaxFps = if (declaredFps > 0) {
+            minOf(maxOf(requestedFps, 1), declaredFps)     // 设备报了就按它的上限，别超
+        } else {
+            maxOf(requestedFps, PROBE_MAX_FPS)             // 设备没报 → 往高了要，实测能到多少算多少
+        }
+
         camera.setFrameCallback(null, 0)
         try { camera.stopPreview() } catch (_: Exception) {}
-        camera.setPreviewSize(w, h, MIN_FPS, maxOf(30, requestedFps), frameFormat, bandwidth)
+        camera.setPreviewSize(w, h, MIN_FPS, wantMaxFps, frameFormat, bandwidth)
         // ⭐ 关键修复：挂哑预览窗口，否则 native startPreview 因无窗口不起流线程 → 无帧
         camera.setPreviewDisplay(ensureDummySurface(w, h))
         camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         camera.startPreview()
         val fmtName = if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"
         Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=$fmtName bw=$bandwidth")
+        Log.d("meidui", "🔌 [OTG] 帧率协商区间=${MIN_FPS}~${wantMaxFps}fps" +
+                (if (declaredFps > 0) "（设备声明该档上限${declaredFps}fps）"
+                 else "（设备未声明该档fps → 按${PROBE_MAX_FPS}探测，实际到多少看下面的实测值）"))
         // ⭐ 第五十章：请求值与协商值不一致要看得见 —— PC 面板选了 160x120，
         //   但该格式的支持列表里没有这一档时，这里会就近落到别的尺寸（PC 显示的档位就"没生效"）。
         if (w != requestedWidth || h != requestedHeight) {
@@ -372,7 +406,8 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         try {
             camera.updateCameraParams()   // 读能力位掩码 + 各控制项的绝对 min/max（百分比映射的基础）
             lines += "OTG设备: ${currentDeviceName ?: "?"}"
-            lines += "协商: ${frameWidth}x${frameHeight} (请求${requestedWidth}x${requestedHeight}@${requestedFps}fps 策略=${strategies()[minOf(noFrameRetry, strategies().size - 1)].name})"
+            lines += "协商: ${frameWidth}x${frameHeight} (请求${requestedWidth}x${requestedHeight}@${requestedFps}fps 策略=${strategies()[minOf(noFrameRetry, strategies().size - 1)].name})" +
+                    if (measuredFps > 0) " 实测${measuredFps}fps" else ""
 
             fun sizesOf(fmt: Int, name: String) {
                 val s = try {
@@ -381,7 +416,11 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                 } catch (_: Exception) { null }
                 // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，记 0）
                 s?.forEach { sz ->
-                    val maxFps = sz.fps?.maxOrNull()?.toInt() ?: 0
+                    // 设备声明的 fps；没声明时，若这一档正是当前在跑的档位就用实测值填上
+                    val declared = sz.fps?.maxOrNull()?.toInt() ?: 0
+                    val maxFps = if (declared > 0) declared
+                                 else if (sz.width == frameWidth && sz.height == frameHeight) measuredFps
+                                 else 0
                     // 同尺寸两种格式都支持时只保留一条（取 fps 上限更高的），PC 档位列表按尺寸去重
                     val exist = sizes.indexOfFirst { it.width == sz.width && it.height == sz.height }
                     if (exist < 0) {
