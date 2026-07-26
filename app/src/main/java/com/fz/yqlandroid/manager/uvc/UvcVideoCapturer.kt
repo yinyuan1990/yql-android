@@ -402,11 +402,14 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         } catch (e: Exception) {
             lines += "能力枚举失败: ${e.message}"
         }
+        // 每档分辨率的码率上限：以"枚举出的最大分辨率 = 现有最高档码率"为锚，按像素率等比算
+        val sizesWithKbps = OtgBitratePlan.annotate(sizes)
+        sizesWithKbps.forEach { lines += "  码率上限 ${it.width}x${it.height}@${it.maxFps} → ${it.maxKbps}kbps" }
         val caps = UvcCapabilityStore.Caps(
             deviceName = currentDeviceName ?: "",
             width = frameWidth,
             height = frameHeight,
-            sizes = sizes,
+            sizes = sizesWithKbps,
             controls = controls,
             version = System.currentTimeMillis()
         )

@@ -622,7 +622,8 @@ class WebSocketManager private constructor() {
                 "version" to caps.version,
                 // 档位列表 = 设备枚举出的分辨率（几档就是几档）
                 "sizes" to caps.sizes.map {
-                    mapOf("width" to it.width, "height" to it.height, "maxFps" to it.maxFps)
+                    mapOf("width" to it.width, "height" to it.height,
+                          "maxFps" to it.maxFps, "maxKbps" to it.maxKbps)
                 },
                 // 硬件可调项（PC 只渲染 supported=true 的）
                 "controls" to caps.controls.map {

@@ -28,8 +28,11 @@ object UvcCapabilityStore {
         val options: List<String> = emptyList()
     )
 
-    /** 一档分辨率 = PC 面板上的一个"档位"（设备枚举出几个就是几个，不再是固定 5 档） */
-    data class SizeOption(val width: Int, val height: Int, val maxFps: Int)
+    /**
+     * 一档分辨率 = PC 面板上的一个"档位"（设备枚举出几个就是几个，不再是固定 5 档）。
+     * [maxKbps] 由 [OtgBitratePlan] 按像素率等比算出，PC 面板据此显示"码率 x% ≈ y kbps"。
+     */
+    data class SizeOption(val width: Int, val height: Int, val maxFps: Int, val maxKbps: Int = 0)
 
     /** 一台 UVC 设备的完整能力快照。[version] 变化即表示能力变了（换设备/重新协商），PC 据此决定是否重建面板 */
     data class Caps(

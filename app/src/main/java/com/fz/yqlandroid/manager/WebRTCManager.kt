@@ -620,8 +620,31 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         } else {
             Log.d("meidui", "🔌 [OTG档位] 预览未启动，记下 ${width}x${height}@${capFps}fps，开流时生效")
         }
+        // 分辨率变了，码率天花板跟着变（按像素率等比），并按当前百分比重算实际码率
+        applyOtgBitrate()
         setEncodingParameters()
         forceKeyframe()
+    }
+
+    /** OTG 码率百分比（0~100）。天花板来自 [OtgBitratePlan]，与自带摄像头的 ladder 无关 */
+    private var otgQualityPercent: Int = 100
+
+    fun setOtgQualityPercentage(percentage: Int) {
+        otgQualityPercent = percentage.coerceIn(10, 100)
+        applyOtgBitrate()
+    }
+
+    /** 按「当前分辨率的码率上限 × 当前百分比」下发码率 */
+    private fun applyOtgBitrate() {
+        val caps = com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.caps.value
+        val ceiling = if (caps != null && caps.sizes.isNotEmpty())
+            com.fz.yqlandroid.manager.uvc.OtgBitratePlan.ceilingFor(
+                caps.sizes, currentWidth, currentHeight, currentFps)
+        else com.fz.yqlandroid.manager.uvc.OtgBitratePlan.ANCHOR_KBPS
+        val targetKbps = (ceiling * otgQualityPercent / 100)
+            .coerceAtLeast(com.fz.yqlandroid.manager.uvc.OtgBitratePlan.MIN_KBPS)
+        setMaxBitrateKbps(targetKbps)
+        Log.d("meidui", "🔌 [OTG码率] ${currentWidth}x${currentHeight}@${currentFps} 上限${ceiling}kbps × ${otgQualityPercent}% → ${targetKbps}kbps")
     }
 
     private fun profileName(profile: LadderProfile): String = when (profile) {
@@ -2343,7 +2366,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    通道。档位不在这里定——OTG 档位=设备分辨率，要等 UVC 枚举完由 PC 按能力快照下发
         //    otg_resolution；在此之前先用 UvcVideoCapturer 的就近协商结果跑着。
         if (usingOtgCamera) {
-            config.bitrate?.let { setQualityPercentage(it) }
+            config.bitrate?.let { setOtgQualityPercentage(it) }
             config.fps?.let { setTargetFps(it) }
             Log.d("meidui", "🔌 [OTG] 初始配置只应用 fps/码率；档位等 PC 按能力快照发 otg_resolution")
             return

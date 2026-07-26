@@ -68,8 +68,8 @@ class OtgConfigRouter(private val mgr: WebRTCManager) {
                     Log.d(LOG, "🔌 [OTG] ❌ otg_bitrate 值非法: $config")
                     return true
                 }
-                mgr.setQualityPercentage(pct)
-                Log.d(LOG, "🔌 [OTG] 码率 → ${pct}%")
+                // 天花板按当前分辨率的像素率算（OtgBitratePlan），不用自带摄像头那套 ladder
+                mgr.setOtgQualityPercentage(pct)
             }
 
             "otg_ctrl" -> {
