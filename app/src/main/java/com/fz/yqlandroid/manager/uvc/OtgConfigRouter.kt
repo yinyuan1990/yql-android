@@ -41,6 +41,9 @@ class OtgConfigRouter(private val mgr: WebRTCManager) {
      */
     fun handle(ptype: String, config: Map<String, Any>): Boolean {
         if (!ptype.startsWith(PREFIX)) return false
+        // ⭐ 全链路日志锚点①：PC 下发的每一条 otg_ 指令到达即打印（含完整载荷）。
+        //   排查口诀：日志里没有这行 = PC 没发出来/信令没到；有这行没后续 = 看下面哪步断了。
+        Log.d(LOG, "🔗 [OTG链路|收到] ptype=$ptype config=$config")
         when (ptype) {
             "otg_resolution" -> {
                 val w = (config["width"] as? Number)?.toInt() ?: 0

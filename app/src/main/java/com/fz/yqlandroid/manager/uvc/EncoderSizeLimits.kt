@@ -50,6 +50,21 @@ object EncoderSizeLimits {
         }
     }
 
+    /**
+     * 该尺寸下编码器支持的最高帧率（能力口径，不是当下负载）。
+     *
+     * 这才是"推流 fps 上限"的正主——之前用的 60 是从自带摄像头 ladder 借来的拍脑袋值，
+     * 跟硬件无关；小分辨率上硬件编码器编 120fps 很常见。查不到时回 0（调用方自己兜底）。
+     */
+    fun maxFrameRate(codec: String, width: Int, height: Int): Int {
+        val vc = capsOf(mimeOf(codec)) ?: return 0
+        return try {
+            vc.getSupportedFrameRatesFor(width, height).upper.toInt().coerceIn(1, 240)
+        } catch (_: Throwable) {
+            0   // 尺寸本身不支持等
+        }
+    }
+
     /** 人读的下限描述，打日志用（如 "H265 编码器支持 176x144 ~ 3840x2160"） */
     fun describe(codec: String): String {
         val mime = mimeOf(codec)

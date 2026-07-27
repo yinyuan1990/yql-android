@@ -184,8 +184,13 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         requestedWidth = width
         requestedHeight = height
         requestedFps = framerate
-        if (!capturing) return
-        Log.d("meidui", "🔌 [OTG] changeCaptureFormat → ${width}x${height}@${framerate}fps（重开UVC流就近协商）")
+        if (!capturing) {
+            Log.d("meidui", "🔗 [OTG链路|重开流] ❌ capturing=false，只记参数不动流 ${width}x${height}@${framerate}")
+            return
+        }
+        // ⭐ 全链路日志锚点③：真正重开 UVC 流（后续看「帧率精确请求」→「协商帧率」→「实测」三行）
+        Log.d("meidui", "🔗 [OTG链路|重开流] ${width}x${height}@${framerate}fps 格式偏好=" +
+                (when (preferredFormat) { 1 -> "MJPEG"; 2 -> "YUYV"; else -> "自动" }))
         uvcHandler?.post {
             val cam = uvcCamera ?: return@post
             try {
@@ -588,7 +593,11 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         // 同时标出硬件编码器吃不下的档位（低于最小分辨率的选了必黑，PC 面板不给选）
         val codec = com.fz.yqlandroid.manager.H265Support.effectiveCodec
         val sizesWithKbps = OtgBitratePlan.annotate(sizes).map {
-            it.copy(encodable = EncoderSizeLimits.isEncodable(codec, it.width, it.height))
+            it.copy(
+                encodable = EncoderSizeLimits.isEncodable(codec, it.width, it.height),
+                // 该尺寸下编码器能编的最高帧率 = 推流 fps 的真实上限（随快照给 PC，滑条按它开）
+                encMaxFps = EncoderSizeLimits.maxFrameRate(codec, it.width, it.height)
+            )
         }
         lines += EncoderSizeLimits.describe(codec)
         sizesWithKbps.forEach {

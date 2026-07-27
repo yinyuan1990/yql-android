@@ -630,7 +630,8 @@ class WebSocketManager private constructor() {
                 "sizes" to caps.sizes.map {
                     mapOf("width" to it.width, "height" to it.height,
                           "maxFps" to it.maxFps, "maxKbps" to it.maxKbps,
-                          "encodable" to it.encodable)
+                          "encodable" to it.encodable,
+                          "encMaxFps" to it.encMaxFps)   // 该尺寸编码器最高帧率=推流真实上限
                 },
                 // 硬件可调项（PC 只渲染 supported=true 的）
                 "controls" to caps.controls.map {

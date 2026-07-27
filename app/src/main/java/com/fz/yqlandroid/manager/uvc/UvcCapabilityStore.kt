@@ -33,13 +33,15 @@ object UvcCapabilityStore {
      * [maxKbps]    由 [OtgBitratePlan] 按像素率等比算出，PC 面板据此显示"码率 x% ≈ y kbps"。
      * [encodable]  硬件编码器吃不吃得下这个尺寸（见 [EncoderSizeLimits]）。
      *              false 的档位 PC 面板不给选——采集没问题但编码器一帧不出，选了必黑。
+     * [encMaxFps]  该尺寸下编码器能编的最高帧率（推流 fps 的真实上限；0=查不到）。
      */
     data class SizeOption(
         val width: Int,
         val height: Int,
         val maxFps: Int,
         val maxKbps: Int = 0,
-        val encodable: Boolean = true
+        val encodable: Boolean = true,
+        val encMaxFps: Int = 0
     )
 
     /** 一台 UVC 设备的完整能力快照。[version] 变化即表示能力变了（换设备/重新协商），PC 据此决定是否重建面板 */

@@ -606,10 +606,16 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             Log.d("meidui", "🔌 [OTG档位] 当前不是 OTG 模式，忽略 ${width}x${height}")
             return
         }
-        otgCapturer()?.preferredFormat = format
-        // ⭐ 采集帧率封顶 60：小分辨率的 UVC 采集上限常见 120fps，但推流侧编码器最高 60，
-        //   真按 120 采集只是白烧电和发热（对齐 iOS「采集60·推30」的思路）。
+        // ⭐ 全链路日志锚点②：切档指令进到落地层
+        val fmtName = when (format) { 1 -> "MJPEG"; 2 -> "YUYV"; else -> "自动" }
+        val cap = otgCapturer()
+        if (cap == null) {
+            Log.d("meidui", "🔗 [OTG链路|切档] ❌ 当前采集器不是 UvcVideoCapturer（未开流/旧链路），忽略 ${width}x${height}@$fps $fmtName")
+            return
+        }
+        cap.preferredFormat = format
         val capFps = (if (fps > 0) fps else maxOf(1, currentFps)).coerceIn(1, OTG_MAX_CAPTURE_FPS)
+        Log.d("meidui", "🔗 [OTG链路|切档] 目标=${width}x${height}@${capFps}fps 格式=$fmtName（当前 ${currentWidth}x${currentHeight}，热控上限${thermalFpsCap}fps）")
         val changed = (width != currentWidth || height != currentHeight)
         currentWidth = width
         currentHeight = height
@@ -633,11 +639,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     /**
-     * OTG 采集帧率硬上限。
-     *
-     * 推流侧编码器最高 60，所以采到 120 有一半推不出去、纯属发热——但**要不要采**是用户的选择
-     * （比如就想验证这台摄像头到底能不能跑 120），面板上会把"采集/推流"两个上限分开写清楚。
-     * 这里只挡明显离谱的值。
+     * OTG 采集帧率硬上限——只挡明显离谱的值。
+     * 推流上限不在这里：那个按编码器真实能力算（EncoderSizeLimits.maxFrameRate，见 setPushFps）。
      */
     private val OTG_MAX_CAPTURE_FPS = 120
 
@@ -2621,7 +2624,21 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * （第五十章：OTG 通道与老通道分家，但"落到编码器"这段实现共用，不重复造轮子）。
      */
     fun setPushFps(pushFps: Int, source: String = "otg_fps") {
-        val maxFps = currentLadder[currentProfile]?.maxPushFps ?: 60
+        // OTG 的推流上限 = 编码器在当前尺寸下的真实能力（MediaCodec 报的），
+        // 不用 ladder 那个 60 —— 那是自带摄像头的拍脑袋值，小分辨率编 120fps 很常见。
+        // 自带摄像头维持原逻辑不动。
+        val maxFps = if (usingOtgCamera) {
+            val enc = com.fz.yqlandroid.manager.uvc.EncoderSizeLimits.maxFrameRate(
+                H265Support.effectiveCodec, currentWidth, currentHeight)
+            if (enc > 0) enc else 120
+        } else {
+            currentLadder[currentProfile]?.maxPushFps ?: 60
+        }
+        if (usingOtgCamera) {
+            Log.d("meidui", "🔗 [OTG链路|推流fps] 请求${pushFps} → 编码器上限${maxFps}" +
+                    "(${H265Support.effectiveCodec}@${currentWidth}x${currentHeight})" +
+                    " → 热控上限${thermalFpsCap} → 结果${minOf(pushFps, maxFps, thermalFpsCap).coerceAtLeast(1)}fps")
+        }
         // ⭐ 回声抑制：这条 set_fps 若=我们刚经 sendFpsUpdate 上报的自适应值（10s 窗口内），
         //   是后端的回声、不是用户/PC 的新指令——只让编码器与该值一致（本来就一致），
         //   【不】下调 targetOutputFps（升帧封顶），否则自适应降一次帧就永远回不去（单向棘轮）。
