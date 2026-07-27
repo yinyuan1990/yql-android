@@ -47,6 +47,8 @@ object UvcCapabilityStore {
         val deviceName: String,
         val width: Int,
         val height: Int,
+        /** 当前实际在用的采集格式："MJPEG" / "YUYV"（PC 面板显示，让"切了格式没生效"看得见） */
+        val format: String = "",
         val sizes: List<SizeOption>,
         val controls: List<Control>,
         val version: Long

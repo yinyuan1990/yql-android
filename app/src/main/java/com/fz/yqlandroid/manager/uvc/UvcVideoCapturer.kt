@@ -60,18 +60,34 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         // 开流后多久没帧就切下一策略（ms）
         private const val NO_FRAME_TIMEOUT_MS = 2500L
 
-        // 稳态帧率采样窗口（ms）。等画面稳了再采，避开相机预热那段空窗
-        private const val FPS_SAMPLE_MS = 3000L
+        // 稳态帧率采样：连采几轮、每轮多长。取各轮**最大值**作为该档的能力上限。
+        //   单窗口采样噪声很大（USB 等时传输 + MJPEG 解码本来就不均匀，实测同一档会在 24~30 之间跳），
+        //   拿单次结果当"能力"再去算码率就会一路错下去。最大值才是"这档能跑到多少"。
+        private const val FPS_SAMPLE_MS = 1500L
+        private const val FPS_SAMPLE_ROUNDS = 3
     }
 
     // ⭐ 开流策略：native「开流成功但无帧」时依次降级重试（不同摄像头/OTG供电下兼容性差异大）
     private data class StreamStrategy(val format: Int, val bandwidth: Float, val name: String)
-    private fun strategies() = listOf(
-        StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.DEFAULT_BANDWIDTH, "MJPEG@1.0"),
-        StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, 0.5f, "MJPEG@0.5"),
-        StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, UVCCamera.DEFAULT_BANDWIDTH, "YUYV@1.0"),
-        StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, 0.3f, "YUYV@0.3")
-    )
+
+    /** PC 指定的采集格式：0=自动（MJPEG 优先，失败降 YUYV）/ 1=只用 MJPEG / 2=只用 YUYV */
+    @Volatile var preferredFormat: Int = 0
+
+    private fun strategies(): List<StreamStrategy> {
+        val mjpeg = listOf(
+            StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, UVCCamera.DEFAULT_BANDWIDTH, "MJPEG@1.0"),
+            StreamStrategy(UVCCamera.FRAME_FORMAT_MJPEG, 0.5f, "MJPEG@0.5")
+        )
+        val yuyv = listOf(
+            StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, UVCCamera.DEFAULT_BANDWIDTH, "YUYV@1.0"),
+            StreamStrategy(UVCCamera.FRAME_FORMAT_YUYV, 0.3f, "YUYV@0.3")
+        )
+        return when (preferredFormat) {
+            1 -> mjpeg + yuyv     // 指定 MJPEG：仍保留 YUYV 兜底，否则谈不拢就彻底没画面
+            2 -> yuyv + mjpeg     // 指定 YUYV
+            else -> mjpeg + yuyv  // 自动
+        }
+    }
     @Volatile private var noFrameRetry = 0
     private var noFrameWatchdog: Runnable? = null
 
@@ -117,6 +133,12 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     /** 首次开流是否已按设备自身列表选定档位（之后的切档才按 PC 请求就近选） */
     @Volatile private var initialSizePicked = false
+
+    /** 协商出来的帧率（来自 UVC 帧间隔，权威值）；0=库没给，只能靠 [measuredFps] */
+    @Volatile private var negotiatedFps = 0
+
+    /** 当前实际采集格式名（MJPEG/YUYV），随能力快照上报，让"切了格式没生效"看得见 */
+    @Volatile private var activeFormatName = ""
 
     private fun codecName(): String = com.fz.yqlandroid.manager.H265Support.effectiveCodec
 
@@ -245,9 +267,12 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     private fun startStreamLocked(camera: UVCCamera) {
         frameCbCount = 0
         measuredFps = 0        // 换档重测，别把上一档的实测值带过来
+        negotiatedFps = 0
         val list = strategies()
-        // 该尺寸已知 MJPEG 谈不拢 → 直接从 YUYV 起步，不再白等两轮看门狗
-        if (noFrameRetry == 0 && mjpegBlacklist.contains(sizeKey(requestedWidth, requestedHeight))) {
+        // 该尺寸已知 MJPEG 谈不拢 → 直接从 YUYV 起步，不再白等两轮看门狗。
+        // 用户明确指定了格式时不做这个自作主张（preferredFormat != 0）。
+        if (noFrameRetry == 0 && preferredFormat == 0 &&
+            mjpegBlacklist.contains(sizeKey(requestedWidth, requestedHeight))) {
             noFrameRetry = firstYuyvIndex()
             Log.d("meidui", "🔌 [OTG] ${requestedWidth}x${requestedHeight} 已知 MJPEG 谈不拢 → 直接用 YUYV 开流")
         }
@@ -313,19 +338,26 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
      * 这个偏低的值还会被回填进能力快照、再被码率公式吃进去（2000×√(20/30)=1633kbps），一路错下去。
      * 所以等画面稳了单独采一段：只数这一段窗口内的增量，除以窗口长度。
      */
-    private fun scheduleFpsSample(camera: UVCCamera) {
+    private fun scheduleFpsSample(camera: UVCCamera, round: Int = 1) {
         val handler = uvcHandler ?: return
         val startCount = frameCbCount
         handler.postDelayed({
             if (!capturing || !streamRunning || uvcCamera !== camera) return@postDelayed
             val delta = frameCbCount - startCount
             val fps = (delta * 1000 / FPS_SAMPLE_MS).toInt()
-            if (fps <= 0) return@postDelayed
-            val changed = fps != measuredFps
-            measuredFps = fps
-            Log.d("meidui", "🔌 [OTG] 📏 稳态实测：${FPS_SAMPLE_MS}ms内${delta}帧 → ${fps}fps " +
-                    "@${frameWidth}x${frameHeight}")
-            if (changed) dumpCapabilitiesLocked(camera)   // 帧率变了才重推能力（码率上限跟着它算）
+            if (fps > measuredFps) {
+                measuredFps = fps
+                Log.d("meidui", "🔌 [OTG] 📏 实测第${round}轮：${FPS_SAMPLE_MS}ms内${delta}帧 → ${fps}fps" +
+                        " @${frameWidth}x${frameHeight}（取各轮最大）")
+            } else {
+                Log.d("meidui", "🔌 [OTG] 📏 实测第${round}轮：${fps}fps（未超过已记录的 ${measuredFps}fps）")
+            }
+            if (round < FPS_SAMPLE_ROUNDS) {
+                scheduleFpsSample(camera, round + 1)
+            } else {
+                Log.d("meidui", "🔌 [OTG] 📏 ${frameWidth}x${frameHeight} 采集能力定为 ${measuredFps}fps（${FPS_SAMPLE_ROUNDS}轮最大）")
+                dumpCapabilitiesLocked(camera)   // 定了才推能力（码率上限跟着它算）
+            }
         }, FPS_SAMPLE_MS)
     }
 
@@ -387,22 +419,42 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val w = target?.width ?: requestedWidth
         val h = target?.height ?: requestedHeight
 
-        // 该档设备声明的 fps 上限（多数设备/版本这里是 null —— 见 PROBE_MAX_FPS 的说明）
+        // ⭐ 帧率必须**精确请求**，不能给一个宽区间。
+        //   libuvc 是在 [min,max] 里遍历帧描述符取第一个命中的；写 min=1 等于"什么都行"，
+        //   于是永远挑中设备默认那档（一般 30），设备就算有 120fps 的描述符也轮不到它。
+        //   要 120 就得请求 min=max=120。设备没有该帧率时协商会失败，由下面的兜底放宽区间重试。
         val declaredFps = try { target?.fps?.maxOrNull()?.toInt() ?: 0 } catch (_: Exception) { 0 }
-        val wantMaxFps = if (declaredFps > 0) {
-            minOf(maxOf(requestedFps, 1), declaredFps)     // 设备报了就按它的上限，别超
-        } else {
-            maxOf(requestedFps, PROBE_MAX_FPS)             // 设备没报 → 往高了要，实测能到多少算多少
+        val exactFps = when {
+            requestedFps > 0 -> requestedFps                       // PC 指定了就照办（含 120）
+            declaredFps > 0  -> declaredFps
+            else             -> PROBE_MAX_FPS
         }
 
         camera.setFrameCallback(null, 0)
         try { camera.stopPreview() } catch (_: Exception) {}
-        camera.setPreviewSize(w, h, MIN_FPS, wantMaxFps, frameFormat, bandwidth)
+        try {
+            camera.setPreviewSize(w, h, exactFps, exactFps, frameFormat, bandwidth)
+            Log.d("meidui", "🔌 [OTG] 帧率精确请求 ${exactFps}fps @${w}x${h}" +
+                    (if (declaredFps > 0) "（设备声明${declaredFps}fps）" else "（设备未声明fps）"))
+        } catch (e: Exception) {
+            // 该档没有这个帧率 → 放宽区间让设备自己挑，并把实情打出来
+            Log.d("meidui", "🔌 [OTG] ⚠️ ${exactFps}fps 该档不支持(${e.message}) → 放宽到 ${MIN_FPS}~${exactFps} 让设备自选")
+            camera.setPreviewSize(w, h, MIN_FPS, exactFps, frameFormat, bandwidth)
+        }
         // ⭐ 关键修复：挂哑预览窗口，否则 native startPreview 因无窗口不起流线程 → 无帧
         camera.setPreviewDisplay(ensureDummySurface(w, h))
         camera.setFrameCallback(frameCallback, UVCCamera.PIXEL_FORMAT_NV21)
         camera.startPreview()
+
+        // 协商完成，读设备真正给的帧率（权威值，优先于后面的实测估算）
+        negotiatedFps = readNegotiatedFps(camera)
+        if (negotiatedFps > 0) {
+            Log.d("meidui", "🔌 [OTG] ✅ 协商帧率=${negotiatedFps}fps（取自 getPreviewSize 的 UVC 帧间隔，非估算）")
+        } else {
+            Log.d("meidui", "🔌 [OTG] ⚠️ 库未给出协商帧率（getCurrentFrameRate/fps/intervals 都为空）→ 只能靠实测")
+        }
         val fmtName = if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"
+        activeFormatName = fmtName
         Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=$fmtName bw=$bandwidth")
         Log.d("meidui", "🔌 [OTG] 帧率协商区间=${MIN_FPS}~${wantMaxFps}fps" +
                 (if (declaredFps > 0) "（设备声明该档上限${declaredFps}fps）"
@@ -458,8 +510,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         try {
             camera.updateCameraParams()   // 读能力位掩码 + 各控制项的绝对 min/max（百分比映射的基础）
             lines += "OTG设备: ${currentDeviceName ?: "?"}"
-            lines += "协商: ${frameWidth}x${frameHeight} (请求${requestedWidth}x${requestedHeight}@${requestedFps}fps 策略=${strategies()[minOf(noFrameRetry, strategies().size - 1)].name})" +
-                    if (measuredFps > 0) " 实测${measuredFps}fps" else ""
+            lines += "协商: ${frameWidth}x${frameHeight}@${activeFormatName}" +
+                    (if (negotiatedFps > 0) " 协商${negotiatedFps}fps" else " 协商fps未知") +
+                    (if (measuredFps > 0) " 实测${measuredFps}fps" else "") +
+                    " (请求${requestedWidth}x${requestedHeight}@${requestedFps}fps)"
 
             fun sizesOf(fmt: Int, name: String) {
                 val s = try {
@@ -468,11 +522,15 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                 } catch (_: Exception) { null }
                 // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，记 0）
                 s?.forEach { sz ->
-                    // 设备声明的 fps；没声明时，若这一档正是当前在跑的档位就用实测值填上
-                    val declared = sz.fps?.maxOrNull()?.toInt() ?: 0
-                    val maxFps = if (declared > 0) declared
-                                 else if (sz.width == frameWidth && sz.height == frameHeight) measuredFps
-                                 else 0
+                    // fps 三级取值：设备声明 > （当前档位的）协商值 > （当前档位的）实测值
+                    val declared = try { sz.fps?.maxOrNull()?.toInt() ?: 0 } catch (_: Exception) { 0 }
+                    val isCurrent = sz.width == frameWidth && sz.height == frameHeight
+                    val maxFps = when {
+                        declared > 0 -> declared
+                        isCurrent && negotiatedFps > 0 -> negotiatedFps
+                        isCurrent -> measuredFps
+                        else -> 0
+                    }
                     // 同尺寸两种格式都支持时只保留一条（取 fps 上限更高的），PC 档位列表按尺寸去重
                     val exist = sizes.indexOfFirst { it.width == sz.width && it.height == sz.height }
                     if (exist < 0) {
@@ -544,6 +602,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             deviceName = currentDeviceName ?: "",
             width = frameWidth,
             height = frameHeight,
+            format = activeFormatName,
             sizes = sizesWithKbps,
             controls = controls,
             version = System.currentTimeMillis()
@@ -638,18 +697,51 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         return true
     }
 
-    // 抗频闪读写走反射：该接口在 libuvc 各分支命名/存在与否不统一，用反射避免编译期绑死
-    private fun readPowerline(camera: UVCCamera): Int? = try {
-        camera.javaClass.getMethod("getPowerlineFrequency").invoke(camera) as? Int
-    } catch (_: Throwable) { null }
+    // 抗频闪：AUSBC 3.5.3 的 UVCCamera 确有 get/setPowerlineFrequency（已反编译核实），直连即可
+    private fun readPowerline(camera: UVCCamera): Int? =
+        try { camera.powerlineFrequency } catch (_: Throwable) { null }
 
     private fun writePowerline(camera: UVCCamera, value: Int) {
-        try {
-            camera.javaClass.getMethod("setPowerlineFrequency", Int::class.javaPrimitiveType)
-                .invoke(camera, value)
-        } catch (t: Throwable) {
-            Log.d("meidui", "🔌 [OTG控制] powerline 该库版本无接口: ${t.message}")
+        try { camera.powerlineFrequency = value } catch (t: Throwable) {
+            Log.d("meidui", "🔌 [OTG控制] powerline 下发失败: ${t.message}")
         }
+    }
+
+    /**
+     * ⭐ 读**已协商**的帧率 —— 这才是权威值，不是估出来的。
+     *
+     * 为什么不能从 `getSupportedSizeList()` 拿：反编译 AUSBC 3.5.3 确认，解析器虽然认
+     * `min_fps`/`max_fps` 字段，但本机 native 对这台设备只吐了简化 JSON
+     * （`{"formats":[{"index":1,"type":6,"size":["320x240","640x480",...]}]}`，纯宽高无帧率），
+     * 所以枚举阶段 `Size.fps` 必然是 null —— 不是没读，是这层压根没给。
+     *
+     * 而 `getPreviewSize()` 返回的是**协商完成后**的 Size，native 手里有 `dwFrameInterval`，
+     * 三条路依次试：`getCurrentFrameRate()` → `fps[]` 取最大 → `intervals[]` 换算（10^7/间隔，UVC 标准 100ns 单位）。
+     */
+    private fun readNegotiatedFps(camera: UVCCamera): Int {
+        val size = try { camera.previewSize } catch (_: Throwable) { null } ?: return 0
+
+        // ① 库自己算好的当前帧率
+        try {
+            val f = size.getCurrentFrameRate()
+            if (f > 0.5f) return Math.round(f)
+        } catch (_: Throwable) { /* unknown frame rate or not ready */ }
+
+        // ② fps[] 数组（需要库先 updateFrameRate 才会填）
+        try {
+            val maxFps = size.fps?.maxOrNull()?.toInt() ?: 0
+            if (maxFps > 0) return maxFps
+        } catch (_: Throwable) {}
+
+        // ③ 原始帧间隔 intervals[]（UVC dwFrameInterval，100ns 单位）→ 最小间隔 = 最高帧率
+        try {
+            val field = size.javaClass.getField("intervals")
+            val arr = field.get(size) as? IntArray
+            val minInterval = arr?.filter { it > 0 }?.minOrNull() ?: 0
+            if (minInterval > 0) return Math.round(10_000_000f / minInterval)
+        } catch (_: Throwable) {}
+
+        return 0
     }
 
     /** 在 uvc 线程同步执行（stopCapture/dispose 要求返回前帧已停） */

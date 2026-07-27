@@ -619,6 +619,7 @@ class WebSocketManager private constructor() {
                 "deviceName" to caps.deviceName,
                 "width" to caps.width,
                 "height" to caps.height,
+                "format" to caps.format,       // 当前实际采集格式 MJPEG/YUYV
                 "version" to caps.version,
                 // 当前生效的推送帧率/码率：设备侧才是真值（初始值来自后端下发的配置），
                 // PC 面板照它显示，不要自己猜一个缺省

@@ -17,7 +17,7 @@ import com.fz.yqlandroid.manager.WebRTCManager
  * 协议（PC → Android，走 `/topic/device/{id}/config` 的 CONFIG_UPDATE）：
  * | ptype | 载荷 | 含义 |
  * |---|---|---|
- * | `otg_resolution` | `{width,height,fps?}` | 档位=分辨率，取自能力快照 sizes 列表 |
+ * | `otg_resolution` | `{width,height,fps?,format?}` | 档位=分辨率；fps 为**精确**请求值；format 0=自动/1=MJPEG/2=YUYV |
  * | `otg_fps`        | `{fps}`              | 推送帧率（真实值，**不做 ÷4**，与老通道的历史怪协议解耦） |
  * | `otg_bitrate`    | `{bitrate}`          | 码率百分比 0~100 |
  * | `otg_ctrl`       | `{key,value}`        | 硬件可调项，key/值域见能力快照 controls |
@@ -50,7 +50,9 @@ class OtgConfigRouter(private val mgr: WebRTCManager) {
                     return true
                 }
                 val fps = (config["fps"] as? Number)?.toInt() ?: 0
-                mgr.applyOtgResolution(w, h, fps)
+                // format: 0=自动 / 1=MJPEG / 2=YUYV（缺省 0，老版本 PC 不带这个字段）
+                val format = (config["format"] as? Number)?.toInt() ?: 0
+                mgr.applyOtgResolution(w, h, fps, format)
             }
 
             "otg_fps" -> {

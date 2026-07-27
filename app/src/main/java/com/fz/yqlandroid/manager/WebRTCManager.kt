@@ -601,11 +601,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      *
      * @param fps 该分辨率的目标采集帧率；<=0 表示沿用当前值（PC 不指定时）
      */
-    fun applyOtgResolution(width: Int, height: Int, fps: Int) {
+    fun applyOtgResolution(width: Int, height: Int, fps: Int, format: Int = 0) {
         if (!usingOtgCamera) {
             Log.d("meidui", "🔌 [OTG档位] 当前不是 OTG 模式，忽略 ${width}x${height}")
             return
         }
+        otgCapturer()?.preferredFormat = format
         // ⭐ 采集帧率封顶 60：小分辨率的 UVC 采集上限常见 120fps，但推流侧编码器最高 60，
         //   真按 120 采集只是白烧电和发热（对齐 iOS「采集60·推30」的思路）。
         val capFps = (if (fps > 0) fps else maxOf(1, currentFps)).coerceIn(1, OTG_MAX_CAPTURE_FPS)
@@ -631,8 +632,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         forceKeyframe()
     }
 
-    /** OTG 采集帧率上限：推流侧编码器最高 60，采集再高只是白发热 */
-    private val OTG_MAX_CAPTURE_FPS = 60
+    /**
+     * OTG 采集帧率硬上限。
+     *
+     * 推流侧编码器最高 60，所以采到 120 有一半推不出去、纯属发热——但**要不要采**是用户的选择
+     * （比如就想验证这台摄像头到底能不能跑 120），面板上会把"采集/推流"两个上限分开写清楚。
+     * 这里只挡明显离谱的值。
+     */
+    private val OTG_MAX_CAPTURE_FPS = 120
 
     /** 把 UVC 实际协商出的分辨率同步进 currentWidth/Height，并按新尺寸重算码率 */
     private fun syncOtgNegotiatedSize() {
