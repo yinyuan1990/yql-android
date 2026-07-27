@@ -59,6 +59,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         private const val PROBE_MAX_FPS = 60
         // 开流后多久没帧就切下一策略（ms）
         private const val NO_FRAME_TIMEOUT_MS = 2500L
+
+        // 稳态帧率采样窗口（ms）。等画面稳了再采，避开相机预热那段空窗
+        private const val FPS_SAMPLE_MS = 3000L
     }
 
     // ⭐ 开流策略：native「开流成功但无帧」时依次降级重试（不同摄像头/OTG供电下兼容性差异大）
@@ -111,6 +114,11 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     /** 当前协商档位的**实测**帧率（设备不声明 fps 时唯一的真实来源），随能力快照上报 PC */
     @Volatile private var measuredFps = 0
+
+    /** 首次开流是否已按设备自身列表选定档位（之后的切档才按 PC 请求就近选） */
+    @Volatile private var initialSizePicked = false
+
+    private fun codecName(): String = com.fz.yqlandroid.manager.H265Support.effectiveCodec
 
     // MARK: - VideoCapturer 接口
 
@@ -270,11 +278,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             if (!capturing || uvcCamera !== camera) return@Runnable
             if (frameCbCount > 0) {
                 noFrameRetry = 0   // 成功出帧：重置档位，后续切档/重开从最优策略开始
-                // ⭐ 实测帧率：设备不声明 fps 时，这是唯一能拿到真实值的办法
-                measuredFps = (frameCbCount * 1000 / NO_FRAME_TIMEOUT_MS).toInt()
                 Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 " +
-                        "${frameWidth}x${frameHeight} → 实测${measuredFps}fps")
+                        "${frameWidth}x${frameHeight}")
                 dumpCapabilitiesLocked(camera)   // 出帧确认后刷新能力快照（协商尺寸/当前值已最终定）
+                scheduleFpsSample(camera)        // 再等画面稳下来单独测一次帧率
                 return@Runnable
             }
             noFrameRetry++
@@ -296,6 +303,30 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         }
         noFrameWatchdog = r
         handler.postDelayed(r, NO_FRAME_TIMEOUT_MS)
+    }
+
+    /**
+     * ⭐ 稳态帧率采样。
+     *
+     * 为什么不复用无帧看门狗那 2.5s 的计数：那个窗口是从**开流那一刻**起算的，
+     * 相机预热的头几百毫秒一帧不出，53 帧 ÷ 2.5s 会算成 21fps，而 WebRTC 侧 `capFps` 实测 29~31。
+     * 这个偏低的值还会被回填进能力快照、再被码率公式吃进去（2000×√(20/30)=1633kbps），一路错下去。
+     * 所以等画面稳了单独采一段：只数这一段窗口内的增量，除以窗口长度。
+     */
+    private fun scheduleFpsSample(camera: UVCCamera) {
+        val handler = uvcHandler ?: return
+        val startCount = frameCbCount
+        handler.postDelayed({
+            if (!capturing || !streamRunning || uvcCamera !== camera) return@postDelayed
+            val delta = frameCbCount - startCount
+            val fps = (delta * 1000 / FPS_SAMPLE_MS).toInt()
+            if (fps <= 0) return@postDelayed
+            val changed = fps != measuredFps
+            measuredFps = fps
+            Log.d("meidui", "🔌 [OTG] 📏 稳态实测：${FPS_SAMPLE_MS}ms内${delta}帧 → ${fps}fps " +
+                    "@${frameWidth}x${frameHeight}")
+            if (changed) dumpCapabilitiesLocked(camera)   // 帧率变了才重推能力（码率上限跟着它算）
+        }, FPS_SAMPLE_MS)
     }
 
     /** 造/复用一个自动排空的 ImageReader 哑预览窗口（尺寸变了才重建）。必须持续排空，
@@ -322,17 +353,37 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     }
 
     private fun negotiateAndStart(camera: UVCCamera, frameFormat: Int, bandwidth: Float): Pair<Int, Int> {
-        // 该格式支持的分辨率里选与请求值最接近的（按面积差 + 宽高比差）
         val sizes = try {
             camera.getSupportedSizeList(frameFormat)?.filterIsInstance<com.jiangdg.utils.Size>()
+                ?.filter { it.width > 0 && it.height > 0 }
         } catch (_: Exception) { null }
-        val target = sizes
-            ?.filter { it.width > 0 && it.height > 0 }
-            ?.minByOrNull { s ->
+
+        // ⭐ 首次开流：**不理会 WebRTC 传进来的尺寸**。
+        //   那个尺寸来自自带摄像头的 ladder（如 STANDARD=1024x768），UVC 设备可能压根没有这一档，
+        //   拿它去"就近协商"既莫名其妙（叠显上写着"请求1024x768"）、在大分辨率设备上还会选偏。
+        //   OTG 的初始档位应当从**设备自己的列表**里挑：取编码器吃得下的最大一档。
+        val target = if (!initialSizePicked) {
+            val best = sizes
+                ?.filter { EncoderSizeLimits.isEncodable(codecName(), it.width, it.height) }
+                ?.maxByOrNull { it.width.toLong() * it.height }
+                ?: sizes?.maxByOrNull { it.width.toLong() * it.height }
+            if (best != null) {
+                Log.d("meidui", "🔌 [OTG] 首次开流：忽略上层传来的 ${requestedWidth}x${requestedHeight}" +
+                        "（那是自带摄像头档位），改用设备自身最大可编码档 ${best.width}x${best.height}")
+                requestedWidth = best.width
+                requestedHeight = best.height
+                initialSizePicked = true
+            }
+            best
+        } else {
+            // 后续切档（PC 发 otg_resolution）：按请求值就近选（面积差 + 宽高比差）
+            sizes?.minByOrNull { s ->
                 val areaDiff = Math.abs(s.width.toLong() * s.height - requestedWidth.toLong() * requestedHeight)
                 val ratioDiff = Math.abs(s.width.toFloat() / s.height - requestedWidth.toFloat() / requestedHeight)
                 areaDiff + (ratioDiff * 1_000_000).toLong()
             }
+        }
+
         val w = target?.width ?: requestedWidth
         val h = target?.height ?: requestedHeight
 
@@ -383,6 +434,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         releaseDummySurface()
         defaultControlValues.clear()
         mjpegBlacklist.clear()
+        initialSizePicked = false
         UvcCapabilityStore.clear()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
     }

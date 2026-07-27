@@ -634,6 +634,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     /** OTG 采集帧率上限：推流侧编码器最高 60，采集再高只是白发热 */
     private val OTG_MAX_CAPTURE_FPS = 60
 
+    /** 把 UVC 实际协商出的分辨率同步进 currentWidth/Height，并按新尺寸重算码率 */
+    private fun syncOtgNegotiatedSize() {
+        val caps = com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.caps.value ?: return
+        if (caps.width <= 0 || caps.height <= 0) return
+        if (caps.width == currentWidth && caps.height == currentHeight) return
+        Log.d("meidui", "🔌 [OTG] 采集实际协商 ${caps.width}x${caps.height}（原记 ${currentWidth}x${currentHeight}）→ 同步并重算码率")
+        currentWidth = caps.width
+        currentHeight = caps.height
+        applyOtgBitrate()
+        setEncodingParameters()
+    }
+
     /** OTG 码率百分比（0~100）。天花板来自 [OtgBitratePlan]，与自带摄像头的 ladder 无关 */
     private var otgQualityPercent: Int = 100
 
@@ -704,7 +716,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             com.fz.yqlandroid.manager.uvc.UvcVideoCapturer(context).also { cap ->
                 // ⭐ 第五十章：UVC 能力枚举完 → 主动推给 PC（PC 据此动态生成 OTG 调节面板）。
                 //   PC 也可随时发 otg_get_caps 再要一次（面板打开/设备上线/切换账号）。
-                cap.onCapsUpdated = { WebSocketManager.instance.sendOtgCaps() }
+                cap.onCapsUpdated = {
+                    // ⭐ 采集器可能自己定了档（首次开流按设备列表挑最大可编码档，
+                    //   而不是用自带摄像头 ladder 传下来的尺寸）——把实际协商值同步回来，
+                    //   否则码率天花板会按一个设备根本没有的尺寸去算。
+                    syncOtgNegotiatedSize()
+                    WebSocketManager.instance.sendOtgCaps()
+                }
                 otgRouter.onCapsRequested = { WebSocketManager.instance.sendOtgCaps() }
             }
         } else {
