@@ -456,9 +456,6 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val fmtName = if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"
         activeFormatName = fmtName
         Log.d(TAG, "UVC开流: 请求${requestedWidth}x${requestedHeight}@${requestedFps} → 协商${w}x${h} format=$fmtName bw=$bandwidth")
-        Log.d("meidui", "🔌 [OTG] 帧率协商区间=${MIN_FPS}~${wantMaxFps}fps" +
-                (if (declaredFps > 0) "（设备声明该档上限${declaredFps}fps）"
-                 else "（设备未声明该档fps → 按${PROBE_MAX_FPS}探测，实际到多少看下面的实测值）"))
         // ⭐ 第五十章：请求值与协商值不一致要看得见 —— PC 面板选了 160x120，
         //   但该格式的支持列表里没有这一档时，这里会就近落到别的尺寸（PC 显示的档位就"没生效"）。
         if (w != requestedWidth || h != requestedHeight) {
