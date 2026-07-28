@@ -587,11 +587,15 @@ fun StreamingScreen(
                     Divider(color = Color.White, thickness = 1.dp)
                     
                     // 清晰度档位选择（仅显示，数据从后端同步）
+                    // ⭐ §53.9 布局修复：5 档挤不下、最后一个「超高帧」被裁掉。
+                    //   原因是各项按内容自然宽度排列 + 12dp 间距 + 18dp 外边距，窄屏放不下又不会换行。
+                    //   改为**五项等分宽度**（每项 weight(1f)）并收紧间距/外边距——一行永远放得下，
+                    //   不依赖换行、也不会随机裁掉最后一项（比换行更适合这个紧凑面板）。
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 18.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            .padding(horizontal = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         // ⭐ 对齐 iOS 5 档（ContentView 顺序 low→standard→high→p4k→ultra）：
                         //   此前少画「超低网」，服务器下发 type=low 时 UI 无处高亮。
@@ -608,6 +612,7 @@ fun StreamingScreen(
                                 name = name,
                                 isSelected = selectedProfile == name,
                                 unlocked = memberActivated && memberLevel >= requiredLevel,
+                                modifier = Modifier.weight(1f),   // 五档等分，窄屏也放得下
                                 onClick = { } // 仅显示，不操作
                             )
                         }
@@ -777,35 +782,25 @@ private fun QualityRadioItem(
     isSelected: Boolean,
     // ⭐ §53.9：该档位是否已随会员开通 → 整项绿色背景标注
     unlocked: Boolean = false,
+    // ⭐ §53.9 布局修复：调用方传 weight(1f) 让 5 档等分宽度（窄屏也放得下，不再裁掉最后一项）
+    modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(4.dp))
             .background(if (unlocked) Color(0xFF4CAF50).copy(alpha = 0.35f) else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(horizontal = 4.dp, vertical = 2.dp),
+            .padding(horizontal = 2.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
+        // 等分后内容居中（圆点与文字间留 3dp），视觉更整齐
+        horizontalArrangement = Arrangement.spacedBy(3.dp, Alignment.CenterHorizontally)
     ) {
-        // 圆圈
+        // 圆圈（等分布局下收窄，给文字留位置）
         Box(
-            modifier = Modifier
-                .size(15.dp)
-                .clip(CircleShape)
-                .background(Color.Transparent)
-                .then(
-                    Modifier.padding(0.dp) // placeholder for border
-                ),
+            modifier = Modifier.size(12.dp),
             contentAlignment = Alignment.Center
         ) {
-            // 外圈
-            Box(
-                modifier = Modifier
-                    .size(15.dp)
-                    .clip(CircleShape)
-                    .background(Color.Transparent)
-            )
             // 选中内圈
             if (isSelected) {
                 Box(
@@ -821,7 +816,10 @@ private fun QualityRadioItem(
             text = name,
             fontSize = 10.sp,
             color = Color(0xFF1A1A1A),
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+            // 等分宽度下强制单行：档位名都是 2~3 个字，绝不允许折行把这一排撑高
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
