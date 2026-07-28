@@ -600,7 +600,10 @@ data class LoginResponse(
     // ⭐ P2P 配置（与iOS一致，登录时下发）
     val iceServers: List<IceServer>? = null,   // STUN/TURN 列表
     val forceRelay: Boolean? = null,           // 强制 TURN 中继
-    val maxP2PViewers: Int? = null             // 最大 P2P 观看端数
+    val maxP2PViewers: Int? = null,            // 最大 P2P 观看端数
+    // ⭐ §53.4.4：编码默认值改由总后台配置（默认 h265，不支持时客户端自动回退 h264）
+    val videoCodecP2p: String? = null,         // "h264" | "h265"
+    val videoCodecSrs: String? = null          // "h264" | "h265"
 )
 
 /**

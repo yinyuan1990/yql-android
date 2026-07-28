@@ -56,6 +56,42 @@ class WebSocketManager private constructor() {
         private set
     @Volatile var lastViewerHeartbeatFps: Int = 0
         private set
+
+    // ⭐ §53.2 PC 在线注册表（PC_PRESENCE 心跳，与画面无关）。
+    //   在线 ≠ 在看：「在线但没出画面」是本轮那类故障的现场特征，必须能分开显示。
+    //   localIps：§53.4 推流前判「同不同 WiFi」用（比 /24 网段，不必先建 WebRTC 会话看 ICE）。
+    data class PcPresence(val lastSeenMs: Long, val viewing: Boolean, val h265Recv: Boolean,
+                          val kernel: String, val localIps: List<String>)
+    private val pcPresence = HashMap<String, PcPresence>()
+    @Volatile var lastPcPresenceAtMs: Long = 0
+        private set
+
+    /** 在线 PC 台数（>4s 无心跳视为离线） */
+    fun onlinePcCount(): Int = synchronized(pcPresence) {
+        val cutoff = System.currentTimeMillis() - 4000
+        pcPresence.entries.removeAll { it.value.lastSeenMs < cutoff }
+        pcPresence.size
+    }
+
+    /** ⭐ §53.4：决策用的在线观看端快照（先剔除超时的），供 SessionPolicy 判同网段/H265 能力 */
+    fun pcPresenceSnapshot(): Map<String, PcPresence> = synchronized(pcPresence) {
+        val cutoff = System.currentTimeMillis() - 4000
+        pcPresence.entries.removeAll { it.value.lastSeenMs < cutoff }
+        HashMap(pcPresence)
+    }
+
+    /** 在线 PC 中是否存在**收不了 H265** 的内核（网页内核）→ SRS 编码需降 H264（§53.5） */
+    fun anyViewerCannotRecvH265(): Boolean = synchronized(pcPresence) {
+        val cutoff = System.currentTimeMillis() - 4000
+        pcPresence.entries.removeAll { it.value.lastSeenMs < cutoff }
+        pcPresence.values.any { !it.h265Recv }
+    }
+
+    /** 退登录/切设备时清空，避免上一台设备的观看端状态串到下一台 */
+    fun clearPcPresence() {
+        synchronized(pcPresence) { pcPresence.clear() }
+        lastPcPresenceAtMs = 0
+    }
     
     // WebSocket
     private var webSocket: WebSocket? = null
@@ -164,6 +200,9 @@ class WebSocketManager private constructor() {
     
     fun disconnect() {
         isManualDisconnect = true  // 🔥 标记为手动断开
+        // ⭐ §53.4：手动断开 = 退登录/切设备 → 清空观看端注册表与本次会话定案，
+        //   避免上一台设备/上一个账号的观看端状态串到下一次推流决策里。
+        SessionPolicy.reset()
         statusJob?.cancel()
         heartbeatJob?.cancel()
         reconnectJob?.cancel()
@@ -372,6 +411,40 @@ class WebSocketManager private constructor() {
                     lastViewerHeartbeatAtMs = System.currentTimeMillis()
                     lastViewerHeartbeatFps = (json["fps"] as? Number)?.toInt() ?: 0
                 }
+
+                // ⭐ §53.2 PC 在线心跳（每秒一条，**与有没有画面无关**）。
+                //   有它才能把「PC 在线」和「PC 在看」分成两个状态——以前只有拉流心跳，
+                //   PC 登录着但没画面时显示「PC未连接」，把故障现象说成了对方没上线。
+                //   h265Recv：PC 内核能否接收 H265（网页内核=Chromium 134 收 H265 必黑屏），
+                //   供 §53.5 编码仲裁（SRS 模式按最弱观看端降 H264）。
+                "PC_PRESENCE" -> {
+                    val pcId = json["fromDevice"] as? String ?: ""
+                    if (pcId.isNotEmpty()) {
+                        lastPcPresenceAtMs = System.currentTimeMillis()
+                        val viewing = json["viewing"] as? Boolean ?: false
+                        val h265Recv = json["h265Recv"] as? Boolean ?: true   // 旧版 PC 视为能收
+                        val kernel = json["kernel"] as? String ?: "unknown"
+                        val localIps = (json["localIps"] as? String ?: "")
+                            .split(",").filter { it.isNotBlank() }
+                        var inputChanged = false
+                        var isNew = false
+                        synchronized(pcPresence) {
+                            val old = pcPresence[pcId]
+                            isNew = old == null
+                            pcPresence[pcId] = PcPresence(System.currentTimeMillis(), viewing,
+                                                          h265Recv, kernel, localIps)
+                            // 只有"会改变决策"的字段变了才评估重新协商，避免每秒心跳都跑一遍
+                            inputChanged = isNew || old?.h265Recv != h265Recv || old?.localIps != localIps
+                            if (isNew) {
+                                Log.d("meidui", "🖥 [PC在线] $pcId 上线（内核=$kernel 能收H265=$h265Recv 在看=$viewing 网段=$localIps）")
+                            }
+                        }
+                        if (inputChanged) {
+                            SessionPolicy.onViewerInputChanged(
+                                if (isNew) "PC上线($pcId)" else "PC网络/能力变化($pcId)")
+                        }
+                    }
+                }
             }
             
             // 🔥 检查cmd字段（可能在任何type的消息中）
@@ -559,6 +632,8 @@ class WebSocketManager private constructor() {
             "connectMode" to connectMode,
             // ⭐ H265：P2P 实际生效编码（"h264"/"h265"），PC 据此选择解码管线（与 iOS 一致）
             "videoCodec" to H265Support.effectiveCodec,
+            // ⭐ §53.4.5「互相监督」：本次链路/编码是**怎么定下来的**（人话），PC 顶栏直接显示
+            "connectReason" to SessionPolicy.connectReason,
             "p2pViewerCount" to P2PManager.currentViewerCount,
             "kbps" to publishingKbps,
             "fps" to publishingFps,

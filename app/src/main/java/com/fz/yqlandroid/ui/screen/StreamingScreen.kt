@@ -106,7 +106,8 @@ fun StreamingScreen(
     var currentFps by remember { mutableIntStateOf(0) }
     var currentKbps by remember { mutableIntStateOf(0) }
     var currentCapFps by remember { mutableIntStateOf(0) }  // ⭐ 相机实际采集帧率（左上角显示）
-    var pcConnected by remember { mutableStateOf(false) }   // ⭐ PC 观看端是否已连接（左上角显示）
+    var pcConnected by remember { mutableStateOf(false) }   // ⭐ PC 观看端是否在看（有画面）
+    var pcOnlineCount by remember { mutableIntStateOf(0) }  // ⭐ §53.2 在线 PC 台数（与有没有画面无关）
     var reconnecting by remember { mutableStateOf(false) }  // ⭐ 切网重连中（左上角显示"网络切换重连中…"）
     
     // 右侧面板 - 显示同步数据（后端下发 + WebRTC实际值）
@@ -136,25 +137,19 @@ fun StreamingScreen(
         webRTCManager.onPcConnectedUpdate = { connected ->
             pcConnected = connected
         }
+        // ⭐ §53.2 在线 PC 台数（PC_PRESENCE 心跳，与有没有画面无关）
+        webRTCManager.onPcOnlineUpdate = { count ->
+            pcOnlineCount = count
+        }
         // ⭐ 切网重连中：拆会话+HANGUP 后等 PC 重连，PC 心跳恢复后回调 false
         webRTCManager.onReconnectingUpdate = { r ->
             reconnecting = r
         }
-        // ⭐ §52.6 与观看端不在同一 WiFi：P2P 只有局域网直连才有优势，跨网走中继全面劣于 SRS。
-        //   停推流 → 把下次登录的默认线路改成多人线路 → 退回登录页并提示。
+        // ⭐ §53.4-定稿：§52.6 的「非同 WiFi → 退回登录页让用户改线路」已废弃。
+        //   线路现在由系统在推流前按网络关系自动决定（SessionPolicy），跨网直接走多人线路，
+        //   用户什么都不用做。这个回调已无人触发，保留空实现仅为回滚方便。
         webRTCManager.onNotSameWifi = {
-            webRTCManager.stopPublish()
-            keepAliveManager.stop()
-            WebSocketManager.instance.disconnect()
-            context.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
-                .edit()
-                .putString("selected_connect_mode", "srs")
-                .putString("connect_mode", "srs")
-                .apply()
-            android.widget.Toast.makeText(
-                context, "不在同一 WiFi，请选择「多人线路」", android.widget.Toast.LENGTH_LONG
-            ).show()
-            onLogout()
+            android.util.Log.d("meidui", "ℹ️ [线路] 收到已废弃的 onNotSameWifi（§53.4 改为自动重新协商），忽略")
         }
         
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
@@ -626,19 +621,32 @@ fun StreamingScreen(
                     color = Color.White,
                     fontSize = 12.sp
                 )
-                // ⭐ PC 观看端连接状态（绿=PC 已连接出画面，灰=无 PC 观看）
+                // ⭐ §53.2：「在线」与「在看」拆成两段，别再用一个灯表达两件事。
+                //   绿=在线且在看 / 橙=在线但没出画面（→ 查拉流侧，不是账号或网络没登录）/ 灰=没上线。
+                //   以前只看拉流心跳（PC 只在有画面时才发），PC 登录着但没画面会显示「无PC」，
+                //   把故障现象说成了对方没上线，误导排障方向。
                 if (isStreaming) {
+                    val pcDotColor = when {
+                        pcConnected -> Color(0xFF4CAF50)
+                        pcOnlineCount > 0 -> Color(0xFFFF9800)
+                        else -> Color(0xFF9E9E9E)
+                    }
+                    val pcText = when {
+                        pcConnected -> if (pcOnlineCount > 1) "PC在线·在看×$pcOnlineCount" else "PC在线·在看"
+                        pcOnlineCount > 0 -> "PC在线·未出画面"
+                        else -> "无PC"
+                    }
                     Spacer(modifier = Modifier.width(8.dp))
                     Box(
                         modifier = Modifier
                             .size(8.dp)
                             .clip(CircleShape)
-                            .background(if (pcConnected) Color(0xFF4CAF50) else Color(0xFF9E9E9E))
+                            .background(pcDotColor)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = if (pcConnected) "PC已连" else "无PC",
-                        color = if (pcConnected) Color(0xFF4CAF50) else Color(0xFFBDBDBD),
+                        text = pcText,
+                        color = pcDotColor,
                         fontSize = 12.sp
                     )
                     // ⭐ 切网重连中（P2P）：过程可视化，PC 心跳恢复后自动消失

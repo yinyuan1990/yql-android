@@ -61,13 +61,9 @@ fun LoginScreen(
     var rememberPassword by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    // ⭐ 连接方式（与 iOS 登录页一致：用户手选、记住上次选择、覆盖后端下发）："srs" | "p2p"
-    var selectedConnectMode by remember { mutableStateOf("srs") }
-    // ⭐ H265：P2P编码二级选项（H264/H265，仅 P2P 选中时显示，逻辑在 H265Support.kt，与 iOS 一致）
-    // ⭐ 2026-07-11：默认 H265（设备不支持时 H265Support.decideForP2P 自动回退 H264）
-    var selectedCodec by remember { mutableStateOf("h265") }
-    // ⭐ SRS 编码（第四十九章）：与 P2P 独立记忆，默认 h264（SRS 服务器 6.0.184 已支持 H265）
-    var selectedCodecSrs by remember { mutableStateOf("h264") }
+    // ⭐ §53.4-定稿：线路（多人/单人）与编码（H264/H265）已不在登录页选——
+    //   线路由 SessionPolicy 在推流前按"与观看端是否同 WiFi"决定，编码取总后台默认值。
+    //   登录页只保留下面的摄像头模式。
     // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android，记住上次选择
     var selectedCameraMode by remember { mutableStateOf("builtin") }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
@@ -91,12 +87,6 @@ fun LoginScreen(
             password = savedPassword
             rememberPassword = true
         }
-        // ⭐ 恢复上次选择的连接方式（与 iOS ConnectModeOption.lastSelected 一致，默认 SRS）
-        selectedConnectMode = prefs.getString("selected_connect_mode", "srs") ?: "srs"
-        // ⭐ H265：恢复上次选择的 P2P 编码（2026-07-11 默认改 H265，不支持自动回退 H264）
-        selectedCodec = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, "h265") ?: "h265"
-        // ⭐ SRS 编码（第四十九章）：默认 h264
-        selectedCodecSrs = prefs.getString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY_SRS, "h264") ?: "h264"
         // ⭐ 摄像头模式（第四十八章）：恢复上次选择，默认自带
         selectedCameraMode = prefs.getString("selected_camera_mode", "builtin") ?: "builtin"
         // ⭐ 强制更新检查（公共接口，失败放行不拦门）
@@ -285,82 +275,13 @@ fun LoginScreen(
                         color = Color(0xFFF0F0F0)
                     )
                     
-                    // ⭐ 连接方式选择（与 iOS 登录页一致：SRS / P2P 手选，记住上次选择）
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "连接方式",
-                            fontSize = 16.sp,
-                            color = Color(0xFF1A1A1A)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        // ⭐ 2026-07-11：SRS=多人线路、P2P=单人线路（仅改显示名，mode 值仍是 srs/p2p）
-                        listOf("srs" to "多人线路", "p2p" to "单人线路").forEach { (mode, label) ->
-                            val selected = selectedConnectMode == mode
-                            Box(
-                                modifier = Modifier
-                                    .padding(end = 8.dp)
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
-                                    .clickable { selectedConnectMode = mode }
-                                    .padding(horizontal = 16.dp, vertical = 6.dp)
-                            ) {
-                                Text(
-                                    text = label,
-                                    fontSize = 14.sp,
-                                    color = if (selected) Color.White else Color(0xFF666666)
-                                )
-                            }
-                        }
-                    }
+                    // ⭐ §53.4-定稿（2026-07-28）：原「连接方式(多人/单人线路)」与「H264/H265 编码」
+                    //   两组选项已移除。线路 = 推流前按"与观看端是否同 WiFi"自动决定（同 WiFi 才 P2P，
+                    //   否则 SRS）；编码 = 总后台配置（默认 H265，本机硬编或观看端内核不支持则回退 H264）。
+                    //   决策逻辑在 `manager/SessionPolicy.kt`（与 iOS 同构）。
+                    //   登录页只保留下面的「摄像头模式：自带 / 外接OTG」。
 
-                    // ⭐ 编码二级选项 H264/H265（第四十九章：P2P 与 SRS 都显示，各自独立记忆；SRT/单人=P2P 沿用旧逻辑）
-                    if (selectedConnectMode == "p2p" || selectedConnectMode == "srs") {
-                        val isP2PCodec = selectedConnectMode == "p2p"
-                        HorizontalDivider(
-                            modifier = Modifier.padding(start = 30.dp),
-                            color = Color(0xFFF0F0F0)
-                        )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = if (isP2PCodec) "单人编码" else "多人编码",
-                                fontSize = 16.sp,
-                                color = Color(0xFF1A1A1A)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            listOf("h264" to "H264", "h265" to "H265").forEach { (codec, label) ->
-                                val curCodec = if (isP2PCodec) selectedCodec else selectedCodecSrs
-                                val selected = curCodec == codec
-                                Box(
-                                    modifier = Modifier
-                                        .padding(end = 8.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
-                                        .clickable {
-                                            if (isP2PCodec) selectedCodec = codec else selectedCodecSrs = codec
-                                        }
-                                        .padding(horizontal = 16.dp, vertical = 6.dp)
-                                ) {
-                                    Text(
-                                        text = label,
-                                        fontSize = 14.sp,
-                                        color = if (selected) Color.White else Color(0xFF666666)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // ⭐ 摄像头模式选择（第四十八章）：自带(Camera2) / 外接OTG(UVC)，样式照抄连接方式
+                    // ⭐ 摄像头模式选择（第四十八章）：自带(Camera2) / 外接OTG(UVC)
                     HorizontalDivider(
                         modifier = Modifier.padding(start = 30.dp),
                         color = Color(0xFFF0F0F0)
@@ -444,13 +365,8 @@ fun LoginScreen(
                                             remove("password")
                                         }
                                         putBoolean("remember", rememberPassword)
-                                        // ⭐ 记住本次选择的连接方式（下次登录默认）
-                                        putString("selected_connect_mode", selectedConnectMode)
-                                        // ⭐ H265：记住本次选择的 P2P 编码
-                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY, selectedCodec)
-                                        // ⭐ SRS 编码（第四十九章）：记住本次选择
-                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_UI_KEY_SRS, selectedCodecSrs)
-                                        // ⭐ 摄像头模式（第四十八章）：记住本次选择
+                                        // ⭐ §53.4：线路/编码已不由用户选（登录页也不再显示），
+                                        //   这里只记住摄像头模式（自带 / 外接OTG）。
                                         putString("selected_camera_mode", selectedCameraMode)
                                         apply()
                                     }
@@ -471,20 +387,25 @@ fun LoginScreen(
                                         response.status?.let { putString("status", it) }
                                         putInt("bound_control_count", response.boundControlCount ?: 0)
                                         
-                                        // ⭐ 连接方式与 P2P 配置（与iOS一致：以用户在登录页的手动选择为准，覆盖后端下发）
-                                        putString("connect_mode", selectedConnectMode)
+                                        // ⭐ §53.4-定稿：连接方式**改以后端下发为准**（不再被登录页选择覆盖）。
+                                        //   "srs" = 总后台一键强制多人线路；其它(auto/p2p/缺省) = 交给
+                                        //   SessionPolicy 在推流前按"与观看端是否同 WiFi"自动决定。
+                                        val backendConnectMode = (response.connectMode ?: "auto").lowercase()
+                                        putString("connect_mode", backendConnectMode)
                                         // ⭐ 摄像头模式运行时决策值（WebRTCManager.startPreview 读取，第四十八章）
                                         putString("camera_mode", selectedCameraMode)
-                                        // ⭐ H265：P2P 编码运行时决策值（WebRTCManager.startPublish → H265Support.decideForP2P 读取）
-                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, selectedCodec)
-                                        // ⭐ SRS 编码运行时决策值（第四十九章，WebRTCManager.startPublish → decideForSrs 读取）
-                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY_SRS, selectedCodecSrs)
+                                        // ⭐ §53.4.4 编码默认值改由总后台配置（默认 h265；本机硬编或观看端内核
+                                        //   不支持时由 SessionPolicy/H265Support 自动回退 h264）。字段缺省=老后端→h265。
+                                        val codecP2p = (response.videoCodecP2p ?: "h265").lowercase()
+                                        val codecSrs = (response.videoCodecSrs ?: "h265").lowercase()
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, codecP2p)
+                                        putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY_SRS, codecSrs)
                                         putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         response.iceServers?.let {
                                             putString("ice_servers_json", com.google.gson.Gson().toJson(it))
                                         }
-                                        println("jfh [Login] ✅ 连接方式(用户选)=$selectedConnectMode, 后端下发=${response.connectMode ?: "nil"}, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
+                                        println("jfh [Login] ✅ 连接方式(后端)=$backendConnectMode, 编码默认(后端) P2P=$codecP2p/SRS=$codecSrs, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
                                         
                                         // 🔥 保存试用/激活信息（与iOS saveTrialInfo完全一致）
                                         response.trialInfo?.let { trial ->

@@ -148,6 +148,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ⭐ PC 观看端连接状态（每秒回调）：P2P=有 ICE 已连接的观看会话；
     //   SRS/通用=最近 6s 内收到过 PC 的 VIEWER_HEARTBEAT（PC 出画面才发心跳）。
     var onPcConnectedUpdate: ((Boolean) -> Unit)? = null
+    // ⭐ §53.2 在线 PC 台数（PC_PRESENCE 心跳，**与有没有画面无关**）。
+    //   与 onPcConnectedUpdate（在看）是两个正交状态：「在线但没在看」= 拉流侧有问题，
+    //   以前只有一个灯，这种情况会被显示成"PC未连接"，误导排障方向。
+    var onPcOnlineUpdate: ((Int) -> Unit)? = null
     // ⭐ 切网重连中（P2P）：拆会话+HANGUP 后等 PC 重连，UI 左上角显示"网络切换重连中…"；PC 心跳恢复即清除
     var onReconnectingUpdate: ((Boolean) -> Unit)? = null
     @Volatile private var p2pReconnecting: Boolean = false
@@ -862,6 +866,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             p2pReconnecting = true
             scope.launch(Dispatchers.Main) { onReconnectingUpdate?.invoke(true) }
         }
+        // ⭐ §53.4.3：决策输入变化 → 停推流 → 重新决策 → 起推流（冷却/次数上限在 SessionPolicy）
+        SessionPolicy.attachContext(context)
+        SessionPolicy.onRenegotiateNeeded = { reason ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post { renegotiateSession(reason) }
+        }
         // 📶 §21.27 网络切换监听（统一入口，P2P/SRS 共用；切网 → publishHealthCheck 同一出口）
         startNetworkMonitoring()
         autoRecoverEnabled = true   // 开始推流即恢复自动自愈（睡眠/被踢时会关掉）
@@ -877,25 +886,36 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // ⭐ P2P诊断日志上报（总后台开关控制）：按推流ID分流，采集 logcat 的 meidui/P2PManager/jfh 行
         P2PLogReporter.start(streamKey)
         
-        // ⭐ 静态连接方式决策（与 iOS decideMode 一致）：登录保存的 connect_mode == "p2p" → P2P 直连，
-        //   其它（"srs"/缺省）→ SRS。互斥，一次会话只走一条链路。
-        val connectMode = appContext?.getSharedPreferences("token_prefs", android.content.Context.MODE_PRIVATE)
-            ?.getString("connect_mode", "srs")?.lowercase() ?: "srs"
         bitrateScaleIdx = 0   // 新推流会话：码率阶梯回满档（自适应从头开始）
-        if (connectMode == "p2p") {
+
+        // ⭐ §53.4.1 宽限期：推流那一刻若还没收到任何 PC_PRESENCE（两端登录有先后，刚开机时
+        //   消息可能还在路上），等 2s 再决策一次——否则"其实同 WiFi"却因消息未到白走 SRS。
+        //   只等一次，等不到就按 SRS（对任何网络都成立的安全默认）。
+        if (SessionPolicy.shouldWaitForPresence()) {
+            Log.d("meidui", "🧭 [链路决策] 暂未收到观看端在线心跳，等 ${SessionPolicy.PRESENCE_GRACE_MS}ms 再定案")
+            publishStarting = false   // 让重试能进来（进门有 isPublishing||publishStarting 守卫）
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                startPublish(serverIP, appName, key)
+            }, SessionPolicy.PRESENCE_GRACE_MS)
+            return
+        }
+
+        // ⭐ §53.4-定稿：**推流前一次定案** mode + codec（决策逻辑全在 SessionPolicy.kt，与 iOS 同构）。
+        //   能 P2P 只限同一 WiFi；否则一律 SRS。编码取总后台默认（h265），观看端内核收不了
+        //   或本机没有 H265 硬编时自动回退 h264。推流中不再切换（切网/换观看端 → 重新协商）。
+        appContext?.let { SessionPolicy.attachContext(it) }
+        val decision = SessionPolicy.decideForPublish(appContext)
+        if (decision.mode == SessionPolicy.Mode.P2P) {
             currentConnMode = ConnMode.P2P
             effectiveConnectstype = 1
-            // ⭐ H265：仅 P2P 按登录页「P2P编码」选项定案（全部逻辑在 H265Support.kt）
-            H265Support.decideForP2P(appContext)
+            H265Support.applyDecidedCodec(decision.codec, "P2P")
             startP2PPublish()   // ⚠️ 异步：publishStarting 由 startP2PPublish 的 scope.launch finally 清零，
                                 //    绝不能在这里同步清（否则 isPublishing 还没置起、窗口没堵住 → 并发双 startPreview）
             return
         }
         currentConnMode = ConnMode.SRS
         effectiveConnectstype = 0
-        // ⭐ H265（第四十九章）：SRS 也按登录页「SRS编码」选项定案（独立 key srs_video_codec，默认 h264）。
-        //   H265 会话下方 Step5 会像 P2P 一样对 Offer 做 mungeOfferH265；CONFIG_STATE.videoCodec 如实上报。
-        H265Support.decideForSrs(appContext)
+        H265Support.applyDecidedCodec(decision.codec, "SRS")
         
         println("jfh [推流] ═══════════════════════════════════════")
         println("jfh [推流] 🚀 开始推流")
@@ -1045,6 +1065,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         publishStarting = false   // 停流即解除建立守卫（scheduleSrsRepublish 的 stop→start 依赖此）
         keyframeJob?.cancel()
         statsJob?.cancel()
+
+        // ⭐ §53.4：清掉"本次会话定案"，但**保留观看端在线注册表**——PC 还在线、心跳还在来，
+        //   下次推流要用它决策（清空会导致重新协商后必然误判成"无观看端"→ 白走 SRS）。
+        SessionPolicy.onPublishStopped()
         
         // 📶 §21.27 网络切换监听随推流生命周期（统一入口在 WebRTCManager）
         stopNetworkMonitoring()
@@ -1080,7 +1104,33 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         Log.d(TAG, "✅ 推流已停止")
     }
-    
+
+    /**
+     * ⭐ §53.4.3 重新协商：决策输入变了（观看端换网段 / 新增收不了 H265 的观看端 / 本机切网）
+     * 且新结果与已定案不同时，由 SessionPolicy 回调到这里。与 iOS `renegotiateSession` 同构。
+     *
+     * **标准动作：停推流 → 重新决策 → 起推流**，不做任何"边推边改"的 in-place 切换——
+     * mode/codec 都必须在推流前定好（编码器、SDP、PC 的解码管线全依赖它）。
+     * 冷却与次数上限在 SessionPolicy 里，这里只负责执行。
+     */
+    fun renegotiateSession(reason: String) {
+        if (!isPublishing) {
+            Log.d("meidui", "🧭 [链路决策] 收到重新协商($reason)但当前未推流，忽略")
+            return
+        }
+        if (srsIP.isEmpty() || baseStreamKey.isEmpty()) {
+            Log.w(TAG, "🧭 [链路决策] 重新协商($reason)缺少推流参数，放弃")
+            return
+        }
+        Log.d("meidui", "🧭 [链路决策] 执行重新协商：$reason —— 停推流 → 重新决策 → 起推流")
+        val ip = srsIP; val appName = app; val key = baseStreamKey
+        stopPublish()
+        // 留一拍给 PeerConnection/采集收尾，避免拆建重叠（与切档重建同款间隔）
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            startPublish(ip, appName, key)
+        }, 600)
+    }
+
     // MARK: - ⭐ P2PManager.DataSource（向 P2P 会话提供工厂/视频轨/编码参数）
     
     override val p2pFactory: PeerConnectionFactory? get() = peerConnectionFactory
@@ -1659,10 +1709,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         // ⭐ PC 连接恢复 = 切网重连完成，清除"重连中"
                         if (pcConnected && p2pReconnecting) p2pReconnecting = false
                         val reconnectingNow = p2pReconnecting && !pcConnected
+                        // ⭐ §53.2：在线台数走 PC_PRESENCE（与画面无关），与上面的 pcConnected(在看) 分开
+                        val onlinePcs = WebSocketManager.instance.onlinePcCount()
                         withContext(Dispatchers.Main) {
                             onCapFpsUpdate?.invoke(capFpsUi)
                             onPcConnectedUpdate?.invoke(pcConnected)
                             onReconnectingUpdate?.invoke(reconnectingNow)
+                            onPcOnlineUpdate?.invoke(onlinePcs)
                         }
                     }
                 }
@@ -1786,19 +1839,19 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         }
                     }
 
-                    // ⭐ §52.6（替代原 §25.7 的「切中继」）：非同 WiFi（选中路径不是 host↔host）
-                    //   → 停止推流并退回登录页，提示改用多人线路(SRS)。
-                    //   原来是切 TURN 中继，但中继下码率被钳到 relayMaxKbps，且路径与 SRS 完全相同却
-                    //   拿不到 SRS 的服务端重传/GOP cache/一对多分发——是最差的一档组合。
-                    //   判定沿用已有的 pathIsLan，不新造检测。后端显式 forceRelay 时不干预。
+                    // ⭐ §53.4-定稿：这里**只做兜底核对，不再退登录页**。
+                    //   正常情况下"同不同 WiFi"已在推流前用 PC_PRESENCE 的 localIps 比过网段
+                    //   （SessionPolicy），跨网压根不会走 P2P。真跑到这儿说明预判与实际不符
+                    //   （同网段但 AP 隔离 / 多网卡 / NAT 掩盖网段）→ 交给 SessionPolicy 重新协商
+                    //   （停推流→重决策→起推流，自带冷却与次数上限）。§52.6 的"退回登录页让用户
+                    //   自己改线路"已废弃：用户不该为网络拓扑负责。
                     if (currentConnMode == ConnMode.P2P && activePairId != null && !notSameWifiHandled &&
                         !p2pManager.forceRelay &&
                         localType != null && remoteType != null && !pathIsLan) {
                         notSameWifiHandled = true
-                        Log.d("meidui", "[线路] 🚫非同WiFi(本端=$localType 远端=$remoteType) → 退出 P2P，提示改用多人线路")
-                        // 本回调跑在 WebRTC 信令线程；停流/Toast/导航必须回主线程
+                        Log.d("meidui", "[线路] ⚠️实测路径非同WiFi(本端=$localType 远端=$remoteType)，与推流前预判不符 → 重新协商走多人线路")
                         android.os.Handler(android.os.Looper.getMainLooper()).post {
-                            onNotSameWifi?.invoke()
+                            SessionPolicy.forceSrsForSession("实测ICE路径非局域网($localType/$remoteType)")
                         }
                     }
                     
@@ -2226,6 +2279,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val wsConnected = WebSocketManager.instance.isConnected
         Log.d(TAG, "📶 [切网] $reason mode=$currentConnMode ws=$wsConnected")
         Log.d("meidui", "📶 [切网统一入口] $reason mode=$currentConnMode wsConnected=$wsConnected")
+        // ⭐ §53.4.3：本机切网 = 决策输入变化（网段可能已变，同 WiFi 关系可能不成立了）→
+        //   交给 SessionPolicy 评估；只有决策结果真的变了才会重启推流（自带冷却与次数上限）。
+        SessionPolicy.onLocalNetworkChanged()
         if (!wsConnected) {
             // 切网瞬间 WS 多半已死：信令发不出去，此刻做任何重连都是黑洞。
             // WS 自动重连成功后 onReconnected → publishHealthCheck("WS重连")，同一出口兜住。

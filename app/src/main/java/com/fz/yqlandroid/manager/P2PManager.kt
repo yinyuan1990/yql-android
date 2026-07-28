@@ -66,6 +66,9 @@ class P2PManager(private val context: Context) {
     //   永远吞掉 PC 的重连请求）；② 创建后 1s 内到达的 WEBRTC_HANGUP 视为旧会话残留信令，忽略
     //   （§23.2 首开 17s 竞态：PC 先 HANGUP 旧会话再 REQUEST，两条消息乱序到达会把新会话干掉）。
     private val sessionCreatedAt = HashMap<String, Long>()
+    // ⭐ §53.3①：PC 带来的 requestId（每次 connectP2P/重发递增）。变了就必须拆旧建新，
+    //   不能再按"会话建立中"忽略——否则新登录的 PC 会被上一轮的幽灵会话吞掉请求。
+    private val lastRequestId = HashMap<String, Long>()
 
     private val gson = Gson()
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -274,7 +277,17 @@ class P2PManager(private val context: Context) {
         mainScope.launch {
             when (type) {
                 "VIEWER_CONNECTED" -> Log.d(TAG, "✅ PC $fromDevice 已收到画面")
-                "VIEWER_DISCONNECTED" -> Log.d(TAG, "🔌 PC $fromDevice 断开")
+                // ⭐ §53.3①：真的拆会话（以前只打日志）。PC 退出时发的这条通知白发 → 会话留在
+                //   CONNECTING 变"幽灵会话"，把 PC 下次登录的请求吞掉（iOS 侧同款问题更严重）。
+                "VIEWER_DISCONNECTED" -> {
+                    val had = synchronized(viewerSessions) { viewerSessions.containsKey(fromDevice) }
+                    if (had) {
+                        Log.d(TAG, "🔌 PC $fromDevice 断开 → 拆会话（防幽灵会话吞掉下次 WEBRTC_REQUEST）")
+                        removeViewerSession(fromDevice, notifyPC = false)
+                    } else {
+                        Log.d(TAG, "🔌 PC $fromDevice 断开（无活动会话）")
+                    }
+                }
                 "WEBRTC_REQUEST" -> {
                     peerNetworkType[fromDevice] = (message["networkType"] as? String) ?: "unknown"
                     applyLanPrecheck(fromDevice, message)   // §25.7e：建会话前定直连/中继
@@ -282,7 +295,9 @@ class P2PManager(private val context: Context) {
                         WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
                         return@launch
                     }
-                    createViewerSession(fromDevice)
+                    // requestId：PC 每次 connectP2P/重发递增；旧版 PC 不带（null）→ 只靠时间窗去重
+                    val reqId = (message["requestId"] as? Number)?.toLong()
+                    createViewerSession(fromDevice, reqId)
                 }
                 "WEBRTC_SDP" -> {
                     val sdpType = message["sdpType"] as? String ?: ""
@@ -351,7 +366,7 @@ class P2PManager(private val context: Context) {
 
     // MARK: - 会话管理
 
-    fun createViewerSession(pcId: String) {
+    fun createViewerSession(pcId: String, requestId: Long? = null) {
         val ds = dataSource ?: run { Log.e(TAG, "❌ dataSource 为空"); return }
         val factory = ds.p2pFactory ?: run { Log.e(TAG, "❌ factory 为空"); return }
 
@@ -359,10 +374,13 @@ class P2PManager(private val context: Context) {
             viewerSessions[pcId]?.let { existing ->
                 val s = existing.connectionState()
                 val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
-                if ((s == PeerConnection.PeerConnectionState.NEW ||
-                     s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 3000) {
-                    // 3s 内的重复 REQUEST 才当去重处理
-                    Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms)，忽略重复请求")
+                // ⭐ §53.3①：requestId 变了 = PC 换了一轮请求（重登/重连），一律拆旧建新，不进去重分支。
+                //   去重窗口 3000→2000ms，与 PC 的重发间隔 1.5s、iOS 的同款窗口对齐。
+                val sameRequest = requestId == null || requestId == lastRequestId[pcId]
+                if (sameRequest &&
+                    (s == PeerConnection.PeerConnectionState.NEW ||
+                     s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 2000) {
+                    Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms, reqId=$requestId)，忽略重复请求")
                     return
                 }
                 // ⭐ 切网重连关键修复：超过 3s 仍停在 NEW/CONNECTING = 僵尸会话（切网后 ICE 永远
@@ -376,6 +394,7 @@ class P2PManager(private val context: Context) {
         if (synchronized(viewerSessions) { viewerSessions.containsKey(pcId) }) {
             removeViewerSession(pcId, notifyPC = false)
         }
+        if (requestId != null) lastRequestId[pcId] = requestId
 
         if (viewerCount >= maxViewers) {
             Log.e(TAG, "❌ 已达最大观看人数($maxViewers)，拒绝 $pcId")
@@ -469,6 +488,7 @@ class P2PManager(private val context: Context) {
         iceRetryCount.remove(pcId)
         forceRelayPeerIds.remove(pcId)
         peerNetworkType.remove(pcId)
+        lastRequestId.remove(pcId)
         Log.d(TAG, "🔌 移除会话 $pcId，剩余 $viewerCount")
     }
 

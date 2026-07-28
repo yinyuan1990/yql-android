@@ -62,6 +62,32 @@ object H265Support {
         log("编码器能力探测: H265=${if (sdkSupportsH265) "支持✅" else "不支持❌(libwebrtc/设备无H265硬编)"} 全部=$codecNames")
     }
 
+    // ---------- 钩子 2'：§53.4-定稿 —— 按 SessionPolicy 定案的编码落地（登录页不再让用户选） ----------
+
+    /**
+     * 推流前由 `SessionPolicy` 定案 codec 后调用（P2P / SRS 共用）。
+     *
+     * 与旧的 `decideForP2P/decideForSrs` 的区别：**不再自己读 prefs 里的用户选择**——
+     * 编码由 SessionPolicy 综合「服务器默认(总后台可配) + 观看端内核能否收 H265 + 本机能否硬编」
+     * 一次算好，这里只负责落地 effectiveCodec。这样"谁决定编码"只有一个地方，不会两处打架。
+     * 指定 H265 但本机编码器不支持 → 如实回退 H264（用户口径：不支持就回退）。
+     */
+    fun applyDecidedCodec(codec: String, mode: String): String {
+        effectiveCodec = if (codec == "h265") {
+            if (sdkSupportsH265) {
+                log("✅ $mode 会话编码 → H265（Offer 将限定 H265）")
+                "h265"
+            } else {
+                log("⚠️ $mode 定案 H265 但本机编码器不支持，回退 H264")
+                "h264"
+            }
+        } else {
+            log("ℹ️ $mode 会话编码 → H264")
+            "h264"
+        }
+        return effectiveCodec
+    }
+
     // ---------- 钩子 2：startPublish P2P 分支调（每次推流定案） ----------
 
     /** P2P 推流前按登录页选择定案编码。选 H265 但不支持 → 回落 H264 并打日志。 */
