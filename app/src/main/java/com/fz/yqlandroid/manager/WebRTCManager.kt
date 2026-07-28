@@ -246,17 +246,36 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // ⭐ 推送基准 = min(档位采集fps, 档位推流上限, 后端目标 targetOutputFps)：
         //    此前直接用 preset.fps(采集60) → 热状态一变化(含回落NOMINAL)推送被拉回60，
         //    后端 set_fps=15 的目标被顶掉，「采集60·推15」解耦失效
-        val basePushFps = minOf(preset?.fps ?: currentFps, preset?.maxPushFps ?: 60, targetOutputFps)
+        //    OTG：档位/ladder 不适用，基准 = min(编码器该尺寸真实上限, 后端目标)
+        val basePushFps = if (usingOtgCamera) minOf(otgEncoderFpsCap(), targetOutputFps)
+                          else minOf(preset?.fps ?: currentFps, preset?.maxPushFps ?: 60, targetOutputFps)
         val baseMaxKbps = preset?.maxKbps ?: currentBitrateKbps
 
         // ⭐ 热控只降「推送」fps + 码率，采集帧率不动（对齐 iOS：iOS 无热控、相机恒按档位采集；
         //    编码/发送才是主要热源，降推送已能有效控温）
+        //
+        // ⭐ OTG 用更宽的档（2026-07-28）：不少国产 ROM 开机就常年上报 MODERATE(→FAIR)，
+        //    按自带摄像头的 30 一压，OTG 推流永远上不去；而 OTG 模式手机自身相机/ISP 根本没开，
+        //    发热源少一大块，FAIR 放到 60 合理。SERIOUS/CRITICAL 仍严格压（那是真热了）。
         when (level) {
             ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
-            ThermalManager.Level.FAIR -> { thermalFpsCap = 30; thermalBitrateScale = 0.8 }
-            ThermalManager.Level.SERIOUS -> { thermalFpsCap = 20; thermalBitrateScale = 0.6 }
-            ThermalManager.Level.CRITICAL -> { thermalFpsCap = 12; thermalBitrateScale = 0.4 }
+            ThermalManager.Level.FAIR -> {
+                thermalFpsCap = if (usingOtgCamera) 60 else 30
+                thermalBitrateScale = 0.8
+            }
+            ThermalManager.Level.SERIOUS -> {
+                thermalFpsCap = if (usingOtgCamera) 30 else 20
+                thermalBitrateScale = 0.6
+            }
+            ThermalManager.Level.CRITICAL -> {
+                thermalFpsCap = if (usingOtgCamera) 15 else 12
+                thermalBitrateScale = 0.4
+            }
         }
+
+        // 让 PC 面板能看见"是谁摁住了 fps"（0=无限制）
+        com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.thermalCapFps =
+            if (thermalFpsCap == Int.MAX_VALUE) 0 else thermalFpsCap
 
         val targetFps = minOf(basePushFps, thermalFpsCap).coerceAtLeast(1)
         val targetKbps = maxOf(300, (baseMaxKbps * thermalBitrateScale).toInt())
@@ -644,6 +663,21 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      */
     private val OTG_MAX_CAPTURE_FPS = 120
 
+    /**
+     * OTG 推流帧率上限 = 编码器在当前尺寸的真实能力（查不到兜底 120）。
+     * 所有"推流 fps 钳位"点在 OTG 模式下都必须用它，**不能**用自带摄像头 ladder 的
+     * maxPushFps(60)——那是无关的拍脑袋值，会把 320x240@120 这类完全可行的推流压死。
+     */
+    private fun otgEncoderFpsCap(): Int {
+        val enc = com.fz.yqlandroid.manager.uvc.EncoderSizeLimits.maxFrameRate(
+            H265Support.effectiveCodec, currentWidth, currentHeight)
+        return if (enc > 0) enc else 120
+    }
+
+    /** 推流帧率的"档位/能力"上限：OTG=编码器真实能力，自带=ladder 的 maxPushFps */
+    private fun pushFpsHardCap(): Int =
+        if (usingOtgCamera) otgEncoderFpsCap() else (currentLadder[currentProfile]?.maxPushFps ?: 60)
+
     /** 把 UVC 实际协商出的分辨率同步进 currentWidth/Height，并按新尺寸重算码率 */
     private fun syncOtgNegotiatedSize() {
         val caps = com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.caps.value ?: return
@@ -718,6 +752,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    后面的 SurfaceTextureHelper/CountingObserver/videoSource/编码/推流链路两种模式完全共用
         usingOtgCamera = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
             .getString("camera_mode", "builtin") == "otg"
+        // ⭐ 热控档位按摄像头模式区分（OTG 更宽），而初始那次热控回调发生在本行之前——
+        //   模式定了必须重算一次，否则常年 MODERATE 的机器 OTG 也被按自带口径压到 30（07-28 日志实锤）
+        applyThermalPolicy(thermalManager.currentLevel)
         videoCapturer = if (usingOtgCamera) {
             Log.d("meidui", "🔌 [OTG] 摄像头模式=外接OTG → UvcVideoCapturer（Camera2 链路不启动）")
             // ⭐ 第四十八章b：OTG 模式日志上报（摄像头占用USB口没法连adb，日志推后端「OTG日志」页）。
@@ -1061,10 +1098,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         return Pair(target, target)
     }
     override fun p2pTargetFps(): Int {
-        val maxPushFps = currentLadder[currentProfile]?.maxPushFps ?: 60
-        return minOf(currentFps, maxPushFps, thermalFpsCap).coerceAtLeast(1)
+        return minOf(currentFps, pushFpsHardCap(), thermalFpsCap).coerceAtLeast(1)
     }
     override fun p2pScaleDown(): Double {
+        // OTG 一律不缩放（协商尺寸即目标尺寸；ladder 的 scaleDown 是自带摄像头口径）
+        if (usingOtgCamera) return 1.0
         val preset = currentLadder[currentProfile]
         return if (preset != null && preset.scaleDown > 1.0) preset.scaleDown else 1.0
     }
@@ -1282,7 +1320,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val targetKbps = maxOf(300, (currentBitrateKbps * thermalBitrateScale * adaptiveBitrateScale()).toInt())
         params.encodings[0].maxBitrateBps = targetKbps * 1000
         params.encodings[0].minBitrateBps = targetKbps * 1000
-        params.encodings[0].maxFramerate = minOf(currentFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        params.encodings[0].maxFramerate = minOf(currentFps, pushFpsHardCap(), thermalFpsCap)
         
         // scaleDown：从采集分辨率缩放到目标输出（与iOS一致）
         // ⭐ 第五十章：OTG 一律不缩放。ladder 的 scaleDown 是按自带摄像头分辨率算的
@@ -1448,7 +1486,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         // ⭐ 升帧上限 = 后端下发目标 fps（iOS maxFps=targetOutputFPS，即「当前设定的 fps」），
         //   再叠加档位推流上限与热控约束——网络再好也只升回设定值，不顶掉后端指令
-        val maxFps = minOf(targetOutputFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        val maxFps = minOf(targetOutputFps, pushFpsHardCap(), thermalFpsCap)
         // 上限被收紧（热控/切档/后端调低）时先静默对齐基准：编码器帧率已由收紧方写入，
         // 这里只同步 adaptiveFps，防止升帧分支打出「30→20fps」的假升帧
         if (adaptiveFps > maxFps) adaptiveFps = maxFps
@@ -2627,13 +2665,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // OTG 的推流上限 = 编码器在当前尺寸下的真实能力（MediaCodec 报的），
         // 不用 ladder 那个 60 —— 那是自带摄像头的拍脑袋值，小分辨率编 120fps 很常见。
         // 自带摄像头维持原逻辑不动。
-        val maxFps = if (usingOtgCamera) {
-            val enc = com.fz.yqlandroid.manager.uvc.EncoderSizeLimits.maxFrameRate(
-                H265Support.effectiveCodec, currentWidth, currentHeight)
-            if (enc > 0) enc else 120
-        } else {
-            currentLadder[currentProfile]?.maxPushFps ?: 60
-        }
+        val maxFps = pushFpsHardCap()
         if (usingOtgCamera) {
             Log.d("meidui", "🔗 [OTG链路|推流fps] 请求${pushFps} → 编码器上限${maxFps}" +
                     "(${H265Support.effectiveCodec}@${currentWidth}x${currentHeight})" +
@@ -2704,7 +2736,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         adaptiveFps = targetFps
         lastRemoteFpsTime = System.currentTimeMillis()
         lastNotifiedFps = targetFps   // 防自适应把同值再上报一遍
-        currentFps = minOf(targetFps, currentLadder[currentProfile]?.maxPushFps ?: 60, thermalFpsCap)
+        currentFps = minOf(targetFps, pushFpsHardCap(), thermalFpsCap)
         if (currentConnMode == ConnMode.P2P) {
             p2pManager.applyFramerateToAllSessions()
         } else videoSender?.let { sender ->

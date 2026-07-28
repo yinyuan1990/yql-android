@@ -64,6 +64,9 @@ object UvcCapabilityStore {
     @Volatile var pushFps: Int = 0
     @Volatile var bitratePct: Int = 0
 
+    /** 当前热控推流上限（0=无限制）。"fps 拖不上去"十有八九是它摁的，必须让 PC 面板看见 */
+    @Volatile var thermalCapFps: Int = 0
+
     private val _lines = MutableStateFlow<List<String>>(emptyList())
     val lines: StateFlow<List<String>> = _lines
 

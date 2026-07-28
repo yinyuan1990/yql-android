@@ -625,6 +625,8 @@ class WebSocketManager private constructor() {
                 // PC 面板照它显示，不要自己猜一个缺省
                 "pushFps" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.pushFps,
                 "bitratePct" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.bitratePct,
+                // 当前热控推流上限（0=无限制）——"fps拖不上去"多半是它，面板要显示出来
+                "thermalCapFps" to com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.thermalCapFps,
                 // 档位列表 = 设备枚举出的分辨率（几档就是几档）
                 // encodable=false 的档位硬件编码器吃不下，选了必黑，PC 不给选
                 "sizes" to caps.sizes.map {
