@@ -1118,6 +1118,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             Log.d("meidui", "🧭 [链路决策] 收到重新协商($reason)但当前未推流，忽略")
             return
         }
+        // ⭐ §53.12：推流正在建立中（POST 未回 / 预览在起）时绝不插手——否则会把别的
+        //   恢复路径（publishHealthCheck 重推、SRS republish）刚建起来的会话拆掉，
+        //   表现就是"切网后彻底没画面"。等它建完，下一次输入变化再评估。
+        if (publishStarting) {
+            Log.d("meidui", "🧭 [链路决策] 推流正在建立中，跳过重新协商($reason)")
+            return
+        }
         if (srsIP.isEmpty() || baseStreamKey.isEmpty()) {
             Log.w(TAG, "🧭 [链路决策] 重新协商($reason)缺少推流参数，放弃")
             return
@@ -2279,8 +2286,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val wsConnected = WebSocketManager.instance.isConnected
         Log.d(TAG, "📶 [切网] $reason mode=$currentConnMode ws=$wsConnected")
         Log.d("meidui", "📶 [切网统一入口] $reason mode=$currentConnMode wsConnected=$wsConnected")
-        // ⭐ §53.4.3：本机切网 = 决策输入变化（网段可能已变，同 WiFi 关系可能不成立了）→
-        //   交给 SessionPolicy 评估；只有决策结果真的变了才会重启推流（自带冷却与次数上限）。
+        // ⭐ §53.12：切网**只标记"待重新决策"，绝不在这里立刻动作**。
+        //   上一版在这里直接评估并可能 stopPublish+startPublish，与紧随其后的 publishHealthCheck
+        //   （原有自愈出口）在同一个事件里抢：两者都会重启推流、顺序还不确定，
+        //   最坏情况是自愈刚把流建好、重新协商随后把它拆掉 → 切网后彻底不出画面。
+        //   而且切网瞬间 WS 多半已断、PC presence 也停了，此刻是**决策输入最不可靠的时候**。
+        //   正确做法：等 PC 的 PC_PRESENCE 重新到达（网络已稳、网段是新的）再评估。
         SessionPolicy.onLocalNetworkChanged()
         if (!wsConnected) {
             // 切网瞬间 WS 多半已死：信令发不出去，此刻做任何重连都是黑洞。

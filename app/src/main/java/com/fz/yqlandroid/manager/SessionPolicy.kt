@@ -71,13 +71,26 @@ object SessionPolicy {
      * 不是每条心跳都调）。内部评估是否需要重新协商。
      */
     fun onViewerInputChanged(trigger: String) {
-        evaluateForRenegotiate(trigger)
+        val pending = pendingNetworkChange
+        if (pending) pendingNetworkChange = false
+        evaluateForRenegotiate(if (pending) "$trigger + 本机切过网" else trigger)
     }
 
-    /** 设备自己切网（WiFi↔蜂窝/换 WiFi） */
+    /**
+     * 设备自己切网（WiFi↔蜂窝/换 WiFi）。
+     *
+     * ⚠️ §53.12：**只打标记，不在这里评估**。切网瞬间 WS 多半已断、PC 的 presence 也停了，
+     * 这时候算出来的"网段关系"是拿旧的/空的观看端网段去比，最不可靠；更要紧的是切网事件
+     * 同时会触发原有的 `publishHealthCheck` 自愈，两条恢复路径在同一事件里抢着重启推流，
+     * 顺序还不确定 —— 实测表现就是「Android 切换网络后不出画面」。
+     * 等 PC 的 PC_PRESENCE 重新到达（网络已稳、网段是新的）时，由 onViewerInputChanged 一并评估。
+     */
     fun onLocalNetworkChanged() {
-        evaluateForRenegotiate("本机切换网络")
+        pendingNetworkChange = true
+        log("📶 本机切网 → 标记待重新决策（等观看端心跳恢复后再评估，避免与切网自愈打架）")
     }
+
+    @Volatile private var pendingNetworkChange = false
 
     /**
      * 兜底：推流前预判同 WiFi，但实测 ICE 路径不是局域网（AP 隔离/多网卡/NAT 掩盖网段）。
@@ -112,6 +125,7 @@ object SessionPolicy {
         pinnedToSrs = false
         lastRenegotiateAtMs = 0
         graceConsumed = false
+        pendingNetworkChange = false
         connectReason = ""
         WebSocketManager.instance.clearPcPresence()
     }
