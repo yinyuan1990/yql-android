@@ -119,6 +119,17 @@ fun StreamingScreen(
     var fluencyValue by remember { mutableFloatStateOf(100f) }    // 流畅 0~100
     var isoGainValue by remember { mutableFloatStateOf(0f) }      // ISO增益 0~100（滤镜移除后，亮度改显 ISO 增益）
     var selectedProfile by remember { mutableStateOf("高清") }     // 清晰度档位
+
+    // ⭐ §53.9 会员状态（档位标绿用）。登录/服务器推送时写进 token_prefs，这里读一次即可
+    //   （改等级要重登或收到推送后进出本页刷新，与「我的」页同口径）。
+    val memberActivated = remember {
+        context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            .getBoolean("activated", false)
+    }
+    val memberLevel = remember {
+        context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            .getInt("activation_level", 0)
+    }
     
     // WebSocket配置同步回调
     DisposableEffect(webRTCManager) {
@@ -584,10 +595,19 @@ fun StreamingScreen(
                     ) {
                         // ⭐ 对齐 iOS 5 档（ContentView 顺序 low→standard→high→p4k→ultra）：
                         //   此前少画「超低网」，服务器下发 type=low 时 UI 无处高亮。
+                        // ⭐ §53.9：会员已开通的档位标绿。等级与档位对应（用户口径：等级1=2个档位）：
+                        //   等级1 高清会员 → 超低网+高清；等级2 → +超清；等级3 → +超高清；等级4 → 全部。
                         listOf("超低网", "高清", "超清", "超高清", "超高帧").forEach { name ->
+                            val requiredLevel = when (name) {
+                                "超低网", "高清" -> 1
+                                "超清" -> 2
+                                "超高清" -> 3
+                                else -> 4          // 超高帧
+                            }
                             QualityRadioItem(
                                 name = name,
                                 isSelected = selectedProfile == name,
+                                unlocked = memberActivated && memberLevel >= requiredLevel,
                                 onClick = { } // 仅显示，不操作
                             )
                         }
@@ -755,10 +775,16 @@ private fun SliderRow(
 private fun QualityRadioItem(
     name: String,
     isSelected: Boolean,
+    // ⭐ §53.9：该档位是否已随会员开通 → 整项绿色背景标注
+    unlocked: Boolean = false,
     onClick: () -> Unit
 ) {
     Row(
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(if (unlocked) Color(0xFF4CAF50).copy(alpha = 0.35f) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {

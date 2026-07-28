@@ -414,6 +414,8 @@ fun LoginScreen(
                                             trial.activationLevel?.let { putInt("activation_level", it) }
                                             trial.activationLevelName?.let { putString("activation_level_name", it) }
                                             trial.activationExpireAt?.let { putString("activation_expire_at", it) }
+                                            // ⭐ §53.9 开通时间（「我的」页把"注册时间"整行换成「<等级>会员 + 开通时间」）
+                                            trial.activationTime?.let { putString("activation_time", it) }
                                             // 日试用
                                             putBoolean("is_daily_trial", trial.isDailyTrial ?: false)
                                             trial.activationRemainingSeconds?.let { putInt("activation_remaining_seconds", it) }

@@ -531,6 +531,8 @@ class WebSocketManager private constructor() {
             (msgDict["activationLevel"] as? Number)?.let { putInt("activation_level", it.toInt()) }
             (msgDict["activationLevelName"] as? String)?.let { putString("activation_level_name", it) }
             (msgDict["activationExpireAt"] as? String)?.let { putString("activation_expire_at", it) }
+            // ⭐ §53.9：服务器推送的激活状态变化里也带开通时间（后台改等级/续期后无需重登即刷新「我的」页）
+            (msgDict["activationTime"] as? String)?.let { putString("activation_time", it) }
             putBoolean("trial_ended", trialEnded)
             (msgDict["currentStage"] as? Number)?.let { putInt("current_stage", it.toInt()) }
             (msgDict["totalStages"] as? Number)?.let { putInt("total_stages", it.toInt()) }

@@ -615,6 +615,7 @@ data class TrialInfo(
     val activationLevel: Int? = null,            // 激活等级 (1=标清, 2=高清, 3=超清, 4=4K)
     val activationLevelName: String? = null,     // 等级名称
     val activationExpireAt: String? = null,      // 激活到期时间
+    val activationTime: String? = null,          // ⭐ §53.9 开通时间（「我的」页显示"<等级>会员 + 开通时间"）
     val qualityAccess: List<String>? = null,     // 可用画质列表
     // 日试用相关
     val isDailyTrial: Boolean? = null,           // 是否日试用码激活
