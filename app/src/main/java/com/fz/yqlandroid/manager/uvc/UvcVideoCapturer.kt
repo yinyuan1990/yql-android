@@ -40,9 +40,6 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     companion object {
         private const val TAG = "UvcVideoCapturer"
-        // libuvc setPreviewSize 的帧率协商区间下限
-        private const val MIN_FPS = 1
-
         /**
          * ⭐ 设备**没声明**每档 fps 时，向 libuvc 请求的帧率上限（探测用）。
          *
@@ -184,6 +181,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         requestedWidth = width
         requestedHeight = height
         requestedFps = framerate
+        fallbackTried = false   // 新的外部切档请求：重新给一次"全败回退最后可用配置"的机会
         if (!capturing) {
             Log.d("meidui", "🔗 [OTG链路|重开流] ❌ capturing=false，只记参数不动流 ${width}x${height}@${framerate}")
             return
@@ -254,19 +252,34 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     }
 
     /**
-     * 记下"这个尺寸用 MJPEG 谈不拢"，下次切回来直接从 YUYV 起步。
+     * 「格式@尺寸」黑名单：谈不拢/起流0帧的组合记下来，下次直接跳过，不再白等看门狗。
      *
-     * 实测（2026-07-26）：某些尺寸设备虽然列在 MJPEG 支持列表里，协商却必失败
-     * （`Failed to set preview size` / `could not negotiate with camera:err=-51`），
-     * 要等两次 2.5s 看门狗超时才降到 YUYV —— 切一次档位黑 7 秒。记住之后直接跳过。
+     * 两轮实测教训（2026-07-26 / 07-28 日志实锤）：设备的"支持列表"是会骗人的——
+     * 第一台设备 320x240 列在 MJPEG 里但 MJPEG 必失败（YUYV 才通）；同一台设备的 YUYV
+     * 又在两个尺寸上全部 err=-51（MJPEG 才通）。所以黑名单必须按 **格式×尺寸** 记，
+     * 不能只记 MJPEG 一边。用户强制指定格式时（preferredFormat != 0）不生效——明确要求就让它试。
      */
-    private val mjpegBlacklist = mutableSetOf<String>()
+    private val formatBlacklist = mutableSetOf<String>()
 
     private fun sizeKey(w: Int, h: Int) = "${w}x$h"
+    private fun fmtName(fmt: Int) = if (fmt == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"
+    private fun blKey(fmt: Int, w: Int, h: Int) = "${fmtName(fmt)}@${w}x$h"
 
-    /** YUYV 在策略表里的起始下标（前面都是 MJPEG 档） */
-    private fun firstYuyvIndex(): Int =
-        strategies().indexOfFirst { it.format == UVCCamera.FRAME_FORMAT_YUYV }.coerceAtLeast(0)
+    /**
+     * 最后一次真正出过帧的完整配置（尺寸+格式+被接受的帧率）。
+     * 所有策略全败时回退到它——2026-07-28 日志实锤：切一个谈不拢的组合失败后
+     * 原逻辑直接躺平（"所有策略均0帧"），画面永久黑掉，而 30 秒前明明有一套跑得好好的配置。
+     */
+    private data class GoodConfig(val width: Int, val height: Int, val format: Int, val fps: Int)
+    @Volatile private var lastGoodConfig: GoodConfig? = null
+    @Volatile private var fallbackTried = false   // 每次外部切档只自动回退一次，防振荡
+
+    /** 每个尺寸上一次协商成功的帧率（切回该尺寸时优先用它精确请求，别再拿 120 去撞） */
+    private val knownGoodFps = mutableMapOf<String, Int>()
+
+    /** 本轮开流实际用的格式与被设备接受的帧率（看门狗成功时据此登记 lastGood/黑名单） */
+    @Volatile private var activeFormatInt = UVCCamera.FRAME_FORMAT_MJPEG
+    @Volatile private var acceptedFps = 0
 
     /** 按当前重试档位选 格式/带宽 开流；开流后装「无帧看门狗」，2.5s 没帧自动切下一档重开 */
     private fun startStreamLocked(camera: UVCCamera) {
@@ -274,14 +287,24 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         measuredFps = 0        // 换档重测，别把上一档的实测值带过来
         negotiatedFps = 0
         val list = strategies()
-        // 该尺寸已知 MJPEG 谈不拢 → 直接从 YUYV 起步，不再白等两轮看门狗。
-        // 用户明确指定了格式时不做这个自作主张（preferredFormat != 0）。
-        if (noFrameRetry == 0 && preferredFormat == 0 &&
-            mjpegBlacklist.contains(sizeKey(requestedWidth, requestedHeight))) {
-            noFrameRetry = firstYuyvIndex()
-            Log.d("meidui", "🔌 [OTG] ${requestedWidth}x${requestedHeight} 已知 MJPEG 谈不拢 → 直接用 YUYV 开流")
+        // 跳过该尺寸已知谈不拢的格式（用户强制格式时不跳，明确要求就让它试）
+        if (preferredFormat == 0) {
+            var idx = minOf(noFrameRetry, list.size - 1)
+            while (idx < list.size &&
+                   formatBlacklist.contains(blKey(list[idx].format, requestedWidth, requestedHeight))) {
+                Log.d("meidui", "🔌 [OTG] 跳过已知谈不拢的 ${list[idx].name}@${sizeKey(requestedWidth, requestedHeight)}")
+                idx++
+            }
+            if (idx >= list.size) {
+                // 全被拉黑：黑名单可能过期（换过口/供电变了），清掉该尺寸重试一轮
+                Log.d("meidui", "🔌 [OTG] ${sizeKey(requestedWidth, requestedHeight)} 所有格式都在黑名单 → 清空重试")
+                formatBlacklist.removeAll { it.endsWith("@${sizeKey(requestedWidth, requestedHeight)}") }
+                idx = minOf(noFrameRetry, list.size - 1)
+            }
+            noFrameRetry = idx
         }
         val st = list[minOf(noFrameRetry, list.size - 1)]
+        activeFormatInt = st.format
         try {
             val (w, h) = negotiateAndStart(camera, st.format, st.bandwidth)
             frameWidth = w
@@ -293,9 +316,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         } catch (e: Exception) {
             streamRunning = false
             Log.d("meidui", "🔌 [OTG] ❌ 开流失败(${st.name}): ${e.message}")
-            if (st.format == UVCCamera.FRAME_FORMAT_MJPEG) {
-                mjpegBlacklist.add(sizeKey(requestedWidth, requestedHeight))
-            }
+            formatBlacklist.add(blKey(st.format, requestedWidth, requestedHeight))
         }
         scheduleNoFrameWatchdog(camera)   // 无论成功/失败都装看门狗：失败或0帧都会切下一档
     }
@@ -308,20 +329,42 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             if (!capturing || uvcCamera !== camera) return@Runnable
             if (frameCbCount > 0) {
                 noFrameRetry = 0   // 成功出帧：重置档位，后续切档/重开从最优策略开始
+                fallbackTried = false
+                // 登记"最后可用配置"与该尺寸的可协商帧率：全败兜底、切回时精确请求都靠它
+                lastGoodConfig = GoodConfig(frameWidth, frameHeight, activeFormatInt, acceptedFps)
+                if (acceptedFps > 0) knownGoodFps[sizeKey(frameWidth, frameHeight)] = acceptedFps
                 Log.d("meidui", "🔌 [OTG] ✅ IFrameCallback正常：${NO_FRAME_TIMEOUT_MS}ms内${frameCbCount}帧 " +
-                        "${frameWidth}x${frameHeight}")
+                        "${frameWidth}x${frameHeight}（登记可用配置 ${fmtName(activeFormatInt)}@${acceptedFps}fps）")
                 dumpCapabilitiesLocked(camera)   // 出帧确认后刷新能力快照（协商尺寸/当前值已最终定）
                 scheduleFpsSample(camera)        // 再等画面稳下来单独测一次帧率
                 return@Runnable
             }
+            // 起流了却 0 帧：这个 格式@尺寸 拉黑
+            formatBlacklist.add(blKey(activeFormatInt, requestedWidth, requestedHeight))
             noFrameRetry++
             if (noFrameRetry >= strategies().size) {
-                Log.d("meidui", "🔌 [OTG] ❌ 所有 格式/带宽 策略均0帧：该UVC设备与本机isoc/MJPEG不兼容，或OTG口供电不足（换带独立供电的OTG口再试）")
+                // ⭐ 全败兜底（2026-07-28 卡死修复）：不许躺平黑屏——回退到最后一次出过帧的配置。
+                //   每次外部切档只回退一次（fallbackTried），回退自身再失败就真没辙了，如实报错。
+                val good = lastGoodConfig
+                if (good != null && !fallbackTried) {
+                    fallbackTried = true
+                    Log.d("meidui", "🔌 [OTG] ❌ 请求的配置所有策略均0帧 → 回退最后可用配置 " +
+                            "${good.width}x${good.height} ${fmtName(good.format)}@${good.fps}fps（PC 面板显示会随能力快照纠正）")
+                    requestedWidth = good.width
+                    requestedHeight = good.height
+                    requestedFps = good.fps
+                    preferredFormat = if (good.format == UVCCamera.FRAME_FORMAT_MJPEG) 1 else 2
+                    noFrameRetry = 0
+                    try {
+                        stopStreamLocked(camera)
+                        startStreamLocked(camera)
+                    } catch (e: Exception) {
+                        Log.d("meidui", "🔌 [OTG] 回退重开失败: ${e.message}")
+                    }
+                    return@Runnable
+                }
+                Log.d("meidui", "🔌 [OTG] ❌ 所有 格式/带宽 策略均0帧（无可回退配置）：该UVC设备与本机isoc不兼容，或OTG口供电不足（换带独立供电的OTG口再试）")
                 return@Runnable
-            }
-            // 这一档 MJPEG 起流了却不出帧，同样拉黑：下次切回该尺寸直接走 YUYV
-            if (strategies()[minOf(noFrameRetry - 1, strategies().size - 1)].format == UVCCamera.FRAME_FORMAT_MJPEG) {
-                mjpegBlacklist.add(sizeKey(requestedWidth, requestedHeight))
             }
             Log.d("meidui", "🔌 [OTG] ⚠️ 开流后${NO_FRAME_TIMEOUT_MS}ms内0帧(native未回调IFrameCallback) → 切换到策略[${noFrameRetry}]重开")
             try {
@@ -424,27 +467,43 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val w = target?.width ?: requestedWidth
         val h = target?.height ?: requestedHeight
 
-        // ⭐ 帧率必须**精确请求**，不能给一个宽区间。
-        //   libuvc 是在 [min,max] 里遍历帧描述符取第一个命中的；写 min=1 等于"什么都行"，
-        //   于是永远挑中设备默认那档（一般 30），设备就算有 120fps 的描述符也轮不到它。
-        //   要 120 就得请求 min=max=120。设备没有该帧率时协商会失败，由下面的兜底放宽区间重试。
+        // ⭐ 帧率必须**精确请求**（min=max），不能给宽区间：
+        //   写 min=1 等于"什么都行"，libuvc 永远挑设备默认档（30），120 的描述符轮不到；
+        //   而"放宽区间 [1,120] 兜底"实测也是废的（2026-07-28 日志：640x480 放宽后照样 err=-51，
+        //   四条策略全败 → 永久黑屏）。所以失败后的正确做法是**按帧率梯度逐个精确重试**：
+        //   请求值 → 该尺寸上次协商成功值 → 60/30/25/20/15/10。
         val declaredFps = try { target?.fps?.maxOrNull()?.toInt() ?: 0 } catch (_: Exception) { 0 }
         val exactFps = when {
             requestedFps > 0 -> requestedFps                       // PC 指定了就照办（含 120）
             declaredFps > 0  -> declaredFps
             else             -> PROBE_MAX_FPS
         }
+        val candidates = (listOf(exactFps) +
+                listOfNotNull(knownGoodFps[sizeKey(w, h)]) +
+                listOf(60, 30, 25, 20, 15, 10).filter { it < exactFps })
+            .filter { it in 1..exactFps }
+            .distinct()
 
         camera.setFrameCallback(null, 0)
         try { camera.stopPreview() } catch (_: Exception) {}
-        try {
-            camera.setPreviewSize(w, h, exactFps, exactFps, frameFormat, bandwidth)
-            Log.d("meidui", "🔌 [OTG] 帧率精确请求 ${exactFps}fps @${w}x${h}" +
-                    (if (declaredFps > 0) "（设备声明${declaredFps}fps）" else "（设备未声明fps）"))
-        } catch (e: Exception) {
-            // 该档没有这个帧率 → 放宽区间让设备自己挑，并把实情打出来
-            Log.d("meidui", "🔌 [OTG] ⚠️ ${exactFps}fps 该档不支持(${e.message}) → 放宽到 ${MIN_FPS}~${exactFps} 让设备自选")
-            camera.setPreviewSize(w, h, MIN_FPS, exactFps, frameFormat, bandwidth)
+        var negotiatedOk = false
+        var lastErr: Exception? = null
+        for (fps in candidates) {
+            try {
+                camera.setPreviewSize(w, h, fps, fps, frameFormat, bandwidth)
+                acceptedFps = fps
+                negotiatedOk = true
+                Log.d("meidui", "🔌 [OTG] 帧率精确请求 ${fps}fps @${w}x${h} ✅被接受" +
+                        (if (fps != exactFps) "（请求的 ${exactFps}fps 该档没有，梯度降级）" else "") +
+                        (if (declaredFps > 0) "（设备声明${declaredFps}fps）" else ""))
+                break
+            } catch (e: Exception) {
+                lastErr = e
+                Log.d("meidui", "🔌 [OTG] ${fps}fps @${w}x${h} 谈不拢(${e.message}) → 试下一档")
+            }
+        }
+        if (!negotiatedOk) {
+            throw lastErr ?: IllegalStateException("no fps candidate accepted @${w}x${h}")
         }
         // ⭐ 关键修复：挂哑预览窗口，否则 native startPreview 因无窗口不起流线程 → 无帧
         camera.setPreviewDisplay(ensureDummySurface(w, h))
@@ -487,7 +546,10 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         uvcCamera = null
         releaseDummySurface()
         defaultControlValues.clear()
-        mjpegBlacklist.clear()
+        formatBlacklist.clear()
+        knownGoodFps.clear()
+        lastGoodConfig = null
+        fallbackTried = false
         initialSizePicked = false
         UvcCapabilityStore.clear()
         Log.d("meidui", "🔌 [OTG] UVC相机已关闭")
