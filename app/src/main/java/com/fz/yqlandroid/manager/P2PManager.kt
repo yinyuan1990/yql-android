@@ -374,11 +374,13 @@ class P2PManager(private val context: Context) {
             viewerSessions[pcId]?.let { existing ->
                 val s = existing.connectionState()
                 val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
-                // ⭐ §53.3①：requestId 变了 = PC 换了一轮请求（重登/重连），一律拆旧建新，不进去重分支。
-                //   去重窗口 3000→2000ms，与 PC 的重发间隔 1.5s、iOS 的同款窗口对齐。
-                val sameRequest = requestId == null || requestId == lastRequestId[pcId]
-                if (sameRequest &&
-                    (s == PeerConnection.PeerConnectionState.NEW ||
+                // ⭐ §53.3① / §53.16：去重窗口 3000→2000ms，与 PC 的重发间隔 1.5s、iOS 同款窗口对齐。
+                //   ⚠️ §53.16 回归修复：**不要拿 requestId 判断"是不是同一轮请求"**。
+                //   PC 侧 requestId 是逐条消息生成的毫秒时间戳，连它自己 1.5s 一次的重发都换新值——
+                //   一旦把"id 变了"当成"新一轮"，这个去重窗就等于没有：每次重试都拆掉刚建好的会话，
+                //   PC 拿着旧 Offer 回的 Answer 落到新会话上、SDP 对不上 → 永远连不通（iOS 上实测：
+                //   采集正常但推送=0fps、PC 不出画面）。requestId 只留作日志关联。
+                if ((s == PeerConnection.PeerConnectionState.NEW ||
                      s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 2000) {
                     Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms, reqId=$requestId)，忽略重复请求")
                     return
