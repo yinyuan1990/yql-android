@@ -477,26 +477,34 @@ class WebSocketManager private constructor() {
     
     // MARK: - ⭐ P2P WebRTC 信令发送（统一发到 /app/webrtc/signal，与 iOS 完全一致）
     
-    fun sendWebRTCSignalingSDP(sdpType: String, sdp: String, toDevice: String) {
+    // ⭐ §53.25：epoch = PC 发起本轮协商时生成的轮次标识（WEBRTC_REQUEST 带来，会话记住）。
+    //   该会话所有出站信令回带它，PC 只收当前轮次——幽灵 Offer/迟到 ICE 从协议层根绝。
+    //   null = 老版 PC 没带（兼容），不写字段。
+    fun sendWebRTCSignalingSDP(sdpType: String, sdp: String, toDevice: String, epoch: Long? = null) {
         val id = deviceId ?: return
-        sendWebRTCSignalingPayload(mapOf(
+        val payload = mutableMapOf<String, Any>(
             "type" to "WEBRTC_SDP", "sdpType" to sdpType, "sdp" to sdp,
             "fromDevice" to id, "toDevice" to toDevice
-        ))
+        )
+        if (epoch != null) payload["epoch"] = epoch
+        sendWebRTCSignalingPayload(payload)
     }
     
-    fun sendWebRTCSignalingICE(candidate: String, sdpMid: String, sdpMLineIndex: Int, toDevice: String) {
+    fun sendWebRTCSignalingICE(candidate: String, sdpMid: String, sdpMLineIndex: Int, toDevice: String, epoch: Long? = null) {
         val id = deviceId ?: return
-        sendWebRTCSignalingPayload(mapOf(
+        val payload = mutableMapOf<String, Any>(
             "type" to "WEBRTC_ICE", "candidate" to candidate, "sdpMid" to sdpMid,
             "sdpMLineIndex" to sdpMLineIndex, "fromDevice" to id, "toDevice" to toDevice
-        ))
+        )
+        if (epoch != null) payload["epoch"] = epoch
+        sendWebRTCSignalingPayload(payload)
     }
     
-    fun sendWebRTCSignaling(type: String, reason: String = "", toDevice: String) {
+    fun sendWebRTCSignaling(type: String, reason: String = "", toDevice: String, epoch: Long? = null) {
         val id = deviceId ?: return
         val payload = mutableMapOf<String, Any>("type" to type, "fromDevice" to id, "toDevice" to toDevice)
         if (reason.isNotEmpty()) payload["reason"] = reason
+        if (epoch != null) payload["epoch"] = epoch
         sendWebRTCSignalingPayload(payload)
     }
     

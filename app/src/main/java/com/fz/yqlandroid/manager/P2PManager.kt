@@ -62,6 +62,9 @@ class P2PManager(private val context: Context) {
     // ⭐ §53.3①：PC 带来的 requestId（每次 connectP2P/重发递增）。变了就必须拆旧建新，
     //   不能再按"会话建立中"忽略——否则新登录的 PC 会被上一轮的幽灵会话吞掉请求。
     private val lastRequestId = HashMap<String, Long>()
+    // ⭐⭐ §53.25：会话 epoch——PC 每轮协商生成一个（重发不换、重建才换）。REQUEST 带来时记住；
+    //   该会话所有出站信令回带；入站 Answer/ICE 轮次不符直接丢弃；同 epoch 重复 REQUEST 天然幂等。
+    private val sessionEpoch = HashMap<String, Long>()
 
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
@@ -162,8 +165,9 @@ class P2PManager(private val context: Context) {
         Log.d("meidui", "📶 [P2P切网] 拆除并让 PC 重连 ${sessions.size} 个会话(不做ICE Restart): ${sessionStatesSummary()}")
         for ((pcId, _) in sessions) {
             iceRetryCount[pcId] = 0
+            val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25：拆除前取轮次回带
             removeViewerSession(pcId, notifyPC = false)
-            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId, e)
         }
         onNetworkSwitchReconnect?.invoke()   // 通知上层置"重连中"（StreamingScreen 左上角显示）
     }
@@ -189,6 +193,19 @@ class P2PManager(private val context: Context) {
         //   ICE 回调打到已释放 pc → SIGSEGV（libjingle_peerconnection_so.so）。
         //   统一 hop 到 mainScope，让信令与 ICE/Observer 处理在同一线程串行，彻底消除 native 竞态。
         mainScope.launch {
+            // ⭐⭐ §53.25：会话 epoch——PC 每轮协商生成一个（重发不换），我们记住并在该会话
+            //   所有出站信令里回带；入站 Answer/ICE/HANGUP 轮次不符 = 上一轮的过期信令，直接丢弃。
+            //   缺字段（老版 PC）= 跳过校验，退回时间窗行为。
+            val msgEpoch = (message["epoch"] as? Number)?.toLong()
+            fun staleEpoch(): Boolean {
+                val cur = synchronized(viewerSessions) { sessionEpoch[fromDevice] } ?: return false
+                val e = msgEpoch ?: return false
+                if (e != cur) {
+                    Log.w(TAG, "🗑 丢弃过期轮次信令 type=$type from=$fromDevice msgEpoch=$e 当前=$cur")
+                    return true
+                }
+                return false
+            }
             when (type) {
                 "VIEWER_CONNECTED" -> Log.d(TAG, "✅ PC $fromDevice 已收到画面")
                 // ⭐ §53.3①：真的拆会话（以前只打日志）。PC 退出时发的这条通知白发 → 会话留在
@@ -207,17 +224,18 @@ class P2PManager(private val context: Context) {
                         WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
                         return@launch
                     }
-                    // requestId：PC 每次 connectP2P/重发递增；旧版 PC 不带（null）→ 只靠时间窗去重
+                    // requestId：逐条消息的时间戳，仅日志关联；轮次判定用 epoch（§53.25）
                     val reqId = (message["requestId"] as? Number)?.toLong()
-                    createViewerSession(fromDevice, reqId)
+                    createViewerSession(fromDevice, reqId, msgEpoch)
                 }
                 "WEBRTC_SDP" -> {
                     val sdpType = message["sdpType"] as? String ?: ""
                     val sdp = message["sdp"] as? String ?: ""
-                    if (sdpType == "answer") handleRemoteAnswer(sdp, fromDevice)
+                    if (sdpType == "answer" && !staleEpoch()) handleRemoteAnswer(sdp, fromDevice)
                 }
-                "WEBRTC_ICE" -> handleRemoteIce(message, fromDevice)
+                "WEBRTC_ICE" -> { if (!staleEpoch()) handleRemoteIce(message, fromDevice) }
                 "WEBRTC_HANGUP" -> {
+                    if (staleEpoch()) return@launch
                     // ⭐ §23.2 竞态保护：会话刚创建（<1s）就收到 HANGUP = PC 针对「上一个会话」的挂断
                     //   乱序迟到（PC 先 HANGUP 再 REQUEST，服务器转发顺序不保证）。无条件移除会把
                     //   正在 createOffer 的新会话干掉 → Offer 发到死会话 → 首开白等 15s+。
@@ -278,30 +296,35 @@ class P2PManager(private val context: Context) {
 
     // MARK: - 会话管理
 
-    fun createViewerSession(pcId: String, requestId: Long? = null) {
+    fun createViewerSession(pcId: String, requestId: Long? = null, epoch: Long? = null) {
         val ds = dataSource ?: run { Log.e(TAG, "❌ dataSource 为空"); return }
         val factory = ds.p2pFactory ?: run { Log.e(TAG, "❌ factory 为空"); return }
 
         synchronized(viewerSessions) {
             viewerSessions[pcId]?.let { existing ->
-                val s = existing.connectionState()
-                val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
-                // ⭐ §53.3① / §53.16：去重窗口 3000→2000ms，与 PC 的重发间隔 1.5s、iOS 同款窗口对齐。
-                //   ⚠️ §53.16 回归修复：**不要拿 requestId 判断"是不是同一轮请求"**。
-                //   PC 侧 requestId 是逐条消息生成的毫秒时间戳，连它自己 1.5s 一次的重发都换新值——
-                //   一旦把"id 变了"当成"新一轮"，这个去重窗就等于没有：每次重试都拆掉刚建好的会话，
-                //   PC 拿着旧 Offer 回的 Answer 落到新会话上、SDP 对不上 → 永远连不通（iOS 上实测：
-                //   采集正常但推送=0fps、PC 不出画面）。requestId 只留作日志关联。
-                if ((s == PeerConnection.PeerConnectionState.NEW ||
-                     s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 2000) {
-                    Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms, reqId=$requestId)，忽略重复请求")
-                    return
+                // ⭐⭐ §53.25 幂等判据（确定性，优先）：同 epoch = 同一轮重发 → 幂等忽略；
+                //   epoch 变了 = PC 新一轮（重建 pipeline）→ 拆旧建新。
+                val cur = sessionEpoch[pcId]
+                if (epoch != null && cur != null) {
+                    if (epoch == cur) {
+                        Log.w(TAG, "⚠️ PC $pcId 同轮次重发(epoch=$epoch) → 幂等忽略，等 Answer")
+                        return
+                    }
+                    Log.w(TAG, "♻️ PC $pcId 新轮次请求(epoch $cur→$epoch) → 拆旧建新")
+                    // 落到下方的拆旧建新路径
+                } else {
+                    val s = existing.connectionState()
+                    val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
+                    // ⭐ §53.3① / §53.16 时间窗（兜底，仅老版 PC 无 epoch 时用）：
+                    //   requestId 是逐条消息时间戳，只留日志关联（§53.16 教训：别拿它判轮次）。
+                    if ((s == PeerConnection.PeerConnectionState.NEW ||
+                         s == PeerConnection.PeerConnectionState.CONNECTING) && ageMs < 2000) {
+                        Log.w(TAG, "⚠️ PC $pcId 会话建立中(${ageMs}ms, reqId=$requestId)，忽略重复请求")
+                        return
+                    }
+                    Log.w(TAG, "🔁 PC $pcId 旧会话状态=$s(${ageMs}ms)，拆掉重建响应新 REQUEST")
+                    Log.d("meidui", "🔁 [P2P] REQUEST 触发旧会话重建: state=$s age=${ageMs}ms")
                 }
-                // ⭐ 切网重连关键修复：超过 3s 仍停在 NEW/CONNECTING = 僵尸会话（切网后 ICE 永远
-                //   连不上/Offer 曾发进死 WS）。旧逻辑无条件忽略 → PC 每次超时重发 REQUEST 都被
-                //   吞掉 → 永远连不上。现在拆掉重建，PC 的重连请求必须赢。
-                Log.w(TAG, "🔁 PC $pcId 旧会话状态=$s(${ageMs}ms)，拆掉重建响应新 REQUEST")
-                Log.d("meidui", "🔁 [P2P] REQUEST 触发旧会话重建: state=$s age=${ageMs}ms")
             }
         }
         // 已存在旧会话（非建立中）→ 拆掉重建
@@ -360,6 +383,8 @@ class P2PManager(private val context: Context) {
             viewerSessions[pcId] = newPC
             viewerSenders[pcId] = sender
             sessionCreatedAt[pcId] = System.currentTimeMillis()
+            // ⭐ §53.25：记住本会话的协商轮次（出站信令回带；老版 PC 无 epoch 则清掉旧值）
+            if (epoch != null) sessionEpoch[pcId] = epoch else sessionEpoch.remove(pcId)
             currentViewerCount = viewerSessions.size
         }
         // 会话创建时初始化整组参数（码率 + 帧率），后续走拆分后的独立方法
@@ -389,8 +414,9 @@ class P2PManager(private val context: Context) {
                 //   协商成 VP8 = ICE 连上但画面永远出不来（SRS 不受影响：SRS Answer 只回 H264）。
                 val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                 newPC.setLocalDescription(SilentSdpObserver, munged)
-                WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
-                Log.d(TAG, "📤 已发送 Offer 给 $pcId（${H265Support.codecLabel()} 限定）")
+                val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25 回带轮次
+                WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId, e)
+                Log.d(TAG, "📤 已发送 Offer 给 $pcId（${H265Support.codecLabel()} 限定，epoch=${e ?: "无"}）")
             }
             override fun onCreateFailure(e: String?) { Log.e(TAG, "❌ 创建 Offer 失败 $pcId: $e") }
             override fun onSetSuccess() {}
@@ -400,12 +426,14 @@ class P2PManager(private val context: Context) {
 
     fun removeViewerSession(pcId: String, notifyPC: Boolean) {
         if (notifyPC) {
-            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "android_close", pcId)
+            val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "android_close", pcId, e)
         }
         val pc = synchronized(viewerSessions) {
             val removed = viewerSessions.remove(pcId)
             viewerSenders.remove(pcId)
             sessionCreatedAt.remove(pcId)
+            sessionEpoch.remove(pcId)   // §53.25
             currentViewerCount = viewerSessions.size
             removed
         }
@@ -423,6 +451,7 @@ class P2PManager(private val context: Context) {
             viewerSessions.clear()
             viewerSenders.clear()
             sessionCreatedAt.clear()
+            sessionEpoch.clear()   // §53.25
             currentViewerCount = 0
             copy
         }
@@ -442,8 +471,9 @@ class P2PManager(private val context: Context) {
     private fun createObserver(pcId: String) = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate?) {
             candidate ?: return
+            val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25 回带轮次
             WebSocketManager.instance.sendWebRTCSignalingICE(
-                candidate.sdp, candidate.sdpMid ?: "0", candidate.sdpMLineIndex, pcId)
+                candidate.sdp, candidate.sdpMid ?: "0", candidate.sdpMLineIndex, pcId, e)
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
@@ -512,7 +542,8 @@ class P2PManager(private val context: Context) {
                     // ⭐ ICE Restart 的 Offer 同样做 codec 限定（与首次 Offer 一致，防重协商时倒回 VP8）
                     val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                     pc.setLocalDescription(SilentSdpObserver, munged)
-                    WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
+                    val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25
+                    WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId, e)
                     Log.d(TAG, "🔄 ICE Restart Offer 已发送 $pcId (${cur + 1}/$MAX_ICE_RETRIES)")
                 }
                 override fun onCreateFailure(e: String?) { Log.e(TAG, "ICE Restart Offer 失败 $pcId: $e") }
@@ -524,9 +555,10 @@ class P2PManager(private val context: Context) {
             //   → 回落 SRS（原"不回退 SRS"是连接方式静态时代的口径，现在会永远黑屏）。
             Log.e(TAG, "❌ $pcId ICE 重试耗尽（无中继=确认非局域网）→ 回落 SRS")
             iceRetryCount.remove(pcId)
+            val e = synchronized(viewerSessions) { sessionEpoch[pcId] }   // §53.25
             removeViewerSession(pcId, notifyPC = false)
             SessionPolicy.forceSrsForSession("P2P ICE 失败重试耗尽($pcId)，无中继=确认非局域网")
-            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "ice_failed", pcId)
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "ice_failed", pcId, e)
         }
     }
 
