@@ -409,14 +409,11 @@ class P2PManager(private val context: Context) {
             return
         }
 
-        // ⚠️ 不加公共 STUN 兜底：ICE 节点一律用后端登录下发的自有 STUN/TURN（coturn）。
-        //   后端没下发就空列表（同局域网 host 候选仍可直连），绝不连第三方免费节点。
-        val servers = loadIceServers()
-        if (servers.isEmpty()) {
-            Log.w(TAG, "⚠️ 后端未下发 iceServers，无 STUN/TURN（仅局域网 host 候选可直连）")
-        }
-        val turnCount = servers.count { it.urls.any { u -> u.startsWith("turn:") } }
-        Log.d(TAG, "🔔 ICE 服务器 ${servers.size} 个 (TURN=$turnCount)")
+        // ⭐⭐ §53.19（用户拍板，与 iOS 一致）：P2P **只做局域网直连**——去掉 TURN 中继与 STUN 打洞。
+        //   传空 iceServers → 只产生 host 候选：同 WiFi 秒连；不在同 WiFi 无 srflx/relay → ICE 失败回落。
+        //   从 ICE 层根断"非局域网还假装 P2P（实走中继）"。loadIceServers/effectiveForceRelay/relay 相关保留但不生效。
+        val servers = emptyList<PeerConnection.IceServer>()
+        Log.d(TAG, "🔔 P2P 局域网直连(host-only，无 TURN/STUN)")
 
         val cfg = PeerConnection.RTCConfiguration(servers)
         cfg.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
@@ -427,10 +424,8 @@ class P2PManager(private val context: Context) {
         // P0-2 对齐 iOS：ICE 稳定性参数（8s 无收包才判 disconnected，弱网更耐抖）
         cfg.iceConnectionReceivingTimeout = 8000
         cfg.iceBackupCandidatePairPingInterval = 2000
-        val useRelay = effectiveForceRelay(pcId)
-        cfg.iceTransportsType = if (useRelay) PeerConnection.IceTransportsType.RELAY
-                                else PeerConnection.IceTransportsType.ALL
-        Log.d(TAG, "🔔 创建会话 $pcId，传输策略=${if (useRelay) "relay(TURN)" else "all(直连优先)"}")
+        // ⭐ §53.19：无 STUN/TURN，ALL 实际只剩 host 候选（=局域网直连）
+        cfg.iceTransportsType = PeerConnection.IceTransportsType.ALL
 
         val observer = createObserver(pcId)
         val newPC = factory.createPeerConnection(cfg, observer) ?: run {
@@ -595,9 +590,12 @@ class P2PManager(private val context: Context) {
                 override fun onSetFailure(e: String?) {}
             }, cons)
         } else {
-            Log.e(TAG, "❌ $pcId ICE 重试耗尽，断开（静态连接方式，不回退 SRS）")
+            // ⭐ §53.19：P2P 已是纯局域网直连（无 TURN/STUN），ICE 重试耗尽 = 确认不在局域网
+            //   → 回落 SRS（原"不回退 SRS"是连接方式静态时代的口径，现在会永远黑屏）。
+            Log.e(TAG, "❌ $pcId ICE 重试耗尽（无中继=确认非局域网）→ 回落 SRS")
             iceRetryCount.remove(pcId)
             removeViewerSession(pcId, notifyPC = false)
+            SessionPolicy.forceSrsForSession("P2P ICE 失败重试耗尽($pcId)，无中继=确认非局域网")
             WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "ice_failed", pcId)
         }
     }
