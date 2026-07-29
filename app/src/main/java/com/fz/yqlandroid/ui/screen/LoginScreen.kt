@@ -400,6 +400,9 @@ fun LoginScreen(
                                         val codecSrs = (response.videoCodecSrs ?: "h265").lowercase()
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY, codecP2p)
                                         putString(com.fz.yqlandroid.manager.H265Support.PREFS_RUNTIME_KEY_SRS, codecSrs)
+                                        // ⭐ §53.20.2：本机公网出口 IP，SessionPolicy 拿它与 PC 的
+                                        //   publicIp 比对，防 /24 网段号撞车误判同 WiFi。老后端=空。
+                                        putString("public_ip", response.clientIp ?: "")
                                         putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         response.iceServers?.let {

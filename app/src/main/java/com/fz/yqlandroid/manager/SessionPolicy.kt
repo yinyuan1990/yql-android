@@ -54,6 +54,10 @@ object SessionPolicy {
     @Volatile private var renegotiateCount = 0
     @Volatile private var pinnedToSrs = false
     @Volatile private var graceConsumed = false
+    /** ⭐ §53.20.1：标记「下一次 decideForPublish 是重协商触发的重启」。没有它，重协商
+     *  = 停推流→startPublish→decideForPublish 把钉住/计数全重置 —— 「钉住 SRS」活不过
+     *  一次重启，P2P↔SRS 每 5~10s 拆建一轮无限打架（客户实测=画面周期性卡顿）。 */
+    @Volatile private var renegotiationInFlight = false
 
     /** 输入变化且新结果与已定案不同 → 回调上层做「停推流 → 重新决策 → 起推流」 */
     @Volatile var onRenegotiateNeeded: ((String) -> Unit)? = null
@@ -70,9 +74,16 @@ object SessionPolicy {
      * 观看端状态有变化时由 WebSocketManager 调用（只在"可能改变决策"的字段变了时才调，
      * 不是每条心跳都调）。内部评估是否需要重新协商。
      */
-    fun onViewerInputChanged(trigger: String) {
+    fun onViewerInputChanged(trigger: String, isNewViewer: Boolean = false) {
         val pending = pendingNetworkChange
         if (pending) pendingNetworkChange = false
+        // ⭐ §53.20.3 单人模式先到先得：P2P 会话进行中，**新上线**的 PC 不触发重新协商
+        //  （不能让后来者把先来者正看着的直连会话顶掉切 SRS）——它的请求由 P2P 层
+        //   回 WEBRTC_REJECT(single_mode_occupied) 提示占线。本机切网(pending)例外照常评估。
+        if (isNewViewer && !pending && current?.mode == Mode.P2P) {
+            log("🚧 单人直连进行中，新上线PC($trigger)不打断当前会话（其请求由 P2P 层拒绝提示占线）")
+            return
+        }
         evaluateForRenegotiate(if (pending) "$trigger + 本机切过网" else trigger)
     }
 
@@ -109,6 +120,7 @@ object SessionPolicy {
         current = Decision(Mode.SRS, decided.codec, "实测非局域网，改走多人线路")
         connectReason = current!!.reason
         log("🔧 $reason → 本次会话钉住多人线路(SRS)，执行重新协商")
+        renegotiationInFlight = true   // §53.20.1：重启后的 decideForPublish 保留钉住状态
         onRenegotiateNeeded?.invoke(reason)
     }
 
@@ -123,11 +135,18 @@ object SessionPolicy {
         current = null
         renegotiateCount = 0
         pinnedToSrs = false
+        renegotiationInFlight = false
         lastRenegotiateAtMs = 0
         graceConsumed = false
         pendingNetworkChange = false
         connectReason = ""
         WebSocketManager.instance.clearPcPresence()
+    }
+
+    /** ⭐ §53.20.1：上层收到重协商回调但未在推流（忽略执行）时清标记，
+     *  否则残留标记会让下一次**用户手动**推流误当成"重协商重启"而保留过期的钉住状态。 */
+    fun abortRenegotiation() {
+        renegotiationInFlight = false
     }
 
     /**
@@ -145,11 +164,18 @@ object SessionPolicy {
 
     /** 按当前输入定案本次会话的 mode + codec（startPublish 调，唯一入口） */
     fun decideForPublish(context: Context?): Decision {
+        // ⭐ §53.20.1：重协商触发的重启必须**继承**钉住状态与协商计数——否则
+        //   forceSrsForSession 钉住 SRS → 停推流重启 → 这里清零 → 又算回 P2P → 又失败，
+        //   P2P↔SRS 无限拆建（客户实测=画面周期性卡顿）。只有全新会话才清零。
+        if (renegotiationInFlight) {
+            renegotiationInFlight = false
+        } else {
+            renegotiateCount = 0
+            pinnedToSrs = false
+        }
         val d = compute(context)
         current = d
         connectReason = d.reason
-        renegotiateCount = 0
-        pinnedToSrs = false
         log("✅ 推流前定案：${d.mode}+${d.codec.uppercase()} —— ${d.reason}")
         return d
     }
@@ -165,7 +191,12 @@ object SessionPolicy {
         val backendForcesSrs = context?.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
             ?.getString("connect_mode", "auto")?.lowercase() == "srs"
         val mode: Mode
-        if (backendForcesSrs) {
+        if (pinnedToSrs) {
+            // ⭐ §53.20.1：本次会话已被实测否掉 P2P（ICE 失败/协商次数达上限），
+            //   重协商重启后必须还记得——不能拿网段预判再算回 P2P。
+            mode = Mode.SRS
+            reasons.add("本次会话已钉住多人线路")
+        } else if (backendForcesSrs) {
             mode = Mode.SRS
             reasons.add("后端强制多人线路")
         } else if (viewers.isEmpty()) {
@@ -174,13 +205,25 @@ object SessionPolicy {
         } else {
             val anyMissingIps = viewers.values.any { it.localIps.isEmpty() }
             val allSameSubnet = viewers.values.all { sharesSubnet(myIps, it.localIps) }
-            if (allSameSubnet && !anyMissingIps) {
+            // ⭐ §53.20.2：/24 网段判定有假阳性——192.168.1.x 是全世界路由器的默认网段，
+            //   设备在 A 地、PC 在 B 地完全可能撞车 → 误判同 WiFi → P2P 白失败几十秒才回落。
+            //   公网出口 IP 双重校验：同一 WiFi 下两端出口必然相同（同一路由器出网）。
+            //   任一侧为空（老 PC/老后端没下发 clientIp）→ 跳过该校验，退回纯网段判定。
+            val myPublicIp = context?.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+                ?.getString("public_ip", "") ?: ""
+            val publicIpMismatch = myPublicIp.isNotEmpty() && viewers.values.any {
+                it.publicIp.isNotEmpty() && it.publicIp != myPublicIp
+            }
+            if (allSameSubnet && !anyMissingIps && !publicIpMismatch) {
                 mode = Mode.P2P
                 reasons.add("与观看端同 WiFi，走单人直连")
             } else {
                 mode = Mode.SRS
-                reasons.add(if (anyMissingIps) "观看端未上报网段(旧版PC)，走多人线路"
-                            else "与观看端不在同一 WiFi，走多人线路")
+                reasons.add(when {
+                    publicIpMismatch -> "公网出口不同(非同一WiFi，网段号撞车)，走多人线路"
+                    anyMissingIps -> "观看端未上报网段(旧版PC)，走多人线路"
+                    else -> "与观看端不在同一 WiFi，走多人线路"
+                })
             }
         }
 
@@ -232,11 +275,13 @@ object SessionPolicy {
             connectReason = current!!.reason
             lastRenegotiateAtMs = System.currentTimeMillis()
             log("⚠️ 本次会话已重新协商 $MAX_RENEGOTIATE_PER_SESSION 次，钉死多人线路(SRS)不再切换（防抖）")
+            renegotiationInFlight = true   // §53.20.1：重启后的 decideForPublish 保留钉住/计数
             onRenegotiateNeeded?.invoke("协商次数达上限→固定SRS")
             return
         }
         lastRenegotiateAtMs = System.currentTimeMillis()
         log("🔄 重新协商($trigger)：${decided.mode}+${decided.codec} → ${fresh.mode}+${fresh.codec}（停推流→重决策→起推流）")
+        renegotiationInFlight = true       // §53.20.1
         onRenegotiateNeeded?.invoke(trigger)
     }
 

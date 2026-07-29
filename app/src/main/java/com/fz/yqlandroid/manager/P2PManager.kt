@@ -398,6 +398,16 @@ class P2PManager(private val context: Context) {
         }
         if (requestId != null) lastRequestId[pcId] = requestId
 
+        // ⭐ §53.20.3 P2P=单人直连，先到先得：已有**别的 PC** 的会话时，后来者直接拒绝并提示，
+        //   绝不拆先来者的会话（同 pcId 的重复/重连请求已在上面的去重窗处理）。
+        val occupied = synchronized(viewerSessions) { viewerSessions.keys.firstOrNull { it != pcId } }
+        if (occupied != null) {
+            Log.w(TAG, "🚧 单人直连已被 $occupied 占用 → 拒绝后来的 $pcId（single_mode_occupied）")
+            Log.d("meidui", "🚧 [P2P] 单人直连已被 $occupied 占用 → 拒绝 $pcId")
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "single_mode_occupied", pcId)
+            return
+        }
+
         if (viewerCount >= maxViewers) {
             Log.e(TAG, "❌ 已达最大观看人数($maxViewers)，拒绝 $pcId")
             WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "max_viewers_reached", pcId)

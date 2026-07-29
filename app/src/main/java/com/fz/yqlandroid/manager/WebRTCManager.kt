@@ -1116,6 +1116,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun renegotiateSession(reason: String) {
         if (!isPublishing) {
             Log.d("meidui", "🧭 [链路决策] 收到重新协商($reason)但当前未推流，忽略")
+            SessionPolicy.abortRenegotiation()   // §53.20.1：清标记，防污染下次手动推流
             return
         }
         // ⭐ §53.12：推流正在建立中（POST 未回 / 预览在起）时绝不插手——否则会把别的
@@ -1123,10 +1124,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //   表现就是"切网后彻底没画面"。等它建完，下一次输入变化再评估。
         if (publishStarting) {
             Log.d("meidui", "🧭 [链路决策] 推流正在建立中，跳过重新协商($reason)")
+            SessionPolicy.abortRenegotiation()   // §53.20.1
             return
         }
         if (srsIP.isEmpty() || baseStreamKey.isEmpty()) {
             Log.w(TAG, "🧭 [链路决策] 重新协商($reason)缺少推流参数，放弃")
+            SessionPolicy.abortRenegotiation()   // §53.20.1
             return
         }
         Log.d("meidui", "🧭 [链路决策] 执行重新协商：$reason —— 停推流 → 重新决策 → 起推流")

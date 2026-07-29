@@ -60,8 +60,9 @@ class WebSocketManager private constructor() {
     // ⭐ §53.2 PC 在线注册表（PC_PRESENCE 心跳，与画面无关）。
     //   在线 ≠ 在看：「在线但没出画面」是本轮那类故障的现场特征，必须能分开显示。
     //   localIps：§53.4 推流前判「同不同 WiFi」用（比 /24 网段，不必先建 WebRTC 会话看 ICE）。
+    //   publicIp：§53.20.2 PC 的公网出口 IP（防 /24 网段号撞车误判同 WiFi）。老版 PC 缺省=空。
     data class PcPresence(val lastSeenMs: Long, val viewing: Boolean, val h265Recv: Boolean,
-                          val kernel: String, val localIps: List<String>)
+                          val kernel: String, val localIps: List<String>, val publicIp: String = "")
     private val pcPresence = HashMap<String, PcPresence>()
     @Volatile var lastPcPresenceAtMs: Long = 0
         private set
@@ -426,22 +427,26 @@ class WebSocketManager private constructor() {
                         val kernel = json["kernel"] as? String ?: "unknown"
                         val localIps = (json["localIps"] as? String ?: "")
                             .split(",").filter { it.isNotBlank() }
+                        // ⭐ §53.20.2：PC 的公网出口 IP（防 /24 网段号撞车误判同 WiFi）
+                        val publicIp = json["publicIp"] as? String ?: ""
                         var inputChanged = false
                         var isNew = false
                         synchronized(pcPresence) {
                             val old = pcPresence[pcId]
                             isNew = old == null
                             pcPresence[pcId] = PcPresence(System.currentTimeMillis(), viewing,
-                                                          h265Recv, kernel, localIps)
+                                                          h265Recv, kernel, localIps, publicIp)
                             // 只有"会改变决策"的字段变了才评估重新协商，避免每秒心跳都跑一遍
-                            inputChanged = isNew || old?.h265Recv != h265Recv || old?.localIps != localIps
+                            inputChanged = isNew || old?.h265Recv != h265Recv ||
+                                           old?.localIps != localIps || old?.publicIp != publicIp
                             if (isNew) {
-                                Log.d("meidui", "🖥 [PC在线] $pcId 上线（内核=$kernel 能收H265=$h265Recv 在看=$viewing 网段=$localIps）")
+                                Log.d("meidui", "🖥 [PC在线] $pcId 上线（内核=$kernel 能收H265=$h265Recv 在看=$viewing 网段=$localIps 公网=${publicIp.ifEmpty { "未报" }}）")
                             }
                         }
                         if (inputChanged) {
                             SessionPolicy.onViewerInputChanged(
-                                if (isNew) "PC上线($pcId)" else "PC网络/能力变化($pcId)")
+                                if (isNew) "PC上线($pcId)" else "PC网络/能力变化($pcId)",
+                                isNewViewer = isNew)
                         }
                     }
                 }

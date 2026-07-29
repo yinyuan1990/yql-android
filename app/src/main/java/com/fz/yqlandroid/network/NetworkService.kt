@@ -603,7 +603,10 @@ data class LoginResponse(
     val maxP2PViewers: Int? = null,            // 最大 P2P 观看端数
     // ⭐ §53.4.4：编码默认值改由总后台配置（默认 h265，不支持时客户端自动回退 h264）
     val videoCodecP2p: String? = null,         // "h264" | "h265"
-    val videoCodecSrs: String? = null          // "h264" | "h265"
+    val videoCodecSrs: String? = null,         // "h264" | "h265"
+    // ⭐ §53.20.2：本机公网出口 IP（后端按请求来源回填）。与 PC 上报的 publicIp 比对，
+    //   防 /24 网段号撞车（两地都是 192.168.1.x）误判同 WiFi。老后端缺省 → 跳过该校验。
+    val clientIp: String? = null
 )
 
 /**
