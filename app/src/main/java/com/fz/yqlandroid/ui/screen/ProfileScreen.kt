@@ -301,17 +301,17 @@ fun ProfileScreen(
                     .fillMaxWidth()
                     .background(Color.White)
             ) {
-                // ⭐ §53.9：开通会员后这一行从「注册时间」变成「<等级>会员 + 开通时间」；
-                //   未开通（试用）时保持原样显示注册时间。等级命名与 levelText 同一口径
-                //   （总后台会员管理：1=高清 2=超清 3=超高清 4=超高帧），不用后端 activationLevelName。
-                val activationTime = tokenPrefs.getString("activation_time", "") ?: ""
+                // ⭐ §53.9 / §53.15：开通会员后这一行显示「<等级> + 注册成功时间」，未开通显示「注册时间」。
+                //   两点口径（与 iOS 一致）：
+                //   ① 等级名**不带"会员"二字**（超高清会员 → 超高清），命名同 levelText
+                //      （总后台会员管理：1=高清 2=超清 3=超高清 4=超高帧），不用后端 activationLevelName。
+                //   ② **不显示开通时间**，只显示账号注册时间——应用商店审核对"开通/付费"类信息敏感，
+                //      不暴露任何与购买/激活时点相关的内容。
+                val registeredAt = formatProfileDate(userProfile?.createdAt)
                 ProfileRow(
                     icon = Icons.Default.DateRange,
-                    title = if (activated) "${levelText}会员" else "注册时间",
-                    subtitle = if (activated) {
-                        // 老后端不下发开通时间时不硬凑假日期，直接留白
-                        if (activationTime.isEmpty()) "—" else "开通时间 " + formatProfileDate(activationTime)
-                    } else formatProfileDate(userProfile?.createdAt),
+                    title = if (activated) levelText else "注册时间",
+                    subtitle = if (activated) "注册成功时间 $registeredAt" else registeredAt,
                     onClick = { }
                 )
                 
