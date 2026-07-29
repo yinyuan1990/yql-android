@@ -375,6 +375,14 @@ class P2PManager(private val context: Context) {
         newPC.createOffer(object : SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 if (sdp == null) return
+                // ⭐ §53.24：幽灵 Offer 抑制——Offer 创建是异步的，期间会话可能已被拆除
+                //  （PC 断开 HANGUP / 新 REQUEST 拆旧建新）。过期 Offer 发出去会与新会话的
+                //   Offer 交错，PC 每收一个新 ufrag 就重建一次 pipeline → 重建风暴。
+                val current = synchronized(viewerSessions) { viewerSessions[pcId] }
+                if (current !== newPC) {
+                    Log.w(TAG, "🗑 会话已拆除，丢弃过期 Offer($pcId)")
+                    return
+                }
                 // ⭐ H264 限定（对齐 iOS preferredCodec=H264）：Android DefaultVideoEncoderFactory
                 //   的 codec 顺序是软件编码器(VP8/VP9/AV1)在前、H264 在后 → Offer 首选 VP8；
                 //   PC GStreamer 是 Answerer 且解码链路写死 rtph264depay(只解 H264)，
@@ -495,6 +503,12 @@ class P2PManager(private val context: Context) {
             pc.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(sdp: SessionDescription?) {
                     if (sdp == null) return
+                    // ⭐ §53.24：幽灵 Offer 抑制（与 createViewerSession 同款）
+                    val current = synchronized(viewerSessions) { viewerSessions[pcId] }
+                    if (current !== pc) {
+                        Log.w(TAG, "🗑 会话已拆除，丢弃过期 ICE Restart Offer($pcId)")
+                        return
+                    }
                     // ⭐ ICE Restart 的 Offer 同样做 codec 限定（与首次 Offer 一致，防重协商时倒回 VP8）
                     val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
                     pc.setLocalDescription(SilentSdpObserver, munged)
