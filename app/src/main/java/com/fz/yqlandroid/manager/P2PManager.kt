@@ -2,8 +2,6 @@ package com.fz.yqlandroid.manager
 
 import android.content.Context
 import android.util.Log
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import org.webrtc.*
 
@@ -12,7 +10,8 @@ import org.webrtc.*
  *
  * - 与 SRS 模式互斥：connect_mode == "p2p" 时由 WebRTCManager 启动本类，SRS 推流不启用。
  * - 多观看端：每个观看 PC 一个独立 PeerConnection（Offerer）。
- * - 链路顺序：P2P 直连(host/srflx) → TURN 中继(relay)；不回退 SRS（静态连接方式）。
+ * - ⭐ §53.19/§53.21：P2P = **纯局域网直连（host-only）**。TURN 中继与 STUN 打洞代码已物理删除
+ *   （用户拍板）：跨网一律走 SRS，本类只负责同 WiFi 的 host↔host 会话；ICE 失败 = 确认非局域网 → 回落 SRS。
  * - 信令走 WebSocketManager 的 /app/webrtc/signal（收 /topic/device/{id}/webrtc），
  *   协议与 iOS 完全一致，PC 端零改动。
  *
@@ -56,12 +55,6 @@ class P2PManager(private val context: Context) {
     private val pendingRemoteIce = HashMap<String, MutableList<IceCandidate>>()
     private val pendingIceRestart = HashSet<String>()
     private val iceRetryCount = HashMap<String, Int>()
-    private val forceRelayPeerIds = HashSet<String>()      // ICE 失败黑名单 → 重建时强制 relay
-    // ⭐ §25.7b：链路择优的 relay 钉住集合。与 forceRelayPeerIds 的区别：**跨会话拆建存活**
-    //（removeViewerSession 不清除，仅 closeAllViewerSessions 清），因为硬切中继 = 拆会话让 PC
-    // 重新 REQUEST，重建时必须还记得「这个 PC 要走 relay」。
-    private val qualityRelayPeerIds = HashSet<String>()
-    private val peerNetworkType = HashMap<String, String>() // pcDeviceId → "cellular"/"wifi"/...
     // ⭐ 会话创建时间：① WEBRTC_REQUEST 去重只在 3s 内生效（防切网后卡死的 CONNECTING 僵尸会话
     //   永远吞掉 PC 的重连请求）；② 创建后 1s 内到达的 WEBRTC_HANGUP 视为旧会话残留信令，忽略
     //   （§23.2 首开 17s 竞态：PC 先 HANGUP 旧会话再 REQUEST，两条消息乱序到达会把新会话干掉）。
@@ -70,16 +63,13 @@ class P2PManager(private val context: Context) {
     //   不能再按"会话建立中"忽略——否则新登录的 PC 会被上一轮的幽灵会话吞掉请求。
     private val lastRequestId = HashMap<String, Long>()
 
-    private val gson = Gson()
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    // 本机网络状态（蜂窝→强制 relay）。§21.27：由 WebRTCManager 的统一网络监听喂入，本类不再自注册回调
+    // 本机网络状态。§21.27：由 WebRTCManager 的统一网络监听喂入（仅用于检测"蜂窝↔WiFi 类型变化"切网信号）
     private var isOnCellular = false
 
     private val prefs get() = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
     private val maxViewers: Int get() = prefs.getInt("max_p2p_viewers", 4).let { if (it > 0) it else 4 }
-    // 后端下发的强制中继开关。§52.6 的「非同 WiFi 退登录页」在此开关打开时不干预，故需对 WebRTCManager 可见。
-    val forceRelay: Boolean get() = prefs.getBoolean("force_relay", false)
 
     /** 已连接（ICE connected/completed）的观看会话，供 WebRTCManager 采集码率/网络 stats。 */
     val connectedViewerPeerConnections: List<PeerConnection>
@@ -123,7 +113,7 @@ class P2PManager(private val context: Context) {
         isActive = true
         isReadyForViewers = true
         // §21.27：网络监听已统一收口到 WebRTCManager（P2P/SRS 共用），这里不再自注册
-        Log.d(TAG, "✅ P2PManager 启动，maxViewers=$maxViewers, forceRelay=$forceRelay")
+        Log.d(TAG, "✅ P2PManager 启动，maxViewers=$maxViewers（纯局域网直连，无中继/打洞）")
     }
 
     fun stop() {
@@ -135,7 +125,7 @@ class P2PManager(private val context: Context) {
 
     // MARK: - 网络事件（§21.27 统一入口在 WebRTCManager，这里只留出口）
 
-    /** §21.27 由 WebRTCManager 的统一网络监听喂入蜂窝状态（relay 策略用）。返回 true=类型变化（切网事件） */
+    /** §21.27 由 WebRTCManager 的统一网络监听喂入蜂窝状态（切网检测用）。返回 true=类型变化（切网事件） */
     fun updateCellularState(cellular: Boolean): Boolean {
         val changed = cellular != isOnCellular
         isOnCellular = cellular
@@ -172,7 +162,6 @@ class P2PManager(private val context: Context) {
         Log.d("meidui", "📶 [P2P切网] 拆除并让 PC 重连 ${sessions.size} 个会话(不做ICE Restart): ${sessionStatesSummary()}")
         for ((pcId, _) in sessions) {
             iceRetryCount[pcId] = 0
-            if (isOnCellular) forceRelayPeerIds.add(pcId)   // 蜂窝：PC 重建后手机新 Offer 走 relay
             removeViewerSession(pcId, notifyPC = false)
             WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
         }
@@ -182,84 +171,9 @@ class P2PManager(private val context: Context) {
     /** ⭐ 切网触发重连回调（WebRTCManager 用于置"重连中"给 UI，PC 心跳恢复后清除） */
     var onNetworkSwitchReconnect: (() -> Unit)? = null
 
-    // MARK: - 传输策略
-
-    private fun effectiveForceRelay(pcId: String): Boolean {
-        if (forceRelay) return true
-        return isOnCellular || peerNetworkType[pcId] == "cellular" || forceRelayPeerIds.contains(pcId) ||
-                qualityRelayPeerIds.contains(pcId)
-    }
-
-    // MARK: - §25.7e 线路预判定（建会话前经 WebSocket 信令定直连/中继）
-
-    /** 本机全部 IPv4（WiFi/热点/有线，排除回环与链路本地 169.254.*） */
-    private fun localIPv4Addresses(): List<String> {
-        val result = mutableListOf<String>()
-        try {
-            val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return result
-            for (iface in ifaces) {
-                if (!iface.isUp || iface.isLoopback) continue
-                for (addr in iface.inetAddresses) {
-                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
-                        val ip = addr.hostAddress ?: continue
-                        if (!ip.startsWith("169.254.")) result.add(ip)
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return result
-    }
-
-    /** 同网段判定（/24）：双方任意一对 IPv4 前三段相同 = 同一局域网（同 WiFi） */
-    private fun sharesSubnet(peerIps: List<String>): Boolean {
-        fun prefix24(ip: String): String? {
-            val parts = ip.split(".")
-            return if (parts.size == 4) parts.subList(0, 3).joinToString(".") else null
-        }
-        val myPrefixes = localIPv4Addresses().mapNotNull(::prefix24).toSet()
-        return peerIps.any { prefix24(it)?.let(myPrefixes::contains) == true }
-    }
-
-    /**
-     * ⭐ §25.7e：建会话前预判线路。PC 的 WEBRTC_REQUEST 带 localIps（逗号分隔的局域网 IPv4），
-     * 与本机比网段：非同网段 = 非同 WiFi → pcId 钉进 qualityRelayPeerIds → 会话从创建起
-     * relay-only，一次 ICE 定终身，不再有「直连先通→ICE 换车→软切/硬切」的中途折腾。
-     * 同网段/字段缺失（旧版 PC）→ 保持直连优先，host↔host stats 判定兜底。
-     * 只进不出：不因后续 REQUEST 判同网段而摘除钉住（防两个不同网络恰好同网段号 → 死循环回直连）。
-     */
-    private fun applyLanPrecheck(pcId: String, message: Map<String, Any>) {
-        val ipsStr = message["localIps"] as? String
-        if (ipsStr.isNullOrEmpty()) {
-            Log.d(TAG, "🛣 [P2P线路预判] $pcId REQUEST 未带 localIps（旧版PC）→ 直连优先+stats兜底")
-            return
-        }
-        val peerIps = ipsStr.split(",").filter { it.isNotBlank() }
-        if (sharesSubnet(peerIps)) {
-            Log.d(TAG, "🛣 [P2P线路预判] $pcId 同网段(同WiFi) → 直连优先 peer=$peerIps")
-        } else {
-            qualityRelayPeerIds.add(pcId)
-            Log.d(TAG, "🛣 [P2P线路预判] $pcId 非同网段(非同WiFi) → 建会话即中继 peer=$peerIps 本机=${localIPv4Addresses()}")
-        }
-    }
-
-    private fun loadIceServers(): List<PeerConnection.IceServer> {
-        val json = prefs.getString("ice_servers_json", null) ?: return emptyList()
-        return try {
-            val type = object : TypeToken<List<com.fz.yqlandroid.network.IceServer>>() {}.type
-            val servers: List<com.fz.yqlandroid.network.IceServer> = gson.fromJson(json, type)
-            servers.mapNotNull { s ->
-                if (s.urls.isEmpty()) return@mapNotNull null
-                val builder = PeerConnection.IceServer.builder(s.urls)
-                if (!s.username.isNullOrEmpty() && !s.credential.isNullOrEmpty()) {
-                    builder.setUsername(s.username).setPassword(s.credential)
-                }
-                builder.createIceServer()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "解析 iceServers 失败: ${e.message}")
-            emptyList()
-        }
-    }
+    // ⭐ §53.21：原「传输策略(effectiveForceRelay) / §25.7e 线路预判(applyLanPrecheck) /
+    //   loadIceServers」已物理删除——P2P 只做局域网 host↔host 直连，无 TURN/STUN；
+    //   同不同 WiFi 由 SessionPolicy 在推流前判定（localIps 网段 + 公网出口 IP，§53.20.2）。
 
     // MARK: - 信令处理（由 WebSocketManager 收 /topic/device/{id}/webrtc 后转发进来）
 
@@ -289,8 +203,6 @@ class P2PManager(private val context: Context) {
                     }
                 }
                 "WEBRTC_REQUEST" -> {
-                    peerNetworkType[fromDevice] = (message["networkType"] as? String) ?: "unknown"
-                    applyLanPrecheck(fromDevice, message)   // §25.7e：建会话前定直连/中继
                     if (!isReadyForViewers) {
                         WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_REJECT", "not_ready", fromDevice)
                         return@launch
@@ -421,7 +333,7 @@ class P2PManager(private val context: Context) {
 
         // ⭐⭐ §53.19（用户拍板，与 iOS 一致）：P2P **只做局域网直连**——去掉 TURN 中继与 STUN 打洞。
         //   传空 iceServers → 只产生 host 候选：同 WiFi 秒连；不在同 WiFi 无 srflx/relay → ICE 失败回落。
-        //   从 ICE 层根断"非局域网还假装 P2P（实走中继）"。loadIceServers/effectiveForceRelay/relay 相关保留但不生效。
+        //   §53.21：中继/打洞代码（TURN 配置、relay 钉住、软切/硬切）已全部物理删除。
         val servers = emptyList<PeerConnection.IceServer>()
         Log.d(TAG, "🔔 P2P 局域网直连(host-only，无 TURN/STUN)")
 
@@ -493,8 +405,6 @@ class P2PManager(private val context: Context) {
         pendingRemoteIce.remove(pcId)
         pendingIceRestart.remove(pcId)
         iceRetryCount.remove(pcId)
-        forceRelayPeerIds.remove(pcId)
-        peerNetworkType.remove(pcId)
         lastRequestId.remove(pcId)
         Log.d(TAG, "🔌 移除会话 $pcId，剩余 $viewerCount")
     }
@@ -517,9 +427,6 @@ class P2PManager(private val context: Context) {
         pendingRemoteIce.clear()
         pendingIceRestart.clear()
         iceRetryCount.clear()
-        forceRelayPeerIds.clear()
-        qualityRelayPeerIds.clear()   // §25.7b：整体停止才清 relay 钉住（单会话拆建不清）
-        peerNetworkType.clear()
     }
 
     // MARK: - PeerConnection Observer
@@ -573,13 +480,12 @@ class P2PManager(private val context: Context) {
         override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {}
     }
 
-    // MARK: - ICE 重连（P2P/TURN 内部，不回退 SRS）
+    // MARK: - ICE 重连（局域网内重试；耗尽 = 确认非局域网 → 回落 SRS）
 
     private fun retryIceConnection(pcId: String, pc: PeerConnection) {
         val cur = iceRetryCount[pcId] ?: 0
         if (cur < MAX_ICE_RETRIES) {
             iceRetryCount[pcId] = cur + 1
-            forceRelayPeerIds.add(pcId)   // 失败后下次重建走 relay
             pendingIceRestart.add(pcId)
             val cons = MediaConstraints().apply {
                 mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
@@ -610,83 +516,8 @@ class P2PManager(private val context: Context) {
         }
     }
 
-    // MARK: - 链路择优（§25.7：直连质量差 → 主动切中继，对照 iOS switchAllSessionsToRelay 移植）
-
-    /**
-     * 直连路径质量持续差（由 WebRTCManager stats 判定：ICE RTT >300ms 持续 10s）时，
-     * 把所有会话切到 TURN 中继。
-     * 两级策略（§25.7b，2026-07-03 iOS 实测日志定型）：
-     * - **第一次触发 = 软切**：setConfiguration(RELAY) + ICE Restart Offer（不整拆会话，旧路径
-     *   持续出画面直到新 relay 路径 nominated）。Chromium 内核（网页内核）走这条即可完成切换。
-     * - **第二次触发（10s 后路径仍是直连）= 硬切**：实测 GStreamer webrtcbin 收到新 ufrag 的
-     *   Offer 不重启 libnice、不重新收集候选（回了 Answer 但零新增本地候选），软切必然失效。
-     *   升级为：pcId 钉进 qualityRelayPeerIds（跨会话存活）→ 拆会话 → 发
-     *   WEBRTC_HANGUP(network_switch_reconnect)（PC 已有处理：不拆 pipeline，自动重发
-     *   WEBRTC_REQUEST）→ 重建的会话 effectiveForceRelay=true，从建会话起就只走 TURN。
-     *   网页内核第一次软切就生效、到不了第二次，不受硬切 HANGUP（网页内核收 HANGUP 停播不重连）影响。
-     */
-    fun switchAllSessionsToRelay(reason: String) {
-        mainScope.launch {
-            val servers = loadIceServers()
-            // 无 TURN 服务器时强制 relay = 零候选必死，直接放弃
-            val hasTurn = servers.any { s ->
-                s.urls.any { it.startsWith("turn:") || it.startsWith("turns:") }
-            }
-            if (!hasTurn) {
-                Log.w(TAG, "⚠️ 切中继请求被忽略（无 TURN 服务器配置）reason=$reason")
-                return@launch
-            }
-            val sessions = synchronized(viewerSessions) { viewerSessions.toMap() }
-            for ((pcId, pc) in sessions) {
-                if (forceRelayPeerIds.contains(pcId)) {
-                    // 已软切过仍被再次触发 = 路径还是直连，对端不支持 ICE Restart（GStreamer）→ 硬切
-                    if (qualityRelayPeerIds.contains(pcId)) continue   // 硬切也做过 = 等重建，别重复拆
-                    qualityRelayPeerIds.add(pcId)
-                    Log.w(TAG, "🔨 软切中继未生效(路径仍直连，对端不支持 ICE Restart) → 硬切重建 $pcId reason=$reason")
-                    Log.d("meidui", "🔨 [P2P线路] 软切未生效 → 硬切重建(拆会话+network_switch_reconnect) $pcId")
-                    removeViewerSession(pcId, notifyPC = false)
-                    WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId)
-                    continue
-                }
-                forceRelayPeerIds.add(pcId)
-                try {
-                    // Android 无 pc.configuration 读取器 → 按 createViewerSession 同参重建配置，仅传输策略改 RELAY
-                    val cfg = PeerConnection.RTCConfiguration(servers)
-                    cfg.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-                    cfg.continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-                    cfg.bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
-                    cfg.rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
-                    cfg.iceCandidatePoolSize = 2
-                    cfg.iceConnectionReceivingTimeout = 8000
-                    cfg.iceBackupCandidatePairPingInterval = 2000
-                    cfg.iceTransportsType = PeerConnection.IceTransportsType.RELAY
-                    pc.setConfiguration(cfg)
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ 切中继 setConfiguration 失败 $pcId: ${e.message}")
-                    continue
-                }
-                pendingIceRestart.add(pcId)
-                val cons = MediaConstraints().apply {
-                    mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
-                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-                }
-                pc.createOffer(object : SdpObserver {
-                    override fun onCreateSuccess(sdp: SessionDescription?) {
-                        if (sdp == null) return
-                        val munged = SessionDescription(sdp.type, mungeOfferForCodec(sdp.description))
-                        pc.setLocalDescription(SilentSdpObserver, munged)
-                        WebSocketManager.instance.sendWebRTCSignalingSDP("offer", munged.description, pcId)
-                        Log.d(TAG, "🔀 已切中继并发送 ICE Restart Offer → $pcId reason=$reason")
-                        Log.d("meidui", "🔀 [P2P线路] 已切中继+ICE Restart → $pcId reason=$reason")
-                    }
-                    override fun onCreateFailure(e: String?) { Log.e(TAG, "❌ 切中继 Offer 创建失败 $pcId: $e") }
-                    override fun onSetSuccess() {}
-                    override fun onSetFailure(e: String?) {}
-                }, cons)
-            }
-        }
-    }
+    // ⭐ §53.21：原「链路择优 switchAllSessionsToRelay（§25.7 软切/硬切 TURN 中继）」已物理删除——
+    //   P2P 无中继可切，直连质量差/路径非局域网时由 SessionPolicy 重新协商切 SRS。
 
     // MARK: - 编码参数（码率与帧率解耦，AllSessions 遍历 —— iOS §21.5 教训）
 

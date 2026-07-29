@@ -403,12 +403,13 @@ fun LoginScreen(
                                         // ⭐ §53.20.2：本机公网出口 IP，SessionPolicy 拿它与 PC 的
                                         //   publicIp 比对，防 /24 网段号撞车误判同 WiFi。老后端=空。
                                         putString("public_ip", response.clientIp ?: "")
-                                        putBoolean("force_relay", response.forceRelay ?: false)
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
-                                        response.iceServers?.let {
-                                            putString("ice_servers_json", com.google.gson.Gson().toJson(it))
-                                        }
-                                        println("jfh [Login] ✅ 连接方式(后端)=$backendConnectMode, 编码默认(后端) P2P=$codecP2p/SRS=$codecSrs, iceServers=${response.iceServers?.size ?: 0}个, forceRelay=${response.forceRelay ?: false}")
+                                        // ⭐ §53.21：force_relay / ice_servers_json 不再落地——P2P 中继与
+                                        //   打洞代码已物理删除（纯局域网 host-only 直连），无消费方。
+                                        //   顺带清掉历史残留，防旧 key 误导排查。
+                                        remove("force_relay")
+                                        remove("ice_servers_json")
+                                        println("jfh [Login] ✅ 连接方式(后端)=$backendConnectMode, 编码默认(后端) P2P=$codecP2p/SRS=$codecSrs（P2P=纯局域网直连，无中继/打洞）")
                                         
                                         // 🔥 保存试用/激活信息（与iOS saveTrialInfo完全一致）
                                         response.trialInfo?.let { trial ->

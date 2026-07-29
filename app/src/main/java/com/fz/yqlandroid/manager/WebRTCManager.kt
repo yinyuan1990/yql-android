@@ -1150,11 +1150,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //   上下漂移（此前 min~max 区间导致码率随 BWE 波动）。弱网退让全部交给自适应阶梯：
         //   先降帧保画质 → 帧率到最低后 bitrateScaleIdx 一档档降码率 → 恢复时反向。
         // currentBitrateKbps 已含热控缩放与画质百分比
-        var target = maxOf(200, (currentBitrateKbps * adaptiveBitrateScale()).toInt())
-        // ⭐ §25.5-1：选中路径=TURN 中继时钳到 relayMaxKbps，防止高档位把中继灌崩
-        if (p2pPathIsRelay && target > relayMaxKbps) {
-            target = relayMaxKbps
-        }
+        // ⭐ §53.21：原「中继时钳到 relayMaxKbps」已随 TURN 中继物理删除（P2P 只有局域网直连）。
+        val target = maxOf(200, (currentBitrateKbps * adaptiveBitrateScale()).toInt())
         return Pair(target, target)
     }
     override fun p2pTargetFps(): Int {
@@ -1665,32 +1662,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private var uiLastCapFrameCount: Long = 0
     private var uiLastCapSampleMs: Long = 0
 
-    // ⭐ §25.5-1（2026-07-03 对照 iOS 移植）：P2P 选中路径走 TURN 中继时的码率钳制。
-    //   中继实测：高档位 7.5Mbps 灌 TURN → 缓冲堆积 → RTT 5.6s → ICE 断链；coturn 已加
-    //   max-bps≈4Mbps 服务器兜底，客户端在编码器层主动钳到 relayMaxKbps 更平滑。
-    //   由 stats 的 transport.selectedCandidatePairId + local-candidate.candidateType 判定，
-    //   路径切换（直连↔中继）时自动重算并经 p2pBitrateRangeKbps 下发。
-    @Volatile private var p2pPathIsRelay = false
-    private val relayMaxKbps = 3000   // 中继单路码率上限（< coturn max-bps 4Mbps，留余量）
+    // ⭐ §53.21：原「中继码率钳制(p2pPathIsRelay/relayMaxKbps) + 链路择优限频(lastRelaySwitchMs/
+    //   relaySwitchGapMs)」已随 TURN 中继物理删除——P2P 只有局域网直连，无中继路径可钳可切。
 
-    // ⭐ §25.7（2026-07-04 简化）：链路择优——只认「同 WiFi 直连」，其余一律中继。
-    //   旧版靠 ICE RTT>300ms 持续 10s 才切中继，探测窗口内用户已经卡了 10 秒；且跨网直连
-    //   （srflx 打洞）质量随公网波动，探测阈值难调。现改为拓扑判定，一次到位：
-    //   选中 ICE 候选对 host↔host（两端候选类型都是 host）= 打通的是局域网直连 = 同 WiFi → 保持直连；
-    //   选中路径含 srflx/prflx（跨 NAT/公网）→ 立即 switchAllSessionsToRelay，不看 RTT、不等待。
-    //   单向操作：会话期内不切回直连（pcId 进 forceRelayPeerIds），拆会话自动清除。
-    //   relaySwitchGapMs：两次触发的最小间隔。软切(ICE Restart)生效要几秒，期间路径仍显示直连，
-    //   若每秒重触发会被 P2PManager 误判「软切无效」而提前硬切拆会话（网页内核观看端会断播）。
-    //   ⚠️ 2026-07-27 §52.6：判定沿用，但**动作已从「切中继」改为「退登录页提示改用多人线路」**，
-    //      下面两个限频字段随之成为死变量（保留以备回滚）。
-    @Suppress("unused") private var lastRelaySwitchMs: Long = 0
-    @Suppress("unused") private val relaySwitchGapMs = 8_000L
-    
     private fun startStats() {
         statsJob?.cancel()
         lastBytesSent = 0; lastPacketsSent = 0; lastPacketsLost = 0; lastStatsTime = 0
         lastFramesEncoded = 0; lastFramesSent = 0; lastMeiduiLogMs = 0; lastNackCount = 0
-        lastRelaySwitchMs = 0
         lastCapFrameCount = capFrameCount
         uiLastCapFrameCount = capFrameCount; uiLastCapSampleMs = 0
         
@@ -1829,25 +1807,16 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     val activePairId = selectedPairId ?: nominatedPairIds.firstOrNull()
                     // ICE 层 RTT（秒）：仅在选中候选对上有读数时采用
                     val icePairRtt = activePairId?.let { pairRttSec[it] }?.takeIf { it > 0 } ?: 0.0
-                    // 选中路径是否走 TURN 中继
+                    // 选中路径两端候选类型
                     val localType = activePairId?.let { pairLocalCandId[it] }?.let { localCandType[it] }
                     val remoteType = activePairId?.let { pairRemoteCandId[it] }?.let { remoteCandType[it] }
-                    val pathIsRelay = localType == "relay"
                     // ⭐ §25.7：同 WiFi 判定 = 选中候选对 host↔host（两侧类型都拿到才判定，防 stats 未就绪误判）
+                    //   §53.21：无 TURN/STUN 后本端候选只有 host，pathIsRelay 判定已随中继代码删除。
                     val pathIsLan = localType == "host" && remoteType == "host"
 
                     // RTT 主源=ICE candidate-pair；无值时回退 RTCP remote-inbound
                     val effectiveRtt = if (icePairRtt > 0) icePairRtt else roundTripTime
                     val rttMs = (effectiveRtt * 1000).toInt()
-
-                    // ⭐ §25.5-1：选中路径 relay 状态同步（首次/变化时触发中继码率钳制重下发）
-                    if (activePairId != null && pathIsRelay != p2pPathIsRelay) {
-                        p2pPathIsRelay = pathIsRelay
-                        Log.d("meidui", "[线路] 选中路径=${if (pathIsRelay) "中继(relay)" else "直连"} → 码率区间重算")
-                        if (currentConnMode == ConnMode.P2P) {
-                            p2pManager.applyBitrateToAllSessions()
-                        }
-                    }
 
                     // ⭐ §53.4-定稿：这里**只做兜底核对，不再退登录页**。
                     //   正常情况下"同不同 WiFi"已在推流前用 PC_PRESENCE 的 localIps 比过网段
@@ -1856,7 +1825,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     //   （停推流→重决策→起推流，自带冷却与次数上限）。§52.6 的"退回登录页让用户
                     //   自己改线路"已废弃：用户不该为网络拓扑负责。
                     if (currentConnMode == ConnMode.P2P && activePairId != null && !notSameWifiHandled &&
-                        !p2pManager.forceRelay &&
                         localType != null && remoteType != null && !pathIsLan) {
                         notSameWifiHandled = true
                         Log.d("meidui", "[线路] ⚠️实测路径非同WiFi(本端=$localType 远端=$remoteType)，与推流前预判不符 → 重新协商走多人线路")
