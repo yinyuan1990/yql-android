@@ -2188,7 +2188,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     return@withContext
                 }
                 if (currentConnMode == ConnMode.P2P) {
-                    p2pManager.restartAllSessions(source)   // 各会话 ICE Restart / 僵尸会话拆除
+                    // ⭐ 需求#9（2026-07-31）：WS 闪断重连时用**选择性恢复**——ICE 活着的会话
+                    //   （局域网直连不经服务器）保画面不拆，死的才拆重连；
+                    //   真切网（source=切网(...)）维持原逻辑全量重连，不碰 §53.12/53.13 已验证链路。
+                    if (source.startsWith("WS重连")) {
+                        p2pManager.recoverDeadSessionsOnly(source)
+                    } else {
+                        p2pManager.restartAllSessions(source)   // 各会话 ICE Restart / 僵尸会话拆除
+                    }
                 } else {
                     val st = try { peerConnection?.iceConnectionState() } catch (_: Exception) { null }
                     if (st == null ||

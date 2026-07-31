@@ -109,6 +109,8 @@ fun StreamingScreen(
     // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
     var showUpdatePrompt by remember { mutableStateOf(false) }
     var updatePromptText by remember { mutableStateOf("") }
+    // ⭐ 需求#3（2026-07-31）：小米后台推流引导（自启动+省电策略无 API，只能引导用户手动开）
+    var showXiaomiGuide by remember { mutableStateOf(false) }
     var connectionStatus by remember { mutableStateOf("未连接") }
     var currentFps by remember { mutableIntStateOf(0) }
     var currentKbps by remember { mutableIntStateOf(0) }
@@ -260,6 +262,22 @@ fun StreamingScreen(
                 showUpdatePrompt = true
             }
         } catch (_: Exception) { /* 版本读取失败不拦截使用 */ }
+    }
+
+    // ⭐ 需求#3：小米切后台断推流的权限处理（进推流页时做，一次性）：
+    //   ① 不在电池优化白名单 → 弹系统授权框（所有品牌通用，MIUI 上等价于省电策略→无限制的关键一半）；
+    //   ② 小米/红米机型 → 首次再弹一次「自启动」引导（该开关无 API，只能带用户去 MIUI 设置页手动开）。
+    LaunchedEffect(Unit) {
+        try {
+            if (!com.fz.yqlandroid.manager.OemPermissionHelper.isIgnoringBatteryOptimizations(context)) {
+                com.fz.yqlandroid.manager.OemPermissionHelper.requestIgnoreBatteryOptimizations(context)
+            }
+            val prefs = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            if (com.fz.yqlandroid.manager.OemPermissionHelper.isXiaomi &&
+                !prefs.getBoolean("xiaomi_bg_guide_shown", false)) {
+                showXiaomiGuide = true
+            }
+        } catch (_: Exception) { /* 权限引导失败不拦截推流 */ }
     }
 
     // 🔥 初始化WebRTC（必须在预览之前完成）
@@ -465,6 +483,32 @@ fun StreamingScreen(
             }
         }
         
+        // ⭐ 需求#3：小米后台推流引导（首次进入弹一次；"去设置"跳 MIUI 自启动页，"已设置"永久不再弹）
+        if (showXiaomiGuide) {
+            AlertDialog(
+                onDismissRequest = { /* 必须二选一，防误触消失 */ },
+                title = { Text("小米手机后台推流设置") },
+                text = {
+                    Text("检测到小米/红米手机。切到后台后若推流中断，需要开启：\n\n" +
+                         "1. 自启动（应用管理 → 本应用 → 自启动）\n" +
+                         "2. 省电策略 → 无限制\n\n" +
+                         "设置一次永久生效。")
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        com.fz.yqlandroid.manager.OemPermissionHelper.openAutoStartSettings(context)
+                    }) { Text("去设置") }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showXiaomiGuide = false
+                        context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+                            .edit().putBoolean("xiaomi_bg_guide_shown", true).apply()
+                    }) { Text("已设置，不再提示") }
+                }
+            )
+        }
+
         // ⭐ 需求#13：版本更新软提示（不拦截推流，知道了即关）
         if (showUpdatePrompt) {
             AlertDialog(

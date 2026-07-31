@@ -151,6 +151,35 @@ class P2PManager(private val context: Context) {
     /** 兼容旧调用点 */
     fun onWebSocketReconnected() = restartAllSessions("WS重连")
 
+    /**
+     * ⭐ 需求#9（2026-07-31）：选择性恢复——**ICE 还活着的会话绝不动**（对齐 iOS recoverSessionsIfBroken）。
+     * P2P 媒体是局域网直连、不经服务器：公网抖一下 WS 重连成功时 ICE 往往还活着，
+     * 旧逻辑无条件拆所有会话重建 = 自己把好画面掐灭几秒。只拆 ICE 已死的会话并发
+     * HANGUP(network_switch_reconnect)——PC 收到后不拆 pipeline、自动重发 REQUEST（既有路径）。
+     * 真切网场景不走本函数（publishHealthCheck 里按 source 分流，切网仍走 restartAllSessions）。
+     */
+    fun recoverDeadSessionsOnly(source: String) {
+        val dead = synchronized(viewerSessions) {
+            viewerSessions.filter { (_, pc) ->
+                val st = try { pc.iceConnectionState() } catch (_: Exception) { null }
+                st != PeerConnection.IceConnectionState.CONNECTED &&
+                st != PeerConnection.IceConnectionState.COMPLETED
+            }.keys.toList()
+        }
+        if (dead.isEmpty()) {
+            Log.d("meidui", "🔌 [$source] $viewerCount 个 P2P 会话 ICE 均存活 → 保画面不拆（需求#9）")
+            return
+        }
+        Log.d("meidui", "🔌 [$source] 拆除 ${dead.size} 个 ICE 已死会话（存活的不动）")
+        for (pcId in dead) {
+            iceRetryCount[pcId] = 0
+            val e = synchronized(viewerSessions) { sessionEpoch[pcId] }
+            removeViewerSession(pcId, notifyPC = false)
+            WebSocketManager.instance.sendWebRTCSignaling("WEBRTC_HANGUP", "network_switch_reconnect", pcId, e)
+        }
+        onNetworkSwitchReconnect?.invoke()
+    }
+
     private fun restartAllIceForNetworkSwitch() {
         // ⭐ 切网重连关键修复：切网瞬间旧 WS 多半已死，此时发 ICE Restart Offer = 发进黑洞
         //   （PC 永远收不到），且会话被标 pendingIceRestart 卡住。改为等 WS 重连成功后

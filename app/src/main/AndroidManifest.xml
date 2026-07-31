@@ -33,6 +33,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- ⭐ 需求#3（2026-07-31）：忽略电池优化白名单。MIUI 的"智能省电"会在切后台后冻结进程
+         （前台服务也照冻），这是小米切后台断推流的主因之一；申请豁免后等价于省电策略→无限制。
+         另一半（自启动开关）系统不开放 API，由 OemPermissionHelper 引导用户到 MIUI 设置页手动开。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:allowBackup="true"
         android:usesCleartextTraffic="true"
