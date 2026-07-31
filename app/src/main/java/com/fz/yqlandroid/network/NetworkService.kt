@@ -624,7 +624,7 @@ data class LatestVersions(
 data class TrialInfo(
     val trialRequired: Boolean = false,          // 是否需要试用限制
     val activated: Boolean? = null,              // 是否已激活
-    val activationLevel: Int? = null,            // 激活等级 (1=标清, 2=高清, 3=超清, 4=4K)
+    val activationLevel: Int? = null,            // 激活等级 (1=高清, 2=超清, 3=超高清, 4=超高帧；等级1对应超低网+高清两个档位)
     val activationLevelName: String? = null,     // 等级名称
     val activationExpireAt: String? = null,      // 激活到期时间
     val activationTime: String? = null,          // ⭐ §53.9 开通时间（「我的」页显示"<等级>会员 + 开通时间"）
