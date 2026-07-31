@@ -62,6 +62,9 @@ class P2PManager(private val context: Context) {
     // ⭐ §53.3①：PC 带来的 requestId（每次 connectP2P/重发递增）。变了就必须拆旧建新，
     //   不能再按"会话建立中"忽略——否则新登录的 PC 会被上一轮的幽灵会话吞掉请求。
     private val lastRequestId = HashMap<String, Long>()
+    // ⭐ §54：同 epoch 重发到达且会话未连通、会话已建超过此毫秒数 → 判定 Offer 丢失，拆旧重发
+    //   （PC 收到 Offer 就会停止重发，"同轮次重发还在来"本身就是没送达的证据）。
+    private val STALE_OFFER_REBUILD_MS = 3000L
     // ⭐⭐ §53.25：会话 epoch——PC 每轮协商生成一个（重发不换、重建才换）。REQUEST 带来时记住；
     //   该会话所有出站信令回带；入站 Answer/ICE 轮次不符直接丢弃；同 epoch 重复 REQUEST 天然幂等。
     private val sessionEpoch = HashMap<String, Long>()
@@ -307,11 +310,26 @@ class P2PManager(private val context: Context) {
                 val cur = sessionEpoch[pcId]
                 if (epoch != null && cur != null) {
                     if (epoch == cur) {
-                        Log.w(TAG, "⚠️ PC $pcId 同轮次重发(epoch=$epoch) → 幂等忽略，等 Answer")
-                        return
+                        // ⭐ §54（2026-07-31）：PC 侧等 Offer 已改为**同 epoch 1.5s 常驻重发（永不放弃）**。
+                        //   PC 只在「没收到 Offer」时才重发——同轮次重发还在到达 = 上一份 Offer 没送达。
+                        //   无条件幂等忽略会让这条会话变成吞掉全部重发的幽灵会话（永久黑屏）。
+                        //   规则：会话未连通 且 已建 > STALE_OFFER_REBUILD_MS → 拆旧重发全新 Offer；
+                        //   已连通会话不受影响（PC 连上后不再发同轮次 REQUEST），3s 内重发仍幂等忽略。
+                        val st = existing.connectionState()
+                        val connected = (st == PeerConnection.PeerConnectionState.CONNECTED)
+                        val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
+                        if (!connected && ageMs > STALE_OFFER_REBUILD_MS) {
+                            Log.w(TAG, "♻️ PC $pcId 同轮次重发但会话 ${ageMs}ms 未连通(state=$st) → 拆旧重发 Offer（§54 防幽灵会话吞常驻重发）")
+                            Log.d("meidui", "♻️ [P2P] 同轮次重发+未连通${ageMs}ms → 拆旧重发 Offer")
+                            // 落到下方的拆旧建新路径
+                        } else {
+                            Log.w(TAG, "⚠️ PC $pcId 同轮次重发(epoch=$epoch) → 幂等忽略，等 Answer")
+                            return
+                        }
+                    } else {
+                        Log.w(TAG, "♻️ PC $pcId 新轮次请求(epoch $cur→$epoch) → 拆旧建新")
+                        // 落到下方的拆旧建新路径
                     }
-                    Log.w(TAG, "♻️ PC $pcId 新轮次请求(epoch $cur→$epoch) → 拆旧建新")
-                    // 落到下方的拆旧建新路径
                 } else {
                     val s = existing.connectionState()
                     val ageMs = System.currentTimeMillis() - (sessionCreatedAt[pcId] ?: 0L)
