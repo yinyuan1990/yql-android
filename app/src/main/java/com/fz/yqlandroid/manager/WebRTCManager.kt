@@ -2650,7 +2650,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 值越大 = 快门越快 = 曝光越短。启用后走 AE OFF + SENSOR_EXPOSURE_TIME=1/cjfps。
      */
     fun setShutterSpeed(cjfps: Int) {
-        _currentShutterSpeed = cjfps.coerceIn(60, 600)
+        // ⭐ 需求#10（2026-07-31）：上限 600→1000（与后台曝光FPS配置/iOS 同步放宽）
+        _currentShutterSpeed = cjfps.coerceIn(60, 1000)
         _shutterEnabled = true
         val ok = applyCameraParams()
         Log.d(TAG, "📸 快门: 1/${_currentShutterSpeed}s (手动快门) 注入=${if (ok) "成功" else "失败"}")

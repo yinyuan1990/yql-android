@@ -403,6 +403,9 @@ fun LoginScreen(
                                         // ⭐ §53.20.2：本机公网出口 IP，SessionPolicy 拿它与 PC 的
                                         //   publicIp 比对，防 /24 网段号撞车误判同 WiFi。老后端=空。
                                         putString("public_ip", response.clientIp ?: "")
+                                        // ⭐ 需求#13（2026-07-31）：后端下发的 Android 最新版本号（空=不提示）。
+                                        //   StreamingScreen 进入时与本地 versionName 比对，不一致弹软提示。
+                                        putString("latest_android_version", response.latestVersions?.android ?: "")
                                         putInt("max_p2p_viewers", response.maxP2PViewers ?: 4)
                                         // ⭐ §53.21：force_relay / ice_servers_json 不再落地——P2P 中继与
                                         //   打洞代码已物理删除（纯局域网 host-only 直连），无消费方。

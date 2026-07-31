@@ -102,6 +102,13 @@ fun StreamingScreen(
     // UI状态
     var showControls by remember { mutableStateOf(true) }
     var isStreaming by remember { mutableStateOf(false) }
+    // ⭐ 需求#1（2026-07-31）：试用到期弹框（对齐 iOS 的 showTrialEndAlert）。
+    //   以前 Android 收到 TryDisconnect 只默默停推流，用户完全不知道为什么画面没了。
+    var showTrialEndDialog by remember { mutableStateOf(false) }
+    var trialEndMessage by remember { mutableStateOf("") }
+    // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
+    var showUpdatePrompt by remember { mutableStateOf(false) }
+    var updatePromptText by remember { mutableStateOf("") }
     var connectionStatus by remember { mutableStateOf("未连接") }
     var currentFps by remember { mutableIntStateOf(0) }
     var currentKbps by remember { mutableIntStateOf(0) }
@@ -214,6 +221,13 @@ fun StreamingScreen(
                         webRTCManager.stopPublish()
                         keepAliveManager.stop()  // 🔊 断开推流：停止保活
                         isStreaming = false
+                        // ⭐ 需求#1：弹框告知原因（对齐 iOS）。断开 WS 防 TryDisconnect 每秒重复到达；
+                        //   showTrialEndDialog 本身即防重（已弹就不再动）。
+                        if (!showTrialEndDialog) {
+                            trialEndMessage = (messageDict["disconnectMessage"] as? String).orEmpty()
+                            showTrialEndDialog = true
+                        }
+                        WebSocketManager.instance.disconnect()
                     }
                 }
             }
@@ -235,6 +249,19 @@ fun StreamingScreen(
         }
     }
     
+    // ⭐ 需求#13：推流前版本检查（软提示，进入推流页时弹一次；后台未配置=空串则跳过）
+    LaunchedEffect(Unit) {
+        try {
+            val latest = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+                .getString("latest_android_version", "") ?: ""
+            val local = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+            if (latest.isNotEmpty() && local.isNotEmpty() && latest != local) {
+                updatePromptText = "发现新版本 v$latest（当前 v$local），请更新后使用"
+                showUpdatePrompt = true
+            }
+        } catch (_: Exception) { /* 版本读取失败不拦截使用 */ }
+    }
+
     // 🔥 初始化WebRTC（必须在预览之前完成）
     LaunchedEffect(Unit) {
         webRTCManager.setContext(context)
@@ -438,6 +465,34 @@ fun StreamingScreen(
             }
         }
         
+        // ⭐ 需求#13：版本更新软提示（不拦截推流，知道了即关）
+        if (showUpdatePrompt) {
+            AlertDialog(
+                onDismissRequest = { showUpdatePrompt = false },
+                title = { Text("发现新版本") },
+                text = { Text(updatePromptText) },
+                confirmButton = {
+                    TextButton(onClick = { showUpdatePrompt = false }) { Text("知道了") }
+                }
+            )
+        }
+
+        // ⭐ 需求#1：试用到期弹框（不可点外关闭；确定 → 清理并回登录页，对齐 iOS「取消→登录页」路径）
+        if (showTrialEndDialog) {
+            AlertDialog(
+                onDismissRequest = { /* 强制用户看到并确认 */ },
+                title = { Text("试用已结束") },
+                text = { Text(trialEndMessage.ifEmpty { "试用已结束，请续费或扫码绑定后继续使用" }) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showTrialEndDialog = false
+                        keepAliveManager.stop()
+                        onLogout()
+                    }) { Text("回到登录页") }
+                }
+            )
+        }
+
         // ===== 右侧操作面板（Zoom + 摄像头切换） =====
         AnimatedVisibility(
             visible = showControls,
@@ -656,9 +711,10 @@ fun StreamingScreen(
                         pcOnlineCount > 0 -> Color(0xFFFF9800)
                         else -> Color(0xFF9E9E9E)
                     }
+                    // ⭐ 需求#4（2026-07-31）：观看端数量始终显示（以前 >1 台才显示 ×N）
                     val pcText = when {
-                        pcConnected -> if (pcOnlineCount > 1) "PC在线·在看×$pcOnlineCount" else "PC在线·在看"
-                        pcOnlineCount > 0 -> "PC在线·未出画面"
+                        pcConnected -> "PC在线(${maxOf(pcOnlineCount, 1)}台)·在看"
+                        pcOnlineCount > 0 -> "PC在线(${pcOnlineCount}台)·未出画面"
                         else -> "无PC"
                     }
                     Spacer(modifier = Modifier.width(8.dp))

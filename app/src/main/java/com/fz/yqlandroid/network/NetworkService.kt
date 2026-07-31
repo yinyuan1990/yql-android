@@ -606,7 +606,16 @@ data class LoginResponse(
     val videoCodecSrs: String? = null,         // "h264" | "h265"
     // ⭐ §53.20.2：本机公网出口 IP（后端按请求来源回填）。与 PC 上报的 publicIp 比对，
     //   防 /24 网段号撞车（两地都是 192.168.1.x）误判同 WiFi。老后端缺省 → 跳过该校验。
-    val clientIp: String? = null
+    val clientIp: String? = null,
+    // ⭐ 需求#13（2026-07-31）：三端最新版本号（总后台可配）。与本地版本比对，不一致提示更新（软提示）。
+    val latestVersions: LatestVersions? = null
+)
+
+// ⭐ 需求#13：三端最新版本号
+data class LatestVersions(
+    val pc: String? = null,
+    val ios: String? = null,
+    val android: String? = null
 )
 
 /**

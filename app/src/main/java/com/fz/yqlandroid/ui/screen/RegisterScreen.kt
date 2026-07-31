@@ -281,8 +281,9 @@ fun RegisterScreen(
                         value = secondaryPassword,
                         onValueChange = { secondaryPassword = it },
                         placeholder = { 
+                            // ⭐ 需求#6（2026-07-31）：「管理密码」改叫「绑定密码」，语义=绑定 PC 端用的密码
                             Text(
-                                "请输入管理密码", 
+                                "请输入绑定密码", 
                                 color = Color(0xFFA3A3A3),
                                 fontSize = 16.sp
                             ) 
@@ -303,9 +304,9 @@ fun RegisterScreen(
                 
                 HorizontalDivider(color = Color(0xFFF0F0F0))
 
-                // ⭐ 提示：管理密码=绑定电脑用的独立密码，可与登录密码一致（加大加粗醒目提示）
+                // ⭐ 需求#6：绑定密码说明（醒目提示）
                 Text(
-                    text = "💡 绑定电脑使用的独立密码，可以和登录密码一致",
+                    text = "💡 用于绑定PC端的密码，可以和登录密码一样",
                     color = Color(0xFFFF7A00),
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
@@ -340,7 +341,7 @@ fun RegisterScreen(
                                 return@Button
                             }
                             secondaryPassword.length < 6 || secondaryPassword.length > 20 -> {
-                                errorMessage = "管理密码长度必须在6到20位之间"
+                                errorMessage = "绑定密码长度必须在6到20位之间"
                                 return@Button
                             }
                         }
