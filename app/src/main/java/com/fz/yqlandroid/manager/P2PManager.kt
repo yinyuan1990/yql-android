@@ -214,10 +214,20 @@ class P2PManager(private val context: Context) {
                 // ⭐ §53.3①：真的拆会话（以前只打日志）。PC 退出时发的这条通知白发 → 会话留在
                 //   CONNECTING 变"幽灵会话"，把 PC 下次登录的请求吞掉（iOS 侧同款问题更严重）。
                 "VIEWER_DISCONNECTED" -> {
+                    // ⭐⭐ §54.6（2026-07-31 PC 日志实锤）：加"新生会话保护"。旧版 PC 对每次内部
+                    //   断开都广播这条消息（不带 epoch）且可能迟到——PC 已发新 REQUEST、我们刚建好
+                    //   新会话发完 Offer 后它才到，无条件拆 = 新会话在 trickle ICE 前被杀 → 黑屏循环。
+                    //   会话很年轻（<2s）时这条断开通知必是上一轮的迟到消息 → 忽略。
                     val had = synchronized(viewerSessions) { viewerSessions.containsKey(fromDevice) }
                     if (had) {
-                        Log.d(TAG, "🔌 PC $fromDevice 断开 → 拆会话（防幽灵会话吞掉下次 WEBRTC_REQUEST）")
-                        removeViewerSession(fromDevice, notifyPC = false)
+                        val ageMs = System.currentTimeMillis() -
+                                (synchronized(viewerSessions) { sessionCreatedAt[fromDevice] } ?: 0L)
+                        if (ageMs < 2000) {
+                            Log.w(TAG, "🗑 PC $fromDevice 的 VIEWER_DISCONNECTED 迟到（会话仅 ${ageMs}ms）→ 忽略，保护新会话")
+                        } else {
+                            Log.d(TAG, "🔌 PC $fromDevice 断开 → 拆会话（防幽灵会话吞掉下次 WEBRTC_REQUEST）")
+                            removeViewerSession(fromDevice, notifyPC = false)
+                        }
                     } else {
                         Log.d(TAG, "🔌 PC $fromDevice 断开（无活动会话）")
                     }
