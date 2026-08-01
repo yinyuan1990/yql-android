@@ -755,10 +755,10 @@ fun StreamingScreen(
                         pcOnlineCount > 0 -> Color(0xFFFF9800)
                         else -> Color(0xFF9E9E9E)
                     }
-                    // ⭐ 需求#4（2026-07-31）：观看端数量始终显示（以前 >1 台才显示 ×N）
+                    // ⭐ 2026-08-01 用户拍板：主页**不显示**观看端数量（撤掉台数，只留状态）
                     val pcText = when {
-                        pcConnected -> "PC在线(${maxOf(pcOnlineCount, 1)}台)·在看"
-                        pcOnlineCount > 0 -> "PC在线(${pcOnlineCount}台)·未出画面"
+                        pcConnected -> "PC在线·在看"
+                        pcOnlineCount > 0 -> "PC在线·未出画面"
                         else -> "无PC"
                     }
                     Spacer(modifier = Modifier.width(8.dp))
