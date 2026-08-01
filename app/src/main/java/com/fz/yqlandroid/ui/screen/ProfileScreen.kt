@@ -92,10 +92,12 @@ fun ProfileScreen(
     }
     
     // 🔥 等级显示（对标 iOS levelDisplayText：activated + activation_level）
+    // ⭐⭐ 2026-08-01 用户拍板【故意对调，勿"修复"】：等级4 对外显示「超高清」、等级3 对外显示「超高帧」。
+    //   与总后台/后端的内部命名（3=超高清 4=超高帧）刻意不同——产品对外展示口径：顶级档（等级4）对客户叫"超高清"。
     val activated = tokenPrefs.getBoolean("activated", false)
     val activationLevel = tokenPrefs.getInt("activation_level", 0)
     val levelText = if (!activated) "试用用户" else when (activationLevel) {
-        4 -> "超高帧"; 3 -> "超高清"; 2 -> "超清"; 1 -> "高清"; else -> "试用用户"
+        4 -> "超高清"; 3 -> "超高帧"; 2 -> "超清"; 1 -> "高清"; else -> "试用用户"
     }
     val levelColor = if (!activated) Color(0xFF808080) else when (activationLevel) {
         4 -> Color(0xFFFF6B00); 3 -> Color(0xFFFFD700); 2 -> Color(0xFF007AFF); 1 -> Color(0xFF34C759); else -> Color(0xFF808080)
