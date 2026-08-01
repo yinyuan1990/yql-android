@@ -84,7 +84,14 @@ object SessionPolicy {
             log("🚧 单人直连进行中，新上线PC($trigger)不打断当前会话（其请求由 P2P 层拒绝提示占线）")
             return
         }
-        evaluateForRenegotiate(if (pending) "$trigger + 本机切过网" else trigger)
+        val handled = evaluateForRenegotiate(if (pending) "$trigger + 本机切过网" else trigger)
+        // ⭐⭐ 2026-08-01 修「切网后卡死在 P2P、切不到 SRS」（与 iOS 同构）：切网标记是唯一的评估
+        //   触发源（PC 没动，其心跳字段永远不变）。评估被 5s 冷却挡下（快速来回切网必撞）时标记
+        //   已被消费——不还回去就再也没有任何东西触发重评估，跨网了还钉在 P2P 上黑屏。
+        //   还回去后 PC 心跳 1s 一条，冷却一过自动重试。
+        if (pending && !handled) {
+            pendingNetworkChange = true
+        }
     }
 
     /**
@@ -254,19 +261,24 @@ object SessionPolicy {
     private var appContext: Context? = null
     fun attachContext(context: Context) { appContext = context.applicationContext }
 
-    private fun evaluateForRenegotiate(trigger: String) {
-        val decided = current ?: return           // 还没推流，等 decideForPublish
-        if (pinnedToSrs) return
+    /**
+     * ⭐ 2026-08-01 返回值：true=已处理完毕（协商已发起/结果不变/无需处理），
+     *   false=**被冷却挡下、需要稍后重试**——调用方（onViewerInputChanged 的切网标记路径）据此
+     *   把 pendingNetworkChange 还回去，否则切网评估机会被冷却吞掉后永远不会再触发（卡死在旧链路）。
+     */
+    private fun evaluateForRenegotiate(trigger: String): Boolean {
+        val decided = current ?: return true      // 还没推流，decideForPublish 会用最新输入重算
+        if (pinnedToSrs) return true              // 本次会话已钉死，无需再评估
 
         val fresh = compute(appContext)
         if (fresh == decided) {
             log("输入变化($trigger)但决策结果不变（${decided.mode}+${decided.codec}），不重启推流")
-            return
+            return true
         }
         val since = System.currentTimeMillis() - lastRenegotiateAtMs
         if (since < RENEGOTIATE_COOLDOWN_MS) {
-            log("⏳ 需要重新协商($trigger)但距上次仅 ${since}ms，等冷却")
-            return
+            log("⏳ 需要重新协商($trigger)但距上次仅 ${since}ms，等冷却后重试")
+            return false   // ⭐ 冷却挡下 ≠ 处理完，调用方须保留切网标记重试
         }
         renegotiateCount++
         if (renegotiateCount > MAX_RENEGOTIATE_PER_SESSION) {
@@ -277,12 +289,13 @@ object SessionPolicy {
             log("⚠️ 本次会话已重新协商 $MAX_RENEGOTIATE_PER_SESSION 次，钉死多人线路(SRS)不再切换（防抖）")
             renegotiationInFlight = true   // §53.20.1：重启后的 decideForPublish 保留钉住/计数
             onRenegotiateNeeded?.invoke("协商次数达上限→固定SRS")
-            return
+            return true
         }
         lastRenegotiateAtMs = System.currentTimeMillis()
         log("🔄 重新协商($trigger)：${decided.mode}+${decided.codec} → ${fresh.mode}+${fresh.codec}（停推流→重决策→起推流）")
         renegotiationInFlight = true       // §53.20.1
         onRenegotiateNeeded?.invoke(trigger)
+        return true
     }
 
     // ---------- 网段工具（与 P2PManager §25.7e 同一套算法，避免两份判定打架） ----------
