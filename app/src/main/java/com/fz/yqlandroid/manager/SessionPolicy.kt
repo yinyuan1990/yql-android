@@ -40,6 +40,11 @@ object SessionPolicy {
 
     // ---------- 可调参数（与 iOS 保持一致） ----------
 
+    /** ⭐⭐ 2026-08-02 用户拍板：当前版本三端一律直接走 SRS，P2P 以后单独出专版、不再混用。
+     *  true = compute() 协商直接返回 SRS（P2P 判定/重协商代码保留不删）；P2P 专版改回 false 即恢复。
+     *  与 iOS `SessionPolicy.srsOnlyBuild` 同构。 */
+    private const val SRS_ONLY_BUILD = true
+
     /** 推流前等 PC_PRESENCE 的宽限期（ms）：两端登录有先后，刚开机时消息可能还没到 */
     const val PRESENCE_GRACE_MS = 2000L
     /** 两次重新协商的最小间隔（ms） */
@@ -201,7 +206,11 @@ object SessionPolicy {
         val backendForcesSrs = context?.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
             ?.getString("connect_mode", "auto")?.lowercase() == "srs"
         val mode: Mode
-        if (pinnedToSrs) {
+        if (SRS_ONLY_BUILD) {
+            // ⭐⭐ 2026-08-02 用户拍板：当前版本一律直接走 SRS，P2P 另出专版、不再混用。
+            mode = Mode.SRS
+            reasons.add("当前版本固定多人线路（P2P另出专版）")
+        } else if (pinnedToSrs) {
             // ⭐ §53.20.1：本次会话已被实测否掉 P2P（ICE 失败/协商次数达上限），
             //   重协商重启后必须还记得——不能拿网段预判再算回 P2P。
             mode = Mode.SRS
