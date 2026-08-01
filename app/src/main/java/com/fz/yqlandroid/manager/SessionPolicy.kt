@@ -77,11 +77,14 @@ object SessionPolicy {
     fun onViewerInputChanged(trigger: String, isNewViewer: Boolean = false) {
         val pending = pendingNetworkChange
         if (pending) pendingNetworkChange = false
-        // ⭐ §53.20.3 单人模式先到先得：P2P 会话进行中，**新上线**的 PC 不触发重新协商
-        //  （不能让后来者把先来者正看着的直连会话顶掉切 SRS）——它的请求由 P2P 层
-        //   回 WEBRTC_REJECT(single_mode_occupied) 提示占线。本机切网(pending)例外照常评估。
-        if (isNewViewer && !pending && current?.mode == Mode.P2P) {
-            log("🚧 单人直连进行中，新上线PC($trigger)不打断当前会话（其请求由 P2P 层拒绝提示占线）")
+        // ⭐ §53.20.3 单人模式先到先得：P2P 会话进行中，**其它观看端的任何 presence 变化都不触发
+        //   重新协商**——不只是"新上线"（与 iOS 同构）。此前只挡 isNewViewer，导致第二台 PC 的
+        //   后续心跳字段一变/跨网就把 compute() 拖去"非同网段→SRS"，把正在 P2P 的第一台踢下来，
+        //   第二台被拒又切回 P2P → P2P↔SRS 来回翻（用户实测"混乱"）。单人模式只认先来的那台；
+        //   其它 PC 由 P2P 层回 single_mode_occupied 提示占线；本机切网(pending)例外照常评估；
+        //   真正的 P2P 对端变差由 ICE 失败 → forceSrsForSession 兜底。
+        if (!pending && current?.mode == Mode.P2P) {
+            log("🚧 单人直连进行中，观看端($trigger)presence 变化不触发重协商（单人模式；其它 PC 由 P2P 层拒绝占线）")
             return
         }
         val handled = evaluateForRenegotiate(if (pending) "$trigger + 本机切过网" else trigger)
