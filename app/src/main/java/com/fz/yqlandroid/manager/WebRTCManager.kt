@@ -261,18 +261,22 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // ⭐ OTG 用更宽的档（2026-07-28）：不少国产 ROM 开机就常年上报 MODERATE(→FAIR)，
         //    按自带摄像头的 30 一压，OTG 推流永远上不去；而 OTG 模式手机自身相机/ISP 根本没开，
         //    发热源少一大块，FAIR 放到 60 合理。SERIOUS/CRITICAL 仍严格压（那是真热了）。
+        // ⭐⭐ 2026-08-02 OTG 的 fps 完全豁免热控（用户实测日志定案）：国产 ROM 温度上报激进，
+        //    仅推 640x480@29/2Mbps 就爬到 SERIOUS，OTG 切 320x240 采集实测 123fps 却被
+        //    「热控上限30」摁死在 30。OTG 模式手机相机/ISP 未开、编码负载小（320x240 才几百 kbps），
+        //    发热主要不来自推流——fps 不再压，码率缩放保留兜底。自带摄像头档位不变。
         when (level) {
             ThermalManager.Level.NOMINAL -> { thermalFpsCap = Int.MAX_VALUE; thermalBitrateScale = 1.0 }
             ThermalManager.Level.FAIR -> {
-                thermalFpsCap = if (usingOtgCamera) 60 else 30
+                thermalFpsCap = if (usingOtgCamera) Int.MAX_VALUE else 30
                 thermalBitrateScale = 0.8
             }
             ThermalManager.Level.SERIOUS -> {
-                thermalFpsCap = if (usingOtgCamera) 30 else 20
+                thermalFpsCap = if (usingOtgCamera) Int.MAX_VALUE else 20
                 thermalBitrateScale = 0.6
             }
             ThermalManager.Level.CRITICAL -> {
-                thermalFpsCap = if (usingOtgCamera) 15 else 12
+                thermalFpsCap = if (usingOtgCamera) Int.MAX_VALUE else 12
                 thermalBitrateScale = 0.4
             }
         }
