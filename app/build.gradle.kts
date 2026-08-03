@@ -36,6 +36,8 @@ android {
     }
     buildFeatures {
         compose = true
+        // ⭐ 2026-08-03：AGP 8 默认不生成 BuildConfig；OtgLogReporter 自诊断头要读 VERSION_NAME
+        buildConfig = true
     }
 }
 
