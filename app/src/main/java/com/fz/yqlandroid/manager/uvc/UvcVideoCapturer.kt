@@ -114,6 +114,60 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     @Volatile private var frameWidth = 0
     @Volatile private var frameHeight = 0
 
+    // ⭐ 2026-08-03 描述符预读表：key="格式@WxH"（格式 1=MJPEG 2=YUYV），值=该档真实 fps 表（降序）。
+    //   相机打开时从 USB 原始描述符解析（UvcDescriptorFps），协商/降帧/能力快照全用它——
+    //   描述符规矩的摄像头切档零试错；解析不到的维持降帧收敛兜底。
+    private val descriptorFps = HashMap<String, List<Int>>()
+
+    private fun fmtKeyOf(frameFormat: Int): Int =
+        if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) UvcDescriptorFps.FORMAT_MJPEG
+        else UvcDescriptorFps.FORMAT_YUYV
+
+    /** 该尺寸（任一格式）低于 belowFps 的最高描述符档；无则 null */
+    private fun descFpsBelow(w: Int, h: Int, belowFps: Int): Int? =
+        (descriptorFps["${UvcDescriptorFps.FORMAT_MJPEG}@${w}x${h}"].orEmpty() +
+         descriptorFps["${UvcDescriptorFps.FORMAT_YUYV}@${w}x${h}"].orEmpty())
+            .filter { it < belowFps }.maxOrNull()
+
+    /** 相机打开时预读 USB 原始描述符里的每档 fps 表（提前知道，不再盲试） */
+    private fun preloadDescriptorFps(device: UsbDevice) {
+        descriptorFps.clear()
+        try {
+            val um = appContext.getSystemService(android.content.Context.USB_SERVICE)
+                    as android.hardware.usb.UsbManager
+            val conn = um.openDevice(device)
+            if (conn == null) {
+                Log.d("meidui", "🔌 [OTG] 📖 描述符预读失败: openDevice=null")
+                com.fz.yqlandroid.manager.OtgLogReporter.diag("📖 描述符预读失败: openDevice=null → 维持降帧收敛兜底")
+                return
+            }
+            val raw = try { conn.rawDescriptors } finally { try { conn.close() } catch (_: Exception) {} }
+            if (raw == null || raw.isEmpty()) {
+                Log.d("meidui", "🔌 [OTG] 📖 描述符预读失败: rawDescriptors 为空")
+                com.fz.yqlandroid.manager.OtgLogReporter.diag("📖 描述符预读失败: rawDescriptors 为空 → 维持降帧收敛兜底")
+                return
+            }
+            val entries = UvcDescriptorFps.parse(raw)
+            for (e in entries) {
+                val key = "${e.format}@${e.width}x${e.height}"
+                // 同格式同尺寸出现多次（多个 VS 接口）取并集
+                descriptorFps[key] = (descriptorFps[key].orEmpty() + e.fpsList).distinct().sortedDescending()
+            }
+            val table = entries.joinToString("  ") {
+                "${if (it.format == UvcDescriptorFps.FORMAT_MJPEG) "MJPEG" else "YUYV"} ${it.width}x${it.height}=${it.fpsList}"
+            }
+            Log.d("meidui", "🔌 [OTG] 📖 描述符预读（${raw.size}字节 ${entries.size}条帧描述符）: $table")
+            if (entries.isEmpty()) {
+                com.fz.yqlandroid.manager.OtgLogReporter.diag("📖 描述符预读为空（设备没按UVC标准报帧间隔）→ 维持降帧收敛兜底")
+            } else {
+                com.fz.yqlandroid.manager.OtgLogReporter.diag("📖 描述符预读 ${entries.size}条: $table")
+            }
+        } catch (e: Exception) {
+            Log.d("meidui", "🔌 [OTG] 📖 描述符预读失败: ${e.message}")
+            com.fz.yqlandroid.manager.OtgLogReporter.diag("📖 描述符预读失败: ${e.message} → 维持降帧收敛兜底")
+        }
+    }
+
     @Volatile private var capturing = false        // startCapture ~ stopCapture 区间
     @Volatile private var streamRunning = false    // UVC 相机已开流
 
@@ -240,6 +294,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             camera.open(ctrlBlock)
             uvcCamera = camera
             currentDeviceName = device.productName ?: device.deviceName
+            preloadDescriptorFps(device)   // ⭐ 先读描述符 fps 表，随后的协商直接按真值请求
             startStreamLocked(camera)
             dumpCapabilitiesLocked(camera)   // ⭐ 能力枚举 → 画面层叠显 + OTG日志
             Log.d("meidui", "🔌 [OTG] ✅ UVC相机已开流: ${device.productName ?: device.deviceName} → ${frameWidth}x${frameHeight}")
@@ -353,8 +408,12 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             //   优先该尺寸已知可协商值，否则 120→60→30），fps 降到底了再走换格式的老梯度。
             if (requestedFps > 30) {
                 val known = knownGoodFps[sizeKey(requestedWidth, requestedHeight)]
-                val next = if (known != null && known in 1 until requestedFps) known
-                           else if (requestedFps > 60) 60 else 30
+                // ⭐ 降帧目标优先级：该档已协商成功值 > 描述符声明的低一档真值 > 60/30 盲降
+                val next = when {
+                    known != null && known in 1 until requestedFps -> known
+                    else -> descFpsBelow(requestedWidth, requestedHeight, requestedFps)
+                            ?: if (requestedFps > 60) 60 else 30
+                }
                 Log.d("meidui", "🔌 [OTG] ⚠️ 0帧且请求${requestedFps}fps 偏高 → 降帧到${next}fps 同策略重试（native假接受高fps后-51）")
                 com.fz.yqlandroid.manager.OtgLogReporter.diag(
                     "⚠️ 0帧 请求=${requestedWidth}x${requestedHeight}@${requestedFps}fps → 降帧到${next}fps 重试（不换格式）")
@@ -514,10 +573,23 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             declaredFps > 0  -> declaredFps
             else             -> PROBE_MAX_FPS
         }
-        val candidates = (listOf(exactFps) +
+        // ⭐ 2026-08-03 描述符预读优先：该 格式@尺寸 的真实 fps 表已在相机打开时解析好
+        //  （preloadDescriptorFps），首选"描述符声明、且不超请求值"的最高档——直接命中，
+        //   不再靠 Java 假接受 + 看门狗盲试。描述符缺失/乱写时照旧走老梯度兜底。
+        val descList = descriptorFps["${fmtKeyOf(frameFormat)}@${w}x${h}"].orEmpty()
+        val descPick = descList.filter { it <= exactFps }
+        if (descList.isNotEmpty()) {
+            Log.d("meidui", "🔌 [OTG] 📖 描述符档@${w}x${h}" +
+                    "(${if (frameFormat == UVCCamera.FRAME_FORMAT_MJPEG) "MJPEG" else "YUYV"})=$descList" +
+                    " 请求${exactFps}fps → 首选${descPick.firstOrNull() ?: descList.minOrNull()}fps")
+        }
+        val candidates = (descPick +
+                listOf(exactFps) +
                 listOfNotNull(knownGoodFps[sizeKey(w, h)]) +
+                // 请求低于描述符最低档时用设备最低真实档（采集偏高无害，推送侧另有节流）
+                listOfNotNull(descList.minOrNull()) +
                 listOf(60, 30, 25, 20, 15, 10).filter { it < exactFps })
-            .filter { it in 1..exactFps }
+            .filter { it >= 1 }
             .distinct()
 
         camera.setFrameCallback(null, 0)
@@ -531,7 +603,8 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                 negotiatedOk = true
                 Log.d("meidui", "🔌 [OTG] 帧率精确请求 ${fps}fps @${w}x${h} ✅被接受" +
                         (if (fps != exactFps) "（请求的 ${exactFps}fps 该档没有，梯度降级）" else "") +
-                        (if (declaredFps > 0) "（设备声明${declaredFps}fps）" else ""))
+                        (if (declaredFps > 0) "（设备声明${declaredFps}fps）" else "") +
+                        (if (descList.contains(fps)) "（命中描述符声明档）" else ""))
                 break
             } catch (e: Exception) {
                 lastErr = e
@@ -622,11 +695,13 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                 } catch (_: Exception) { null }
                 // 每档分辨率带 fps 上限（Size.fps 由 UVC 帧间隔描述符算出；null=设备没报，记 0）
                 s?.forEach { sz ->
-                    // fps 三级取值：设备声明 > （当前档位的）协商值 > （当前档位的）实测值
+                    // fps 取值：设备声明 > ⭐描述符预读（2026-08-03，全档提前知道）> 协商值 > 实测值
                     val declared = try { sz.fps?.maxOrNull()?.toInt() ?: 0 } catch (_: Exception) { 0 }
+                    val descMax = descriptorFps["${fmtKeyOf(fmt)}@${sz.width}x${sz.height}"]?.maxOrNull() ?: 0
                     val isCurrent = sz.width == frameWidth && sz.height == frameHeight
                     val maxFps = when {
                         declared > 0 -> declared
+                        descMax > 0 -> descMax
                         isCurrent && negotiatedFps > 0 -> negotiatedFps
                         isCurrent -> measuredFps
                         else -> 0
