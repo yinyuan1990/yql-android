@@ -964,7 +964,7 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         // ⭐ 2026-08-03 颜色诊断（查"OTG颜色不正"）：第10帧 + 之后每600帧，采样中心块 Y/V/U 均值
         //   上报自诊断通道。NV21 色度平面 V 前 U 后——**对着纯红色物体**：正常应 V≫128 且 U≪128；
         //   若相反 = native 实际吐的是 NV12（UV 序），色度对调，红蓝互换。采样 16x8 色度块，开销可忽略。
-        if (frameCbCount == 10 || frameCbCount % 600 == 0) {
+        if (frameCbCount == 10L || frameCbCount % 600L == 0L) {
             try {
                 var sy = 0L; var sv = 0L; var su = 0L
                 val cx = w / 2; val cy = h / 2
