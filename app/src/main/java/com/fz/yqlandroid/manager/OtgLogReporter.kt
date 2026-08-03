@@ -125,9 +125,24 @@ object OtgLogReporter {
 
     // MARK: - logcat 采集（读自己进程的日志，无需权限）
 
+    /** 把一条自诊断信息直接塞进上传缓冲（⭐ 2026-08-03：logcat 起不来的机型，失败原因
+     *  自己就是靠 logcat 传的——死循环。此通道绕过 logcat，保证后台至少能看到原因） */
+    private fun bufferDiagLine(msg: String) {
+        synchronized(lock) {
+            buffer.append("[OtgLogReporter自诊断] ").append(msg).append('\n')
+            bufferLines++
+        }
+    }
+
     private fun startLogcat() {
         if (logcatJob?.isActive == true) return
         logcatJob = scope.launch {
+            // ⭐ 2026-08-03：先写设备信息头（机型/系统/APK版本）——排查"哪台手机没传日志"
+            //   时能直接对上是谁、跑的什么版本（老版 APK 是日志缺失的头号嫌疑）。
+            bufferDiagLine("采集启动 model=${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}" +
+                    " sdk=${android.os.Build.VERSION.SDK_INT}" +
+                    " appVer=${com.fz.yqlandroid.BuildConfig.VERSION_NAME}")
+            var gotAnyLine = false
             try {
                 val pid = android.os.Process.myPid()
                 // -T 500: 回放最近500行（OTG 插入/授权/开流日志发生在启动瞬间，不能漏）
@@ -138,6 +153,7 @@ object OtgLogReporter {
                 BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                     while (isActive && active && enabled) {
                         val line = reader.readLine() ?: break
+                        gotAnyLine = true
                         synchronized(lock) {
                             if (bufferLines < MAX_BUFFER_LINES) {
                                 buffer.append(line).append('\n')
@@ -146,8 +162,13 @@ object OtgLogReporter {
                         }
                     }
                 }
+                // ⭐ 进程秒退且一行都没吐（个别 ROM 禁 logcat）→ 上报原因，别再静默
+                if (!gotAnyLine && active && enabled) {
+                    bufferDiagLine("⚠️ logcat 进程退出且未输出任何日志（该机型可能限制应用读取日志）")
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "logcat 采集异常: ${e.message}")
+                bufferDiagLine("⚠️ logcat 采集失败: ${e.message}（该机型可能禁止应用执行 logcat）")
             } finally {
                 stopLogcatProcess()
             }
