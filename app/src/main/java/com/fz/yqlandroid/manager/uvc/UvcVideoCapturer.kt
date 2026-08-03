@@ -886,6 +886,35 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val pooled = bufferPool.poll()
         val data = if (pooled != null && pooled.size == expected) pooled else ByteArray(expected)
         frame.get(data, 0, expected)
+        // ⭐ 2026-08-03 颜色诊断（查"OTG颜色不正"）：第10帧 + 之后每600帧，采样中心块 Y/V/U 均值
+        //   上报自诊断通道。NV21 色度平面 V 前 U 后——**对着纯红色物体**：正常应 V≫128 且 U≪128；
+        //   若相反 = native 实际吐的是 NV12（UV 序），色度对调，红蓝互换。采样 16x8 色度块，开销可忽略。
+        if (frameCbCount == 10 || frameCbCount % 600 == 0) {
+            try {
+                var sy = 0L; var sv = 0L; var su = 0L
+                val cx = w / 2; val cy = h / 2
+                var n = 0
+                for (row in (cy - 8) until (cy + 8)) {
+                    for (col in (cx - 16) until (cx + 16)) {
+                        sy += data[row * w + col].toInt() and 0xFF; n++
+                    }
+                }
+                val chromaBase = w * h
+                var m = 0
+                for (crow in (cy / 2 - 4) until (cy / 2 + 4)) {
+                    for (ccol in (cx / 2 - 8) until (cx / 2 + 8)) {
+                        val idx = chromaBase + crow * w + ccol * 2
+                        sv += data[idx].toInt() and 0xFF
+                        su += data[idx + 1].toInt() and 0xFF
+                        m++
+                    }
+                }
+                com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                    "色彩采样#$frameCbCount ${w}x${h} ${fmtName(activeFormatInt)}" +
+                    " 中心块 Y=${sy / n} V=${sv / m} U=${su / m}" +
+                    "（对纯红物体：正常 V≫128、U≪128；相反=色度NV12/NV21对调）")
+            } catch (_: Exception) { /* 采样越界等异常不影响推流 */ }
+        }
         val nv21 = NV21Buffer(data, w, h) { bufferPool.offer(data) }
         val ts = TimeUnit.MILLISECONDS.toNanos(SystemClock.elapsedRealtime())
         val videoFrame = VideoFrame(nv21, 0, ts)
