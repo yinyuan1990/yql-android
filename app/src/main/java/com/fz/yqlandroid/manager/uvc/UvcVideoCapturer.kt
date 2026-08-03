@@ -346,6 +346,28 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                 scheduleFpsSample(camera)        // 再等画面稳下来单独测一次帧率
                 return@Runnable
             }
+            // ⭐⭐ 2026-08-03 华为 JEF-AN00 实锤修复：Java 层 setPreviewSize 会"假接受"高 fps
+            //  （请求120被"接受"为60/120），真正的协商在 native prepare_preview 才报 -51
+            //   INVALID_MODE → 0帧。此前重试梯度只换 格式/带宽、fps 永远钉在高值 → 三种策略
+            //   全死在同一个 -51 上（错不在格式）。所以 0 帧后先**降帧重试**（同策略，
+            //   优先该尺寸已知可协商值，否则 120→60→30），fps 降到底了再走换格式的老梯度。
+            if (requestedFps > 30) {
+                val known = knownGoodFps[sizeKey(requestedWidth, requestedHeight)]
+                val next = if (known != null && known in 1 until requestedFps) known
+                           else if (requestedFps > 60) 60 else 30
+                Log.d("meidui", "🔌 [OTG] ⚠️ 0帧且请求${requestedFps}fps 偏高 → 降帧到${next}fps 同策略重试（native假接受高fps后-51）")
+                com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                    "⚠️ 0帧 请求=${requestedWidth}x${requestedHeight}@${requestedFps}fps → 降帧到${next}fps 重试（不换格式）")
+                requestedFps = next
+                // 错不在格式：不拉黑、不推进策略档
+                try {
+                    stopStreamLocked(camera)
+                    startStreamLocked(camera)
+                } catch (e: Exception) {
+                    Log.d("meidui", "🔌 [OTG] 降帧重开失败: ${e.message}")
+                }
+                return@Runnable
+            }
             // 起流了却 0 帧：这个 格式@尺寸 拉黑
             formatBlacklist.add(blKey(activeFormatInt, requestedWidth, requestedHeight))
             noFrameRetry++
