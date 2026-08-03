@@ -643,6 +643,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         cap.preferredFormat = format
         val capFps = (if (fps > 0) fps else maxOf(1, currentFps)).coerceIn(1, OTG_MAX_CAPTURE_FPS)
         Log.d("meidui", "🔗 [OTG链路|切档] 目标=${width}x${height}@${capFps}fps 格式=$fmtName（当前 ${currentWidth}x${currentHeight}，热控上限${thermalFpsCap}fps）")
+        // ⭐ 2026-08-03 自诊断通道：切档入口（华为等 ROM 丢 Log.d，后台只能靠这条看到切了什么档）
+        OtgLogReporter.diag("切档指令 目标=${width}x${height}@${capFps}fps 格式=$fmtName（当前 ${currentWidth}x${currentHeight}）")
         val changed = (width != currentWidth || height != currentHeight)
         currentWidth = width
         currentHeight = height

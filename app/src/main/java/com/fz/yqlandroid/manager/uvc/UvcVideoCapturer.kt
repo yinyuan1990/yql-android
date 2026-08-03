@@ -313,9 +313,16 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
             bufferPool.clear()
             streamRunning = true
             Log.d("meidui", "🔌 [OTG] 开流策略=${st.name} 尺寸=${w}x${h}，${NO_FRAME_TIMEOUT_MS}ms后检查有无帧")
+            // ⭐ 2026-08-03 自诊断通道（绕过 logcat，华为等 ROM 丢 Log.d 也能上后台）
+            com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                "开流成功 策略=${st.name} 协商=${w}x${h}@${acceptedFps}fps" +
+                "（请求=${requestedWidth}x${requestedHeight}@${requestedFps}fps）")
         } catch (e: Exception) {
             streamRunning = false
             Log.d("meidui", "🔌 [OTG] ❌ 开流失败(${st.name}): ${e.message}")
+            com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                "❌ 开流失败 策略=${st.name} 请求=${requestedWidth}x${requestedHeight}@${requestedFps}fps" +
+                " err=${e.message}（-51=INVALID_MODE 该组合摄像头不认）")
             formatBlacklist.add(blKey(st.format, requestedWidth, requestedHeight))
         }
         scheduleNoFrameWatchdog(camera)   // 无论成功/失败都装看门狗：失败或0帧都会切下一档
@@ -350,6 +357,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                     fallbackTried = true
                     Log.d("meidui", "🔌 [OTG] ❌ 请求的配置所有策略均0帧 → 回退最后可用配置 " +
                             "${good.width}x${good.height} ${fmtName(good.format)}@${good.fps}fps（PC 面板显示会随能力快照纠正）")
+                    com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                        "❌ 请求=${requestedWidth}x${requestedHeight} 全策略0帧 → 回退最后可用配置 " +
+                        "${good.width}x${good.height} ${fmtName(good.format)}@${good.fps}fps")
                     requestedWidth = good.width
                     requestedHeight = good.height
                     requestedFps = good.fps
@@ -364,9 +374,13 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
                     return@Runnable
                 }
                 Log.d("meidui", "🔌 [OTG] ❌ 所有 格式/带宽 策略均0帧（无可回退配置）：该UVC设备与本机isoc不兼容，或OTG口供电不足（换带独立供电的OTG口再试）")
+                com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                    "❌ 请求=${requestedWidth}x${requestedHeight} 全策略0帧且无可回退配置（isoc不兼容/OTG供电不足）")
                 return@Runnable
             }
             Log.d("meidui", "🔌 [OTG] ⚠️ 开流后${NO_FRAME_TIMEOUT_MS}ms内0帧(native未回调IFrameCallback) → 切换到策略[${noFrameRetry}]重开")
+            com.fz.yqlandroid.manager.OtgLogReporter.diag(
+                "⚠️ 开流后${NO_FRAME_TIMEOUT_MS}ms内0帧 请求=${requestedWidth}x${requestedHeight}@${requestedFps}fps → 切策略[${noFrameRetry}]重开")
             try {
                 stopStreamLocked(camera)
                 startStreamLocked(camera)

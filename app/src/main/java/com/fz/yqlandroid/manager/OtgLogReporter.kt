@@ -134,6 +134,21 @@ object OtgLogReporter {
         }
     }
 
+    /** ⭐ 2026-08-03 对外自诊断通道：UVC 开流/协商的关键失败点直接写这里（绕过 logcat）。
+     *  背景：华为等 ROM 默认丢弃 Log.d——JEF-AN00 实测只上来 4 行 E 级 err=-51，
+     *  看不到请求的是哪个 尺寸@fps@格式，等于盲修。带时间戳，与 logcat 行可对齐。 */
+    fun diag(msg: String) {
+        if (!active) return
+        val ts = java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+            .format(java.util.Date())
+        synchronized(lock) {
+            if (bufferLines < MAX_BUFFER_LINES) {
+                buffer.append("[诊断] ").append(ts).append(' ').append(msg).append('\n')
+                bufferLines++
+            }
+        }
+    }
+
     private fun startLogcat() {
         if (logcatJob?.isActive == true) return
         logcatJob = scope.launch {
