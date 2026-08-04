@@ -1,6 +1,8 @@
 package com.fz.yqlandroid.ui.screen
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -65,10 +67,13 @@ fun LoginScreen(
     //   线路由 SessionPolicy 在推流前按"与观看端是否同 WiFi"决定，编码取总后台默认值。
     //   登录页只保留下面的摄像头模式。
     // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android
-    // ⭐⭐ 2026-08-04 拆分：本仓库为主版"金凤凰"（自带摄像头），固定 builtin；
-    //   OTG 入口已拆到独立仓库 android-otg（"金凤凰OTG"，包名 com.fz.yqlandroid.otg），
-    //   两 App 可同装。代码同构，OTG 相关代码保留不删（以后 OTG 的修改在 OTG 仓库做）。
+    // ⭐⭐ 2026-08-04 拆分：本仓库为主版"金凤凰"（自带摄像头），推流恒为 builtin；
+    //   OTG 已拆为独立 App"金凤凰OTG"（仓库 android-otg，包名 com.fz.yqlandroid.otg，可同装）。
+    //   登录页保留"外接OTG"按钮作为**下载入口**：点击弹框 → 直接下载 OTG 版 APK
+    //  （下载地址取总后台「App更新配置」的 otg 块，版本独立）。代码同构，OTG 代码保留不删。
     var selectedCameraMode by remember { mutableStateOf("builtin") }
+    // OTG 下载弹框
+    var showOtgDownloadDialog by remember { mutableStateOf(false) }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
     var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
     // ⭐ 设备号弹框（点击设备号显示完整 ID + 复制）
@@ -301,15 +306,18 @@ fun LoginScreen(
                             color = Color(0xFF1A1A1A)
                         )
                         Spacer(modifier = Modifier.width(12.dp))
-                        // ⭐ 主版：只保留自带（OTG 入口在独立 App"金凤凰OTG"，仓库 android-otg）
-                        listOf("builtin" to "自带").forEach { (mode, label) ->
+                        // ⭐ 主版推流恒为自带；"外接OTG"按钮保留为独立 App 的**下载入口**（点击弹框下载）
+                        listOf("builtin" to "自带", "otg" to "外接OTG").forEach { (mode, label) ->
                             val selected = selectedCameraMode == mode
                             Box(
                                 modifier = Modifier
                                     .padding(end = 8.dp)
                                     .clip(RoundedCornerShape(14.dp))
                                     .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
-                                    .clickable { selectedCameraMode = mode }
+                                    .clickable {
+                                        if (mode == "otg") showOtgDownloadDialog = true
+                                        else selectedCameraMode = mode
+                                    }
                                     .padding(horizontal = 16.dp, vertical = 6.dp)
                             ) {
                                 Text(
@@ -561,6 +569,38 @@ fun LoginScreen(
                     .clickable { showDeviceIdDialog = true }
             )
         }
+    }
+
+    // ⭐⭐ 2026-08-04 OTG 下载弹框：外接OTG 已拆为独立 App"金凤凰OTG"，
+    //   点击"立即下载"直接用浏览器下载 APK（地址取总后台「App更新配置」otg 块，版本独立）。
+    if (showOtgDownloadDialog) {
+        AlertDialog(
+            onDismissRequest = { showOtgDownloadDialog = false },
+            title = { Text("金凤凰OTG") },
+            text = {
+                Text("外接OTG摄像头功能已升级为独立App「金凤凰OTG」，可与本App同时安装。点击下方按钮直接下载安装。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        val url = com.fz.yqlandroid.manager.AppUpdateManager.fetchOtgDownloadUrl()
+                        if (url.isNullOrBlank()) {
+                            Toast.makeText(context, "未获取到下载地址，请联系管理员", Toast.LENGTH_SHORT).show()
+                        } else {
+                            try {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                showOtgDownloadDialog = false
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "打开下载链接失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }) { Text("立即下载") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showOtgDownloadDialog = false }) { Text("取消") }
+            }
+        )
     }
 
     // ⭐ 设备号弹框：完整 ID + 复制按钮
