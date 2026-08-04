@@ -2771,6 +2771,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // OTG：把生效值同步进能力快照，PC 面板照真值显示（别让面板自己猜一个缺省）
         if (usingOtgCamera) com.fz.yqlandroid.manager.uvc.UvcCapabilityStore.pushFps = targetFps
 
+        // ⭐⭐ 2026-08-04 修「OTG 拖动推送fps后绿屏/卡死」：改 maxFramerate 会让部分硬件编码器
+        //   （华为 JEF-AN00 实测）内部重置 → 码流不连续；而周期 IDR 已摘除（§21 防卡顿），
+        //   PC 解码器坏了永远等不到自愈关键帧 → 一直绿屏。fps 真变化时立刻补一发 IDR
+        //  （与切档 applyOtgResolution 末尾的 forceKeyframe 同款；自带摄像头行为不变）。
+        if (usingOtgCamera && fpsChanged) {
+            forceKeyframe()
+            com.fz.yqlandroid.manager.OtgLogReporter.diag("推送fps ${pushFps}→${targetFps} 已变更 → 补发关键帧（防绿屏）")
+        }
+
         Log.d(TAG, "🎬 推送FPS[$source]: 请求${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
         Log.d("meidui", "⚠️ fps修改源=$source ${pushFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")
     }

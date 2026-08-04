@@ -114,6 +114,12 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     @Volatile private var frameWidth = 0
     @Volatile private var frameHeight = 0
 
+    companion object {
+        /** ⭐ 2026-08-04：native "NV21" 回调实为 NV12（U/V 对调，OTG 皮肤发蓝实锤），
+         *  帧回调里逐对交换色度字节纠正。若将来遇到不需要交换的设备/库版本，改 false 即可。 */
+        private const val UV_SWAP = true
+    }
+
     // ⭐ 2026-08-03 描述符预读表：key="格式@WxH"（格式 1=MJPEG 2=YUYV），值=该档真实 fps 表（降序）。
     //   相机打开时从 USB 原始描述符解析（UvcDescriptorFps），协商/降帧/能力快照全用它——
     //   描述符规矩的摄像头切档零试错；解析不到的维持降帧收敛兜底。
@@ -961,6 +967,19 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
         val pooled = bufferPool.poll()
         val data = if (pooled != null && pooled.size == expected) pooled else ByteArray(expected)
         frame.get(data, 0, expected)
+        // ⭐⭐ 2026-08-04 修「OTG 颜色不正（皮肤发蓝）」：native 回调虽标着 PIXEL_FORMAT_NV21，
+        //   实际吐的是 NV12（U 前 V 后）——用户截图实锤：中性色（车顶灰/窗户白）全正常、
+        //   唯独高饱和的皮肤翻成蓝色，正是 U/V 对调的指纹（中性色 U≈V≈128 换了看不出来）。
+        //   自带摄像头没事是因为它走纹理通路，只有 OTG 走这条字节通路。
+        //   在自己的拷贝上把色度平面逐对交换成真 NV21（1080p 约 1~2ms/帧，可接受）。
+        //   下面的「色彩采样」在交换之后，日志里 V/U 已是修正后的值。
+        if (UV_SWAP) {
+            var i = w * h
+            while (i + 1 < expected) {
+                val t = data[i]; data[i] = data[i + 1]; data[i + 1] = t
+                i += 2
+            }
+        }
         // ⭐ 2026-08-03 颜色诊断（查"OTG颜色不正"）：第10帧 + 之后每600帧，采样中心块 Y/V/U 均值
         //   上报自诊断通道。NV21 色度平面 V 前 U 后——**对着纯红色物体**：正常应 V≫128 且 U≪128；
         //   若相反 = native 实际吐的是 NV12（UV 序），色度对调，红蓝互换。采样 16x8 色度块，开销可忽略。
