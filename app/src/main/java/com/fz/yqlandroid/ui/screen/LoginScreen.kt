@@ -64,7 +64,10 @@ fun LoginScreen(
     // ⭐ §53.4-定稿：线路（多人/单人）与编码（H264/H265）已不在登录页选——
     //   线路由 SessionPolicy 在推流前按"与观看端是否同 WiFi"决定，编码取总后台默认值。
     //   登录页只保留下面的摄像头模式。
-    // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android，记住上次选择
+    // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android
+    // ⭐⭐ 2026-08-04 拆分：本仓库为主版"金凤凰"（自带摄像头），固定 builtin；
+    //   OTG 入口已拆到独立仓库 android-otg（"金凤凰OTG"，包名 com.fz.yqlandroid.otg），
+    //   两 App 可同装。代码同构，OTG 相关代码保留不删（以后 OTG 的修改在 OTG 仓库做）。
     var selectedCameraMode by remember { mutableStateOf("builtin") }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
     var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
@@ -87,8 +90,8 @@ fun LoginScreen(
             password = savedPassword
             rememberPassword = true
         }
-        // ⭐ 摄像头模式（第四十八章）：恢复上次选择，默认自带
-        selectedCameraMode = prefs.getString("selected_camera_mode", "builtin") ?: "builtin"
+        // ⭐ 主版：模式恒为 builtin（不读旧记忆——老版本可能存过 otg，恢复后没有入口改回来）
+        selectedCameraMode = "builtin"
         // ⭐ 强制更新检查（公共接口，失败放行不拦门）
         forceUpdate = com.fz.yqlandroid.manager.AppUpdateManager.checkForceUpdate(context)
     }
@@ -298,7 +301,8 @@ fun LoginScreen(
                             color = Color(0xFF1A1A1A)
                         )
                         Spacer(modifier = Modifier.width(12.dp))
-                        listOf("builtin" to "自带", "otg" to "外接OTG").forEach { (mode, label) ->
+                        // ⭐ 主版：只保留自带（OTG 入口在独立 App"金凤凰OTG"，仓库 android-otg）
+                        listOf("builtin" to "自带").forEach { (mode, label) ->
                             val selected = selectedCameraMode == mode
                             Box(
                                 modifier = Modifier
