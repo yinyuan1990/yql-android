@@ -40,6 +40,9 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
 
     companion object {
         private const val TAG = "UvcVideoCapturer"
+        /** ⭐ 2026-08-04：native "NV21" 回调实为 NV12（U/V 对调，OTG 皮肤发蓝实锤），
+         *  帧回调里逐对交换色度字节纠正。若将来遇到不需要交换的设备/库版本，改 false 即可。 */
+        private const val UV_SWAP = true
         /**
          * ⭐ 设备**没声明**每档 fps 时，向 libuvc 请求的帧率上限（探测用）。
          *
@@ -113,12 +116,6 @@ class UvcVideoCapturer(context: Context) : VideoCapturer, UvcDeviceMonitor.Liste
     // UVC 实际协商出的帧格式（NV21Buffer 必须用这个尺寸）
     @Volatile private var frameWidth = 0
     @Volatile private var frameHeight = 0
-
-    companion object {
-        /** ⭐ 2026-08-04：native "NV21" 回调实为 NV12（U/V 对调，OTG 皮肤发蓝实锤），
-         *  帧回调里逐对交换色度字节纠正。若将来遇到不需要交换的设备/库版本，改 false 即可。 */
-        private const val UV_SWAP = true
-    }
 
     // ⭐ 2026-08-03 描述符预读表：key="格式@WxH"（格式 1=MJPEG 2=YUYV），值=该档真实 fps 表（降序）。
     //   相机打开时从 USB 原始描述符解析（UvcDescriptorFps），协商/降帧/能力快照全用它——
