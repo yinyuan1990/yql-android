@@ -8,8 +8,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -721,7 +724,8 @@ fun StreamingScreen(
             Column(
                 modifier = Modifier
                     .padding(end = 16.dp)
-                    .padding(bottom = 100.dp),
+                    // ⭐ 手表/小屏适配：小屏不再为底部面板预留 100dp，否则 Zoom 控件被顶出屏
+                    .padding(bottom = if (LocalConfiguration.current.screenHeightDp < 500) 8.dp else 100.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -808,8 +812,11 @@ fun StreamingScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    // ⭐ 手表/小屏适配：面板最高占屏 55%，超出部分面板内可滚（手机内容本就放得下，不受影响）
+                    .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.55f).dp)
                     .background(Color.White, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                     .padding(16.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
                 // 灰色卡片内容
                 Column(
