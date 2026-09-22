@@ -2397,7 +2397,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    改发 otg_ 前缀，这里只兜住老版本 PC / 后端回放的残留指令，不报错不崩。
         //    通用项（关键帧请求）不受影响，继续往下走。
         if (usingOtgCamera && ptype in listOf(
-                "type", "fps", "bitrate", "direction", "zoom", "cjfps", "focus",
+                "type", "fps", "bitrate", "direction", "zoom", "cjfps", "focus", "autoFocus",
                 "test_brightness", "white_balance", "applyWhiteBalance")) {
             Log.d("meidui", "🔌 [OTG] 忽略自带摄像头通道指令 ptype=$ptype（OTG 请用 otg_ 前缀）")
             return
@@ -2478,6 +2478,18 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 (config["focus"] as? Number)?.let { f ->
                     setFocus(f.toFloat())
                 }
+            }
+
+            // §104 自动对焦开关
+            "autoFocus" -> {
+                val on = when (val v = config["autoFocus"]) {
+                    is Boolean -> v
+                    is String -> v.equals("true", ignoreCase = true)
+                    is Number -> v.toInt() != 0
+                    else -> null
+                }
+                if (on != null) setAutoFocus(on)
+                else Log.w(TAG, "⚠️ ptype=autoFocus 缺少值，忽略")
             }
             
             // 🔥 ISO 增益（PC 硬件链路 test_brightness，value=0~100 → 手动 SENSOR_SENSITIVITY）。
@@ -2642,6 +2654,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     val currentZoom: Float get() = _currentZoom
     private var _currentFocus: Float = 0.5f
     val currentFocus: Float get() = _currentFocus
+    // §104 自动对焦开关：默认 false=手动；PC ptype=autoFocus 控制；收到 focus 值自动关掉
+    private var _autoFocus: Boolean = false
+    val autoFocusEnabled: Boolean get() = _autoFocus
     private var _currentShutterSpeed: Int = 240
     val currentShutterSpeed: Int get() = _currentShutterSpeed
     private var _shutterEnabled: Boolean = false     // 是否启用手动快门(cjfps)；false=自动曝光
@@ -2662,6 +2677,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val params = Camera2ParamApplier.Params(
             exposureEv = null,   // 滤镜已移除：不再做 AE 曝光补偿（颜色调整走 PC 端）
             focus = _currentFocus,
+            autoFocus = _autoFocus,
             zoom = _currentZoom,
             shutterCjfps = if (_shutterEnabled) _currentShutterSpeed else null,
             manualIsoPercent = _isoPercent,
@@ -2710,8 +2726,19 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     /** 设置对焦距离 (0.0 ~ 1.0)；0.5=连续自动对焦，其余=手动 */
     fun setFocus(distance: Float) {
         _currentFocus = distance.coerceIn(0f, 1f)
+        if (_autoFocus) {
+            _autoFocus = false   // §104 手动更改 → 手动对焦
+            Log.d(TAG, "🎯 收到手动焦距，自动对焦关闭")
+        }
         applyCameraParams()
         Log.d(TAG, "🎯 对焦距离: $_currentFocus")
+    }
+
+    /** §104 自动对焦开关（PC ptype=autoFocus）。关掉时按缓存的 _currentFocus 重新锁焦距 */
+    fun setAutoFocus(on: Boolean) {
+        _autoFocus = on
+        applyCameraParams()
+        Log.d(TAG, "🎯 对焦模式 → ${if (on) "自动" else "手动(focus=$_currentFocus)"}")
     }
 
     /**

@@ -40,6 +40,7 @@ object Camera2ParamApplier {
     data class Params(
         val exposureEv: Float? = null,     // AE 曝光补偿(EV)，仅在未启用手动快门时生效
         val focus: Float? = null,          // 0..1；0.5=连续自动对焦，其余=手动对焦距离
+        val autoFocus: Boolean = false,    // §104 true=连续自动对焦（忽略 focus）；false=按 focus 处理
         val zoom: Float? = null,           // >=1.0；变焦
         val shutterCjfps: Int? = null,     // 快门 1/cjfps 秒(60~600)，非空=手动曝光(AE OFF)
         val manualIsoPercent: Int? = null, // ISO 增益 0~100（PC test_brightness）→ 映射设备 SENSITIVITY_RANGE；仅手动快门(AE OFF)生效
@@ -220,6 +221,11 @@ object Camera2ParamApplier {
     // ===== 对焦 =====
     private fun applyFocus(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
         try {
+            // §104 自动对焦开关优先：开着就下连续 AF，focus 值不看
+            if (p.autoFocus) {
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                return
+            }
             val f = p.focus ?: return
             val minFocusDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             if (f == 0.5f || minFocusDist <= 0f) {
