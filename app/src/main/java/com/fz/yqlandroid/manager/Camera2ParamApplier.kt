@@ -41,7 +41,7 @@ object Camera2ParamApplier {
         val exposureEv: Float? = null,     // AE 曝光补偿(EV)，仅在未启用手动快门时生效
         val focus: Float? = null,          // 0..1；0.5=连续自动对焦，其余=手动对焦距离
         val autoFocus: Boolean = false,    // §104 true=连续自动对焦（忽略 focus）；false=按 focus 处理
-        val zoom: Float? = null,           // >=1.0；变焦
+        val zoom: Float? = null,           // 0.5~max；变焦（<1 需设备 ZOOM_RATIO_RANGE 支持，否则夹到 1.0）
         val shutterCjfps: Int? = null,     // 快门 1/cjfps 秒(60~600)，非空=手动曝光(AE OFF)
         val manualIsoPercent: Int? = null, // ISO 增益 0~100（PC test_brightness）→ 映射设备 SENSITIVITY_RANGE；仅手动快门(AE OFF)生效
         val whiteBalanceSlider: Int? = null, // 0..100 手动色温(0冷100暖)
@@ -244,16 +244,22 @@ object Camera2ParamApplier {
     // ===== 变焦 =====
     private fun applyZoom(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
         try {
-            val z = (p.zoom ?: return).coerceAtLeast(1.0f)
-            val maxZoom = c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
-            val zc = z.coerceIn(1.0f, maxZoom)
+            val z = p.zoom ?: return
+            // §106 逻辑多摄机型（Pixel/三星等）ZOOM_RATIO 下限 0.5~0.6：设 <1 时 HAL 自动切超广角，无需换会话
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val range = c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                 if (range != null) {
-                    b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zc.coerceIn(range.lower, range.upper))
+                    val zr = z.coerceIn(range.lower, range.upper)
+                    if (z < 1.0f && zr >= 1.0f) {
+                        Log.d("meidui", "🔍 请求 ${z}x 但本机逻辑后摄变焦下限=${range.lower}（不开放超广角），按 ${zr}x")
+                    }
+                    b.set(CaptureRequest.CONTROL_ZOOM_RATIO, zr)
                     return
                 }
             }
+            if (z < 1.0f) Log.d("meidui", "🔍 请求 ${z}x 但系统 <Android 11 无 ZOOM_RATIO，按 1.0x")
+            val maxZoom = c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
+            val zc = z.coerceIn(1.0f, maxZoom)
             val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
             if (zc > 1.0f) {
                 val cropW = (active.width() / zc).toInt()

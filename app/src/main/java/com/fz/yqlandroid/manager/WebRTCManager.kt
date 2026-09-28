@@ -2075,6 +2075,23 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
     }
 
+    /** §106 诊断：各后摄的 ZOOM_RATIO_RANGE（下限<1=能到超广角）与焦距，判断机型是否支持 0.5x */
+    private fun logBackCameraZoomInfo(backIds: List<String>, usingId: String) {
+        try {
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            for (id in backIds) {
+                val ch = cm.getCameraCharacteristics(id)
+                val range = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R)
+                    ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
+                val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.joinToString("/") { "%.2f".format(it) }
+                Log.d("meidui", "📷 后摄 id=$id${if (id == usingId) "(使用中)" else ""} zoomRange=$range focal=${focal}mm")
+            }
+        } catch (e: Exception) {
+            Log.d("meidui", "📷 后摄变焦信息读取失败: ${e.message}")
+        }
+    }
+
     private fun createCameraCapturer(useFront: Boolean): CameraVideoCapturer {
         // 🔥 使用 WebRTC 原生 Camera2 采集器（低发热，走 WebRTC 优化纹理管线）。
         //    曝光/对焦/变焦/快门/白平衡改由 Camera2ParamApplier 反射原生 session 按需注入（见 docs 十五）。
@@ -2086,6 +2103,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         } ?: names.firstOrNull()
         ?: throw IllegalStateException("找不到可用摄像头")
         Log.d(TAG, "🎥 原生采集器: camera=$target front=$useFront")
+        logBackCameraZoomInfo(names.filter { enumerator.isBackFacing(it) }, target)
         // ⭐ 挂相机事件回调：此前传 null，相机被系统断开（切后台约1分钟）应用完全无感知，
         //    回前台也不知道要恢复——这是「后台断流、回来不自动推」的感知缺失一环
         val events = object : CameraVideoCapturer.CameraEventsHandler {
@@ -2716,9 +2734,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
     }
 
-    /** 设置变焦 (1.0 ~ maxZoom) */
+    /** 设置变焦 (0.5 ~ maxZoom)；0.5=超广角，实际下限由 Camera2ParamApplier 按设备 ZOOM_RATIO_RANGE 夹 */
     fun setZoom(zoom: Float) {
-        _currentZoom = zoom.coerceIn(1.0f, 10.0f)
+        _currentZoom = zoom.coerceIn(0.5f, 10.0f)
         applyCameraParams()
         Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x")
     }
