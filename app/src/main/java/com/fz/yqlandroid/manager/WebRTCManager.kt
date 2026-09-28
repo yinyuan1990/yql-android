@@ -2016,6 +2016,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 
                 // 🔥 切换后重新计算档位（前后置能力不同）
                 calculateLadder(isFront)
+
+                // §106 新摄像头到不了 <1 倍 → 记忆值回 1.0（切回后置也保持 1.0，与 PC 显示一致）
+                if (_currentZoom < 1f && currentMinZoomRatio() >= 1f) _currentZoom = 1f
+                reportLensCaps()
                 
                 Log.d(TAG, "🔄 切换到${if (isFront) "前置" else "后置"}摄像头")
                 
@@ -2458,11 +2462,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
-            // 变焦: 1.0~max
+            // 变焦: 0.5(超广角,需设备支持)~max
             "zoom" -> {
                 val zoom = (config["zoom"] as? Number)?.toFloat() ?: 1.0f
                 setZoom(zoom)
             }
+
+            // §106 PC 询问当前镜头能否 0.5 倍
+            "queryLensCaps" -> reportLensCaps()
             
             // 推送FPS
             "fps" -> {
@@ -2606,8 +2613,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         //    applyRemoteConfig 内部按 wantFront != isFrontCamera 差异切换，直传即可。
         applyRemoteConfig(mapOf("ptype" to "direction", "direction" to config.direction))
 
-        // 3) 变焦
-        applyRemoteConfig(mapOf("ptype" to "zoom", "zoom" to config.zoom))
+        // 3) 变焦：§106 每次启动从主摄 1 倍开始，不沿用后端存的上次倍数
+        applyRemoteConfig(mapOf("ptype" to "zoom", "zoom" to 1.0f))
 
         // 4) 快门(cjfps) —— 用户反馈“启动时没挂上”，这里补齐
         config.cjfps?.let { applyRemoteConfig(mapOf("ptype" to "cjfps", "cjfps" to it)) }
@@ -2734,11 +2741,42 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
     }
 
-    /** 设置变焦 (0.5 ~ maxZoom)；0.5=超广角，实际下限由 Camera2ParamApplier 按设备 ZOOM_RATIO_RANGE 夹 */
+    /** 设置变焦 (0.5 ~ maxZoom)；<1 仅当前摄像头 ZOOM_RATIO 下限 <1（超广角）时生效，否则按 1.0 */
     fun setZoom(zoom: Float) {
-        _currentZoom = zoom.coerceIn(0.5f, 10.0f)
+        val minRatio = currentMinZoomRatio()
+        val lower = if (minRatio < 1f) minRatio.coerceAtLeast(0.5f) else 1.0f
+        _currentZoom = zoom.coerceIn(lower, 10.0f)
         applyCameraParams()
-        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x")
+        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x（请求 ${zoom}x，设备下限 $minRatio）")
+        reportLensCaps()
+    }
+
+    // §106 按朝向缓存 ZOOM_RATIO 下限（true=前置），特性表不会变
+    private val minZoomRatioCache = HashMap<Boolean, Float>()
+
+    /** §106 当前朝向摄像头的 ZOOM_RATIO 下限；<1 = 能到超广角。读不到/Android 10 及以下按 1.0 */
+    private fun currentMinZoomRatio(): Float {
+        if (usingOtgCamera || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return 1f
+        val front = isFrontCamera
+        minZoomRatioCache[front]?.let { return it }
+        val v = try {
+            val enumerator = Camera2Enumerator(context)
+            val id = enumerator.deviceNames.firstOrNull {
+                if (front) enumerator.isFrontFacing(it) else enumerator.isBackFacing(it)
+            }
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            id?.let { cm.getCameraCharacteristics(it).get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower } ?: 1f
+        } catch (e: Exception) {
+            1f
+        }
+        minZoomRatioCache[front] = v
+        return v
+    }
+
+    /** §106 回传 PC：当前朝向能否 <1 倍 + 实际倍数 */
+    fun reportLensCaps() {
+        if (usingOtgCamera) return
+        WebSocketManager.instance.sendLensCaps(currentMinZoomRatio() < 1f, _currentZoom, isFrontCamera)
     }
 
     /** 设置对焦距离 (0.0 ~ 1.0)；0.5=连续自动对焦，其余=手动 */

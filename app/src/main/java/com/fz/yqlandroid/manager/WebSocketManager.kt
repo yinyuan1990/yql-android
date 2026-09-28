@@ -828,6 +828,29 @@ class WebSocketManager private constructor() {
     }
     
     /**
+     * §106 镜头能力回传：当前朝向能否 <1 倍（超广角）+ 实际倍数，PC 据此灰掉/点亮「0.5x 广角」。
+     * 字段用 lensZoom 而非 zoom，避免被当成变焦指令。
+     */
+    fun sendLensCaps(ultraWide: Boolean, zoom: Float, front: Boolean) {
+        val id = deviceId ?: return
+        val payload = mapOf(
+            "type" to "CONFIG_UPDATE",
+            "deviceId" to id,
+            "config" to mapOf(
+                "ptype" to "lensCaps",
+                "ultraWide" to ultraWide,
+                "lensZoom" to zoom,
+                "front" to front,
+                "device_id" to id
+            ),
+            "operator" to id,
+            "timestamp" to System.currentTimeMillis()
+        )
+        sendStompMessage("/topic/device/$id/config", gson.toJson(payload))
+        Log.d(TAG, "📤 镜头能力: ultraWide=$ultraWide zoom=$zoom front=$front")
+    }
+
+    /**
      * 🔥 发送 set_fps_ack 确认（与iOS一致）
      */
     fun sendSetFpsAck(fps: Int, status: String = "applied") {
