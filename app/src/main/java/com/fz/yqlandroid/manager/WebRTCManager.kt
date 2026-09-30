@@ -2619,8 +2619,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // 4) 快门(cjfps) —— 用户反馈“启动时没挂上”，这里补齐
         config.cjfps?.let { applyRemoteConfig(mapOf("ptype" to "cjfps", "cjfps" to it)) }
 
-        // 5) 对焦
-        config.focus?.let { applyRemoteConfig(mapOf("ptype" to "focus", "focus" to it)) }
+        // 5) 对焦：初始配置里的 focus 是上次存的值，不是这次的手动操作——自动模式下只记值、不关 AF
+        config.focus?.let {
+            if (_autoFocus) {
+                _currentFocus = it.toFloat().coerceIn(0f, 1f)
+                applyCameraParams()
+            } else {
+                applyRemoteConfig(mapOf("ptype" to "focus", "focus" to it))
+            }
+        }
 
         // 6) 码率/清晰度百分比（滤镜已移除：不再应用初始亮度/曝光）
         config.bitrate?.let { applyRemoteConfig(mapOf("ptype" to "bitrate", "bitrate" to it)) }
@@ -2679,8 +2686,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     val currentZoom: Float get() = _currentZoom
     private var _currentFocus: Float = 0.5f
     val currentFocus: Float get() = _currentFocus
-    // §104 自动对焦开关：默认 false=手动；PC ptype=autoFocus 控制；收到 focus 值自动关掉
-    private var _autoFocus: Boolean = false
+    // §104 自动对焦开关：§107 起默认 true=自动；PC ptype=autoFocus 控制；收到 focus 值自动关掉
+    private var _autoFocus: Boolean = true
     val autoFocusEnabled: Boolean get() = _autoFocus
     private var _currentShutterSpeed: Int = 240
     val currentShutterSpeed: Int get() = _currentShutterSpeed
