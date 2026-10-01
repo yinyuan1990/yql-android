@@ -85,6 +85,8 @@ fun LoginScreen(
     
     // 获取设备ID
     val deviceId = remember { DeviceIDManager.getDeviceID(context) }
+    // ⭐ §110 系统限制读取设备标识（ANDROID_ID 返回全零等假值）→ 提示用户去关闭限制
+    var showIdRestrictedDialog by remember { mutableStateOf(DeviceIDManager.isAndroidIdRestricted(context)) }
 
     // ⭐ 手表/小屏适配：屏高 < 500dp（典型手表 300~450dp）时压缩顶部留白与 Logo，
     //   保证账号/密码/登录按钮不用滚太远就能看到
@@ -659,6 +661,42 @@ fun LoginScreen(
                 TextButton(onClick = { showDeviceIdDialog = false }) {
                     Text("关闭")
                 }
+            }
+        )
+    }
+
+    // ⭐ §110 设备标识受限提示：可关闭继续使用（已自动改用本机随机设备号，不会和别人串号）
+    if (showIdRestrictedDialog) {
+        AlertDialog(
+            onDismissRequest = { showIdRestrictedDialog = false },
+            title = { Text("设备标识被系统限制") },
+            text = {
+                Text(
+                    "检测到系统限制了本应用读取设备标识（常见于手机的隐私保护功能，如小米「空白通行证」，或应用双开/分身、改机环境）。\n\n" +
+                        "本应用已临时使用本机随机设备号，但卸载重装或清除数据后会变化，可能导致账号与设备不匹配。\n\n" +
+                        "建议：在系统设置中找到本应用，关闭对它的隐私保护/设备信息限制，不要用双开或分身打开，然后重新打开本应用。",
+                    fontSize = 14.sp,
+                    color = Color(0xFF333333)
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    try {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${context.packageName}"))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    } catch (e: Exception) {
+                        Toast.makeText(context, "无法打开设置，请手动前往系统设置", Toast.LENGTH_SHORT).show()
+                    }
+                    showIdRestrictedDialog = false
+                }) {
+                    Text("去设置", color = Color(0xFF65AEF7), fontWeight = FontWeight.Medium)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showIdRestrictedDialog = false }) { Text("继续使用") }
             }
         )
     }

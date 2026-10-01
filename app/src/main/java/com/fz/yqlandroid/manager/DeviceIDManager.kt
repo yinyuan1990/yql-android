@@ -61,6 +61,10 @@ object DeviceIDManager {
 
     private fun generatePersistentID(context: Context): String {
         val androidId = getAndroidID(context)
+        if (isInvalidAndroidID(androidId)) {
+            Log.w(TAG, "⚠️ §110 ANDROID_ID 无效(raw=[$androidId])，可能是系统隐私保护/双开/改机，改用本机随机设备号")
+            return getFallbackDeviceID(context)
+        }
         val packageName = context.packageName
         val salt = "HuoFengHuang_2024_DeviceID" // 固定盐值
         
@@ -105,6 +109,30 @@ object DeviceIDManager {
      */
     fun getRawAndroidID(context: Context): String {
         return getAndroidID(context)
+    }
+
+    // §110 系统隐私保护/双开/改机时 ANDROID_ID 会返回这些假值，不同客户的手机算出同一个设备号 → 串号
+    private val INVALID_ANDROID_IDS = setOf("", "unknown_device", "null", "9774d56d682e549c")
+
+    private fun isInvalidAndroidID(id: String): Boolean {
+        val v = id.trim().lowercase()
+        return v in INVALID_ANDROID_IDS || v.all { it == '0' }
+    }
+
+    /** ANDROID_ID 被系统限制（返回假值）时为 true，登录页据此弹提示引导用户关闭限制 */
+    fun isAndroidIdRestricted(context: Context): Boolean = isInvalidAndroidID(getAndroidID(context))
+
+    // ANDROID_ID 无效时的兜底设备号：首次生成随机值存 SharedPreferences，卸载重装/清数据会变
+    @Synchronized
+    private fun getFallbackDeviceID(context: Context): String {
+        val prefs = context.getSharedPreferences("install_prefs", Context.MODE_PRIVATE)
+        var id = prefs.getString("fallback_device_id", null)
+        if (id.isNullOrBlank()) {
+            id = PLATFORM_PREFIX + java.util.UUID.randomUUID().toString().replace("-", "").uppercase()
+            prefs.edit().putString("fallback_device_id", id).apply()
+            Log.d(TAG, "🆕 生成兜底设备ID: ${id.take(15)}...")
+        }
+        return id
     }
 
     // ⭐ §71 安装实例ID：首启随机 UUID，存 SharedPreferences。
