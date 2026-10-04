@@ -99,7 +99,7 @@ object LoginRecordManager {
                 put("content", content)
             }
             val req = Request.Builder()
-                .url("${APIConfig.BASE_URL}/api/loginlog/upload")
+                .url("${APIConfig.BASE_URL}/api/loginrecord/upload")
                 .post(json.toString().toRequestBody(jsonType))
                 .build()
             client.newCall(req).execute().use { resp ->
