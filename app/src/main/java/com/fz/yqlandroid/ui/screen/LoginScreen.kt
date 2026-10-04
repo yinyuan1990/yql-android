@@ -492,6 +492,10 @@ fun LoginScreen(
                                         user = response.username,
                                         controlCount = response.boundControlCount ?: 0
                                     )
+
+                                    // ⭐ §114 登录记录（排查设备id变化）：追加一条本地记录（时间/机型/账号/设备id/rawAndroidId/installId）
+                                    com.fz.yqlandroid.manager.LoginRecordManager.appendRecord(
+                                        context, response.username, deviceId)
                                     
                                     // 🔥 Step 4: 获取设备初始配置（与iOS一致）
                                     val boundCount = response.boundControlCount ?: 0
@@ -600,6 +604,29 @@ fun LoginScreen(
                 modifier = Modifier
                     .padding(bottom = 20.dp)
                     .clickable { showDeviceIdDialog = true }
+            )
+
+            // ⭐ §114 隐藏上传入口：点击「设备id 下方空白处」把本地登录记录上传到后端（排查设备id变化）
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(72.dp)
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        Toast.makeText(context, "正在上传登录记录…", Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                com.fz.yqlandroid.manager.LoginRecordManager.uploadRecords(context)
+                            }
+                            Toast.makeText(
+                                context,
+                                if (ok) "登录记录已上传" else "上传失败或暂无记录",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
             )
         }
     }
