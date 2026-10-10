@@ -1,5 +1,6 @@
 package com.fz.yqlandroid.manager
 
+import android.os.SystemClock
 import android.util.Log
 import org.webrtc.EncodedImage
 import org.webrtc.VideoCodecInfo
@@ -76,10 +77,76 @@ class ColorTaggingVideoEncoderFactory(
 }
 
 /**
+ * 🔑 关键帧限频 + 每秒 I/P 帧统计（§125，所有编码器实例共用）。
+ *
+ * 码率 min=max 钉死时，I 帧（P 帧 5~10 倍大）会吃掉后面几帧 P 帧的预算，运动画面出现
+ * 「一张清楚、后几张文字发散」。关键帧来源：PC 的 PLI（SRS 多观众时每个都会要）、每次改
+ * RtpEncodingParameters 后 libwebrtc 自动要的一次。两次关键帧至少间隔 [KEYFRAME_MIN_INTERVAL_MS]，
+ * 期间的请求推迟到点再补一个 I 帧（合并，不丢）。
+ * 放行：编码器 init 后首个关键帧；[allowForcedKeyframe] 之后的窗口（forceKeyframe 主动调用）。
+ */
+object EncoderFrameGate {
+    const val KEYFRAME_MIN_INTERVAL_MS = 2000L
+    private const val FORCED_WINDOW_MS = 1500L
+
+    @Volatile private var forcedUntilMs = 0L
+
+    fun allowForcedKeyframe() {
+        forcedUntilMs = SystemClock.elapsedRealtime() + FORCED_WINDOW_MS
+    }
+
+    fun isForced(nowMs: Long): Boolean = nowMs < forcedUntilMs
+
+    private var iCount = 0
+    private var iBytes = 0L
+    private var pCount = 0
+    private var pBytes = 0L
+    private var pMaxBytes = 0
+    private var keyReqPassed = 0
+    private var keyReqDeferred = 0
+    private var deferredSent = 0
+
+    @Synchronized
+    fun onEncodedFrame(isKey: Boolean, bytes: Int) {
+        if (isKey) {
+            iCount++; iBytes += bytes
+        } else {
+            pCount++; pBytes += bytes
+            if (bytes > pMaxBytes) pMaxBytes = bytes
+        }
+    }
+
+    @Synchronized
+    fun onKeyRequest(deferred: Boolean) {
+        if (deferred) keyReqDeferred++ else keyReqPassed++
+    }
+
+    @Synchronized
+    fun onDeferredKeySent() { deferredSent++ }
+
+    /** meidui 统计行用：自上次调用以来的 I/P 帧大小与关键帧请求情况，调用后清零。 */
+    @Synchronized
+    fun snapshotAndReset(): String {
+        val sb = StringBuilder()
+        sb.append("I=").append(iCount)
+        if (iCount > 0) sb.append("×").append(iBytes / iCount / 1024).append("KB")
+        sb.append(" P均=").append(if (pCount > 0) "%.1f".format(pBytes.toDouble() / pCount / 1024) else "0").append("KB")
+        sb.append(" P峰=").append("%.1f".format(pMaxBytes / 1024.0)).append("KB")
+        sb.append(" kf请求=").append(keyReqPassed + keyReqDeferred)
+        if (keyReqDeferred > 0) sb.append("(延后").append(keyReqDeferred).append(")")
+        if (deferredSent > 0) sb.append(" 补发=").append(deferredSent)
+        iCount = 0; iBytes = 0; pCount = 0; pBytes = 0; pMaxBytes = 0
+        keyReqPassed = 0; keyReqDeferred = 0; deferredSent = 0
+        return sb.toString()
+    }
+}
+
+/**
  * 包装单个 VideoEncoder：
  *   1. （仅 H264）拦截回调，在关键帧改写 SPS 的 VUI；
  *   2. 轻量运动突增检测（P 帧字节滑动基线）；
- *   3. 🎛️ 恒定码率 governor（见文件头，对标官方 DynamicBitrateAdjuster、只准向下钳）。
+ *   3. 🎛️ 恒定码率 governor（见文件头，对标官方 DynamicBitrateAdjuster、只准向下钳）；
+ *   4. 🔑 关键帧限频（见 [EncoderFrameGate]）。
  */
 private class H264ColorTagEncoder(
     private val inner: VideoEncoder,
@@ -192,13 +259,59 @@ private class H264ColorTagEncoder(
         } catch (_: Throwable) { rc /* 构造失败原样透传，绝不影响推流 */ }
     }
 
+    // ===== 🔑 关键帧限频 =====
+    // keySinceInit/lastKeyMs 在输出线程写、编码线程读；pendingKey 只在编码线程读写。
+    @Volatile private var keySinceInit = false
+    @Volatile private var lastKeyMs = 0L
+    private var pendingKey = false
+
+    private fun gateKeyframe(info: VideoEncoder.EncodeInfo?): VideoEncoder.EncodeInfo? {
+        val types = info?.frameTypes ?: return info
+        val wantsKey = types.any { it == EncodedImage.FrameType.VideoFrameKey }
+        if (!wantsKey && !pendingKey) return info
+        return try {
+            val now = SystemClock.elapsedRealtime()
+            val allow = !keySinceInit || EncoderFrameGate.isForced(now) ||
+                    now - lastKeyMs >= EncoderFrameGate.KEYFRAME_MIN_INTERVAL_MS
+            when {
+                allow && wantsKey -> {
+                    pendingKey = false
+                    lastKeyMs = now
+                    EncoderFrameGate.onKeyRequest(deferred = false)
+                    info
+                }
+                allow -> {
+                    pendingKey = false
+                    lastKeyMs = now
+                    EncoderFrameGate.onDeferredKeySent()
+                    VideoEncoder.EncodeInfo(Array(types.size) { EncodedImage.FrameType.VideoFrameKey })
+                }
+                wantsKey -> {
+                    pendingKey = true
+                    EncoderFrameGate.onKeyRequest(deferred = true)
+                    VideoEncoder.EncodeInfo(Array(types.size) { EncodedImage.FrameType.VideoFrameDelta })
+                }
+                else -> info
+            }
+        } catch (_: Throwable) { info /* 限频失败原样透传，绝不影响推流 */ }
+    }
+
     // ===== VideoEncoder 代理 =====
 
     override fun initEncode(settings: VideoEncoder.Settings?, cb: VideoEncoder.Callback?): VideoCodecStatus {
         // startBitrate 单位 kbps（官方 Settings 注释：Kilobits per second）
         settings?.let { govSetTargets(it.startBitrate * 1000.0, it.maxFramerate.toDouble()) }
+        keySinceInit = false
+        pendingKey = false
         val wrapped = if (cb == null) null else VideoEncoder.Callback { frame, info ->
-            govReportFrame(frame.buffer?.remaining() ?: 0)
+            val bytes = frame.buffer?.remaining() ?: 0
+            val isKey = frame.frameType == EncodedImage.FrameType.VideoFrameKey
+            if (isKey) {
+                keySinceInit = true
+                lastKeyMs = SystemClock.elapsedRealtime()
+            }
+            EncoderFrameGate.onEncodedFrame(isKey, bytes)
+            govReportFrame(bytes)
             detectMotionSurge(frame)
             cb.onEncodedFrame(maybeTag(frame), info)
         }
@@ -217,7 +330,7 @@ private class H264ColorTagEncoder(
                 try { inner.setRates(scaledRc(rc, s)) } catch (_: Throwable) {}
             }
         }
-        return inner.encode(frame, info)
+        return inner.encode(frame, gateKeyframe(info))
     }
 
     override fun setRateAllocation(allocation: VideoEncoder.BitrateAllocation?, framerate: Int): VideoCodecStatus {

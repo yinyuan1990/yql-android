@@ -1421,7 +1421,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         Log.d("meidui", "MOTION_SURGE（快速关键帧窗口已停用，仅观测）")
     }
 
-    fun forceKeyframe() {
+    /**
+     * @param bypassGate true=主动补帧（切档/切摄像头/恢复采集等），绕过 [EncoderFrameGate] 的 2s 限频；
+     *   false=观看端请求，与 PLI 合并限频。
+     */
+    fun forceKeyframe(bypassGate: Boolean = true) {
+        if (bypassGate) EncoderFrameGate.allowForcedKeyframe()
         // ⭐ P2P：videoSender 恒为 null，必须落到各直连会话（iOS 曾因此断链半年，§21.5 教训）
         if (currentConnMode == ConnMode.P2P) {
             p2pManager.forceKeyframeAllSessions()
@@ -1646,6 +1651,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private var lastFramesSent: Long = 0
     private var lastMeiduiLogMs: Long = 0
     private var lastNackCount: Long = 0
+    // ⭐ §125 清晰度诊断：qpSum 增量 ÷ 编码帧增量 = 本秒平均 QP（越大压得越狠）
+    private var lastQpSum: Long = 0
+    private var lastEncoderImpl: String = ""
     // ⭐ [meidui 诊断] 相机实际吐帧计数（CountingObserver 在采集线程递增，统计线程读增量）
     @Volatile private var capFrameCount: Long = 0
     private var lastCapFrameCount: Long = 0
@@ -1743,6 +1751,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     var keyFramesEncoded: Long = 0
                     var pliCount: Long = 0
                     var firCount: Long = 0
+                    var qpSum: Long = -1
+                    var targetBitrateBps: Double = 0.0
+                    var frameWidth: Long = 0
+                    var frameHeight: Long = 0
+                    var encoderImpl = ""
                     // ⭐ [meidui 诊断] P2P fps=0 排查②：区分「stats里根本没视频outbound-rtp」vs「有但无fps字段」
                     var sawVideoOutbound = false
                     var hasFpsField = false
@@ -1772,6 +1785,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             (stats.members["keyFramesEncoded"] as? Number)?.let { keyFramesEncoded = it.toLong() }
                             (stats.members["pliCount"] as? Number)?.let { pliCount = it.toLong() }
                             (stats.members["firCount"] as? Number)?.let { firCount = it.toLong() }
+                            (stats.members["qpSum"] as? Number)?.let { qpSum = it.toLong() }
+                            (stats.members["targetBitrate"] as? Number)?.let { targetBitrateBps = it.toDouble() }
+                            (stats.members["frameWidth"] as? Number)?.let { frameWidth = it.toLong() }
+                            (stats.members["frameHeight"] as? Number)?.let { frameHeight = it.toLong() }
+                            (stats.members["encoderImplementation"] as? String)?.let { encoderImpl = it }
                         }
                         if (stats.type == "remote-inbound-rtp") {
                             (stats.members["packetsLost"] as? Number)?.let { packetsLost = it.toLong() }
@@ -1867,6 +1885,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             } catch (_: Exception) { -1 }
                             val nackDelta = nackCount - lastNackCount
                             val kbps = WebSocketManager.publishingKbps
+                            val encDelta = framesEncoded - lastFramesEncoded
+                            val qpAvg = if (qpSum >= 0 && lastQpSum > 0 && encDelta > 0)
+                                ((qpSum - lastQpSum) / encDelta).toString() else "-"
+                            if (qpSum >= 0) lastQpSum = qpSum
+                            if (encoderImpl.isNotEmpty() && encoderImpl != lastEncoderImpl) {
+                                lastEncoderImpl = encoderImpl
+                                Log.d("meidui", "🎬 编码器=$encoderImpl ${frameWidth}x${frameHeight}")
+                            }
                             Log.d("meidui", "capFps=$capFps encFps=$encFps sentFps=$sentFps encMaxFps=$encMaxFps " +
                                     "kbps=$kbps fpsStat=$fps " +
                                     "sendDelay=${"%.2f".format(totalPacketSendDelay)}s qLimit=$qualityLimit " +
@@ -1876,7 +1902,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     "fastKF=${System.currentTimeMillis() < fastKeyframeUntilMs} " +
                                     // ⭐ [H265 黑屏诊断] kf=累计关键帧 pli/fir=累计收到的关键帧请求。
                                     //   正常应见：起流 kf≥1，PC 每发 PLI 后 kf +1；kf 恒 0 = 编码器没吐过关键帧
-                                    "kf=$keyFramesEncoded pli=$pliCount fir=$firCount")
+                                    "kf=$keyFramesEncoded pli=$pliCount fir=$firCount " +
+                                    // ⭐ §125 清晰度诊断：qp=本秒平均量化参数（运动时 ≳35 = 码率不够）、
+                                    //   tgt=WebRTC 给编码器的目标码率、帧=本秒 I/P 帧大小与关键帧请求（延后=被 2s 限频推迟）
+                                    "qp=$qpAvg tgt=${(targetBitrateBps / 1000).toInt()}k ${frameWidth}x${frameHeight} " +
+                                    "帧=${EncoderFrameGate.snapshotAndReset()}")
                             // ⭐ [meidui 诊断] P2P 推送 fps=0 定性：一行说清卡在哪一层
                             if (currentConnMode == ConnMode.P2P && fps == 0) {
                                 val reason = when {
@@ -2489,7 +2519,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 val now = System.currentTimeMillis()
                 if (now - lastKeyframeAtMs >= REQUEST_KEYFRAME_MIN_INTERVAL_MS) {
                     lastKeyframeAtMs = now
-                    forceKeyframe()
+                    forceKeyframe(bypassGate = false)
                     Log.d(TAG, "🔑 [按需关键帧] 响应观看端 request_keyframe")
                 } else {
                     Log.d(TAG, "⏭️ [按需关键帧] 距上次不足 ${REQUEST_KEYFRAME_MIN_INTERVAL_MS}ms，节流跳过")
