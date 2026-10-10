@@ -1529,6 +1529,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         
         // 后端指令生效中，暂停
         if (now - lastRemoteFpsTime < 1000) return
+
+        // §126 防频闪开启：帧率必须保持 100 的约数，升降帧停摆（同 iOS）
+        if (antiFlickerEnabled) return
         
         // 冷却期检查（iOS：降帧后冷却1秒 / 升帧后冷却2秒）
         val cooldown = if (lastFpsDirectionDown) cooldownAfterDownMs else cooldownAfterUpMs
@@ -2018,7 +2021,46 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      *  对齐 iOS：相机恒按档位帧率采集，热控只降推送（thermalFpsCap 不进这里——
      *  推流常态温度就是 FAIR，热控若压采集，「采集60」永远保不住） */
     private fun captureFps(): Int {
-        return (currentLadder[currentProfile]?.fps ?: currentFps).coerceAtLeast(1)
+        val ladderFps = (currentLadder[currentProfile]?.fps ?: currentFps).coerceAtLeast(1)
+        if (!antiFlickerEnabled || usingOtgCamera) return ladderFps
+        return flickerSafeFps(minOf(currentFps, deviceMaxCaptureFps()))
+    }
+
+    // MARK: - §126 防频闪（对齐 iOS onAntiFlickerCommand + lockFrameRate）
+    // 50Hz 市电灯光按 100Hz 闪：采集帧率是 100 的整数约数时，每帧都在灯光同一相位开始曝光，
+    // 帧间亮度一致、卷帘条纹不滚动，快门可任意。开启期间采集帧率 = 推送帧率，自适应升降帧停摆。
+    @Volatile private var antiFlickerEnabled = false
+
+    private fun deviceMaxCaptureFps(): Int {
+        val sizeMax = if (isFrontCamera) frontSizeMaxFps else backSizeMaxFps
+        val whole = if (isFrontCamera) frontMaxFps else backMaxFps
+        return (sizeMax[Size(currentWidth, currentHeight)] ?: whole).coerceAtLeast(1)
+    }
+
+    /** 不超过 [fps] 的最大「100 的整数约数」 */
+    private fun flickerSafeFps(fps: Int): Int =
+        intArrayOf(100, 50, 25, 20, 10, 5).firstOrNull { it <= fps } ?: 5
+
+    /**
+     * PC `anti_flicker`：serverFps=80/100/200 → 20/25/50fps（设备在当前分辨率跑不到时退到更低的约数）。
+     * 关闭时推送帧率保持不变（同 iOS），采集回到档位帧率。
+     */
+    fun setAntiFlicker(enabled: Boolean, serverFps: Int) {
+        if (usingOtgCamera) {
+            Log.d("meidui", "🔦 [防频闪] OTG 模式忽略（UVC 帧率按描述符协商）")
+            return
+        }
+        antiFlickerEnabled = enabled
+        if (enabled) {
+            val want = (if (serverFps > 0) serverFps else 80) / 4
+            val fps = flickerSafeFps(minOf(want, deviceMaxCaptureFps()))
+            setPushFps(fps, "防频闪(${serverFps}÷4)")
+        }
+        ensureCaptureFps(if (enabled) "防频闪开启" else "防频闪关闭")
+        applyCameraParams()
+        Log.d("meidui", "🔦 [防频闪] ${if (enabled) "开启" else "关闭"} 请求=${serverFps}÷4 推送=${currentFps}fps " +
+                "采集=${captureFps()}fps 设备上限=${deviceMaxCaptureFps()}fps(${currentWidth}x${currentHeight}) " +
+                "快门=${if (_shutterEnabled) "1/${_currentShutterSpeed}s(钉帧间隔)" else "自动曝光(开50Hz防闪)"}")
     }
 
     /** 最近一次实际下发给相机的采集帧率（changeCaptureFormat 会重开会话，相同值不重复下发防闪烁） */
@@ -2526,13 +2568,26 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
             }
             
+            // §126 防频闪：PC MainPage.sendAntiFlickerConfig → {cmd, enabled, fps=80/100/200}
+            "anti_flicker" -> {
+                val enabled = when (val e = config["enabled"]) {
+                    is Boolean -> e
+                    is Number -> e.toInt() != 0
+                    is String -> e.equals("true", ignoreCase = true)
+                    else -> false
+                }
+                val serverFps = (config["fps"] as? Number)?.toInt() ?: 80
+                Log.d("meidui", "🔦 [防频闪] 收到 PC 指令 enabled=$enabled fps=$serverFps")
+                setAntiFlicker(enabled, serverFps)
+            }
+
             // ⭐ 2026-07-06 滤镜代码已移除：颜色类滤镜（亮度/对比度/饱和度/gamma/曝光/redBoost/
             //   黑点/锐化/高光/色度/LUT/HDR/exposureBias 等）改由 PC 端本地处理（GStreamer
             //   videobalance / 网页内核 CSS filter），新版 PC 对 Android 不再下发这些 ptype。
             //   旧版 PC 若仍下发 → 静默忽略（不当未知 ptype 刷 warning）。
             "filterEnabled", "brightness", "exposure", "contrast", "saturation", "redBoost",
             "gamma", "blackPoint", "sharpness", "highlightLift", "chroma", "videoHDR",
-            "autoHDR", "test_mode", "lutName", "anti_flicker", "captureColor",
+            "autoHDR", "test_mode", "lutName", "captureColor",
             "captureColorReset", "exposureBias" -> {
                 Log.d("meidui", "🎨 [滤镜已移除] ptype=$ptype → 颜色滤镜走 PC 端本地处理，Android 忽略")
             }
@@ -2678,7 +2733,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             whiteBalanceLocked = _whiteBalanceLocked,
             // 🔥 钉死 AE 帧率区间，防低光时相机自动 30→15（iOS 无此坑，Android Camera2 经典问题）
             // ⭐ 用采集帧率（档位60）而非推送目标：否则推送30时 AE 被钉 [30,30]，采集被硬拉回30，解耦失效
-            targetFps = captureFps()
+            targetFps = captureFps(),
+            antiBanding50Hz = antiFlickerEnabled
         )
         return Camera2ParamApplier.apply(videoCapturer as? CameraVideoCapturer, params)
     }
@@ -2888,7 +2944,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
 
         Log.d(TAG, "🎬 推送FPS[$source]: 请求${pushFps} → 推送${targetFps}fps(编码器已同步), 采集保持${captureFps()}fps(解耦, changed=$fpsChanged)")
-        Log.d("meidui", "⚠️ fps修改源=$source ${pushFps}→推送${targetFps}fps(采集${captureFps()}fps不动)")
+        Log.d("meidui", "⚠️ fps修改源=$source ${pushFps}→推送${targetFps}fps(采集${captureFps()}fps" +
+                "${if (antiFlickerEnabled) "，防频闪锁定" else "不动"})")
     }
     
     /**
@@ -2900,6 +2957,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * - urgency=critical/high 补一发关键帧（iOS 还会临时短 GOP，Android 无 GOP 定时器，仅补 IDR）。
      */
     fun applyRemotePushFps(pushFps: Int, urgency: String) {
+        if (antiFlickerEnabled) {
+            Log.d("meidui", "🔦 [防频闪] 开启中，忽略 cmd=set_fps ${pushFps}fps（保持 ${currentFps}fps）")
+            if (urgency == "critical" || urgency == "high") forceKeyframe()
+            return
+        }
         val targetFps = maxOf(minAdaptiveFps, pushFps)
         adaptiveFps = targetFps
         lastRemoteFpsTime = System.currentTimeMillis()

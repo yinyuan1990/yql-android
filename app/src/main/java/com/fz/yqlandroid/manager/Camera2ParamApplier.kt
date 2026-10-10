@@ -46,7 +46,8 @@ object Camera2ParamApplier {
         val manualIsoPercent: Int? = null, // ISO 增益 0~100（PC test_brightness）→ 映射设备 SENSITIVITY_RANGE；仅手动快门(AE OFF)生效
         val whiteBalanceSlider: Int? = null, // 0..100 手动色温(0冷100暖)
         val whiteBalanceLocked: Boolean = false, // 锁定当前白平衡
-        val targetFps: Int? = null         // 🔥 钉死 AE 帧率区间 [fps,fps]，防低光自动砍半(30→15)
+        val targetFps: Int? = null,        // 🔥 钉死 AE 帧率区间 [fps,fps]，防低光自动砍半(30→15)
+        val antiBanding50Hz: Boolean = false // §126 防频闪：自动曝光下 AE 防闪按 50Hz（曝光取 10ms 整数倍）；手动快门下规范上不生效
     )
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
@@ -158,6 +159,22 @@ object Camera2ParamApplier {
                 // 自动曝光 + 曝光补偿(EV)
                 b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                 b.set(CaptureRequest.CONTROL_AE_LOCK, false)
+                if (p.antiBanding50Hz) {
+                    val modes = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES)
+                    val mode = when {
+                        modes?.contains(CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ) == true ->
+                            CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ
+                        modes?.contains(CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO) == true ->
+                            CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO
+                        else -> null
+                    }
+                    if (mode != null) b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, mode)
+                    Log.d("meidui", "🔦 [防频闪] 自动曝光防闪=${when (mode) {
+                        CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ -> "50Hz"
+                        CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO -> "AUTO(机型无50Hz档)"
+                        else -> "不支持"
+                    }} 可用=${modes?.joinToString()}")
+                }
                 val ev = p.exposureEv
                 if (ev != null) {
                     val step = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
