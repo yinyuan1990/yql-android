@@ -220,6 +220,8 @@ fun StreamingScreen(
                 "type" -> {
                     val type = config["type"] as? String ?: ""
                     selectedProfile = when (type.lowercase()) {
+                        "srt2k" -> "2K"
+                        "srt4k" -> "4K"
                         "p4k", "4k" -> "超高清"
                         "ultra" -> "超高帧"
                         "high" -> "超清"
@@ -389,6 +391,8 @@ fun StreamingScreen(
         config.focus?.let { focusValue = it }
         config.bitrate?.let { fluencyValue = it.toFloat() }
         selectedProfile = when (config.type.lowercase()) {
+            "srt2k" -> "2K"
+            "srt4k" -> "4K"
             "p4k", "4k" -> "超高清"
             "ultra" -> "超高帧"
             "high" -> "超清"

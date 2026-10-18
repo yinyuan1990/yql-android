@@ -130,7 +130,7 @@ object LadderConfigStore {
     fun entryOf(name: String): Entry = remote[name] ?: DEFAULTS[name] ?: DEFAULTS[STANDARD]!!
 
     fun nameOf(profile: LadderProfile): String = when (profile) {
-        LadderProfile.P4K -> P4K
+        LadderProfile.P4K, LadderProfile.SRT2K, LadderProfile.SRT4K -> P4K
         LadderProfile.HIGH -> HIGH
         LadderProfile.ULTRA -> ULTRA
         LadderProfile.STANDARD -> STANDARD

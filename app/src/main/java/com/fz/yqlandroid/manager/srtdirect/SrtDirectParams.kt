@@ -21,17 +21,19 @@ object SrtDirectParams {
     const val DEFAULT_HOST = "118.178.33.144"
     const val DEFAULT_PORT = 8890
 
-    val PROFILES = listOf("low", "standard", "high", "ultra", "p4k")
+    val PROFILES = listOf("low", "standard", "high", "ultra", "p4k", "srt2k", "srt4k")
 
     /** 内置默认（§133.1 起步参数） */
     private val DEFAULT_JSON = """
         {
           "presets": {
-            "low":      {"width":1280,"height":720, "fps":25,"bitrateKbps":3000},
-            "standard": {"width":1920,"height":1080,"fps":25,"bitrateKbps":8000},
-            "high":     {"width":2560,"height":1440,"fps":25,"bitrateKbps":12000,"peakKbps":20000},
-            "ultra":    {"width":1280,"height":720, "fps":50,"bitrateKbps":8000},
-            "p4k":      {"width":3840,"height":2160,"fps":25,"bitrateKbps":16000,
+            "low":      {"width":640, "height":480, "fps":25,"bitrateKbps":1500},
+            "standard": {"width":1024,"height":768, "fps":25,"bitrateKbps":2500},
+            "high":     {"width":1440,"height":1080,"fps":25,"bitrateKbps":4500},
+            "ultra":    {"width":1280,"height":720, "fps":50,"bitrateKbps":4000},
+            "p4k":      {"width":1920,"height":1440,"fps":25,"bitrateKbps":6000},
+            "srt2k":    {"width":2560,"height":1440,"fps":25,"bitrateKbps":10000,"peakKbps":16000},
+            "srt4k":    {"width":3840,"height":2160,"fps":25,"bitrateKbps":16000,
                          "peakKbps":24000,"latencyMs":1000,"gopSec":3,"qpPMin":25,"qpPMax":34}
           },
           "bitrateMode": 1,

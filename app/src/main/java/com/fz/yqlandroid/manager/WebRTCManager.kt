@@ -21,7 +21,9 @@ enum class LadderProfile {
     STANDARD,   // 高清   (4:3)
     HIGH,       // 超清   (4:3)
     ULTRA,      // 超高帧 (16:9)
-    P4K         // 超高清 (4:3)
+    P4K,        // 超高清 (4:3)
+    SRT2K,      // 2K 2560x1440（仅 SRT直推，SRT全码专属；WebRTC 模式无此档 → 按 P4K）
+    SRT4K       // 4K 3840x2160（同上）
 }
 
 // ===== 档位预设 =====
@@ -761,6 +763,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     private fun profileName(profile: LadderProfile): String = when (profile) {
         LadderProfile.P4K -> "超高清(p4k)"
+        LadderProfile.SRT2K -> "2K(srt2k)"
+        LadderProfile.SRT4K -> "4K(srt4k)"
         LadderProfile.ULTRA -> "超高帧(ultra)"
         LadderProfile.HIGH -> "超清(high)"
         LadderProfile.LOW -> "超低网(low)"
@@ -1142,6 +1146,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         LadderProfile.HIGH -> "high"
         LadderProfile.ULTRA -> "ultra"
         LadderProfile.P4K -> "p4k"
+        LadderProfile.SRT2K -> "srt2k"
+        LadderProfile.SRT4K -> "srt4k"
     }
 
     /** 当前档位的 srtParams 生效参数（内置默认 ⊕ 登录下发 ⊕ STOMP 改参） */
@@ -2814,6 +2820,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             "type" -> {
                 val type = config["type"] as? String ?: ""
                 val profile = when (type.lowercase()) {
+                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P4K
+                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P4K
                     "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH
