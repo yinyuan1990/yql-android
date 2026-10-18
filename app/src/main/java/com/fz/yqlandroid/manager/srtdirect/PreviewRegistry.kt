@@ -7,7 +7,7 @@ import java.util.concurrent.CopyOnWriteArraySet
  * §134 屏幕预览 Surface 登记处（拷自 test-android，照 silu `UvcPreviewSurfaceRegistry`）。
  *
  * 推流页可见时登记 SurfaceView 的 Surface，熄屏/切后台时撤销；摄像头会话监听变化：
- * 有预览就同时输出给预览，没有就输出给看不见的后台替身（见 SdCameraSource.standbySize）。
+ * 有预览就同时输出给预览；接过预览后消失则输出给看不见的后台替身（见 SdCameraSource.standbySize）。
  */
 object PreviewRegistry {
     fun interface Listener {

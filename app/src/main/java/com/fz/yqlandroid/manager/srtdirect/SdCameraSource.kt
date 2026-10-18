@@ -21,8 +21,8 @@ import com.fz.yqlandroid.manager.Camera2ParamApplier
 
 /**
  * §134 Camera2 采集（拷自 test-android `CameraSource`，照 silu `Camera2MediaStreamer.createSession`）：
- * 录像模板，会话输出 = **编码器 Surface（必选）+ SurfaceView 预览（界面可见时）/ 后台替身（不可见时）**，
- * 摄像头直写编码器，不经 GPU 重绘/CPU 拷贝。
+ * 录像模板，会话输出 = **编码器 Surface（必选）+ SurfaceView 预览（界面可见时）/ 后台替身（接过预览后不可见时）**，
+ * 摄像头直写编码器，不经 GPU 重绘/CPU 拷贝。不接预览则整个推流期间仅编码器（silu CameraLiveService 同款）。
  *
  * 与 test-android 的差别：前后摄可选；PC 下发的硬件参数（AE 帧率区间=推送帧率、快门/ISO、对焦、变焦含 0.5x、
  * 白平衡、50Hz 防闪、关防抖）走 yql-android 既有算法 [Camera2ParamApplier.applyToBuilder]，直接写自己的 CaptureRequest。
@@ -98,13 +98,15 @@ internal class SdCameraSource(
     @Volatile private var previewUnsupported = false
 
     /**
-     * 界面不可见时顶替预览的看不见的输出（尺寸 = 预览尺寸，引擎设置）。
-     * 三星 S25U 上会话只剩编码器时，编码器收到的画面无法压缩（QP33 下 4K P 帧 2.8MB），
-     * 帧率掉到 2~4、PC 黑屏；保持「编码器 + 一路预览类输出」与前台同构即正常。
+     * 接过屏幕预览后、界面不可见时顶替预览的看不见的输出（尺寸 = 预览尺寸，引擎设置）。
+     * 三星 S25U 上推流中途从「编码器+预览」重建成「仅编码器」后，编码器收到的画面无法压缩
+     * （QP33 下 4K P 帧 2.8MB），帧率掉到 2~4、PC 黑屏。会话布局在整个推流期间保持不变即正常：
+     * 从没接过预览的（silu 做法）始终仅编码器；接过预览的用替身保持两路输出。
      */
     @Volatile var standbySize: Size? = null
     private var standbyReader: ImageReader? = null
     @Volatile private var standbyUnsupported = false
+    private var hadPreview = false
     private var targets: List<Surface> = emptyList()
     @Volatile private var params = Camera2ParamApplier.Params()
     private var firstFrameSeen = false
@@ -378,7 +380,8 @@ internal class SdCameraSource(
         try { session?.close() } catch (_: Throwable) {}
         session = null
         val preview = if (previewUnsupported) null else PreviewRegistry.current()
-        val standby = if (preview == null && !standbyUnsupported) standbySurface() else null
+        if (preview != null) hadPreview = true
+        val standby = if (preview == null && hadPreview && !standbyUnsupported) standbySurface() else null
         val second = preview ?: standby
         val t = if (second != null) listOf(enc, second) else listOf(enc)
         targets = t
