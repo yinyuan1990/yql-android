@@ -94,6 +94,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 return@post
             }
             val cam = SdCameraSource(context, cameraListener)
+            cam.standbySize = _previewSize.value
             camera = cam
             cameraRunning = true
             cam.open(front, enc.inputSurface!!, effectiveControls())
@@ -286,6 +287,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         synchronized(peak) { peak.reset(r.plan, android.os.Build.VERSION.SDK_INT >= 31 && enc.qpConfigured) }
         val p = SdCameraSource.choosePreviewSize(context, cameraId, encodeWidth, encodeHeight)
         _previewSize.value = p
+        camera?.standbySize = p
     }
 
     private fun newEncoder(c: SdH264Encoder.Config): SdH264Encoder {

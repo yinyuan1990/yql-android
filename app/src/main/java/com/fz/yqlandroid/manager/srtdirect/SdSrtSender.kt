@@ -137,6 +137,7 @@ internal class SdSrtSender(
                 SdLog.i("连上后首个关键帧已发：等了 ${now - waitKeySinceMs}ms，期间丢 $waitKeyDrops 帧（IDR ${ts.size / 1024}KB）")
                 waitKey = false
                 live = true
+                state = "推流中"
                 liveAttempt = currentAttempt
             }
             val t0 = System.currentTimeMillis()

@@ -9,6 +9,9 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.os.Handler
 import android.os.HandlerThread
@@ -18,8 +21,8 @@ import com.fz.yqlandroid.manager.Camera2ParamApplier
 
 /**
  * §134 Camera2 采集（拷自 test-android `CameraSource`，照 silu `Camera2MediaStreamer.createSession`）：
- * 录像模板，会话输出 = **编码器 Surface（必选）+ SurfaceView 预览（仅界面可见时）**，
- * 摄像头直写编码器，不经 GPU 重绘/CPU 拷贝；熄屏/切后台预览撤掉只剩编码器。
+ * 录像模板，会话输出 = **编码器 Surface（必选）+ SurfaceView 预览（界面可见时）/ 后台替身（不可见时）**，
+ * 摄像头直写编码器，不经 GPU 重绘/CPU 拷贝。
  *
  * 与 test-android 的差别：前后摄可选；PC 下发的硬件参数（AE 帧率区间=推送帧率、快门/ISO、对焦、变焦含 0.5x、
  * 白平衡、50Hz 防闪、关防抖）走 yql-android 既有算法 [Camera2ParamApplier.applyToBuilder]，直接写自己的 CaptureRequest。
@@ -93,6 +96,15 @@ internal class SdCameraSource(
     private var encoderSurface: Surface? = null
     @Volatile private var closed = false
     @Volatile private var previewUnsupported = false
+
+    /**
+     * 界面不可见时顶替预览的看不见的输出（尺寸 = 预览尺寸，引擎设置）。
+     * 三星 S25U 上会话只剩编码器时，编码器收到的画面无法压缩（QP33 下 4K P 帧 2.8MB），
+     * 帧率掉到 2~4、PC 黑屏；保持「编码器 + 一路预览类输出」与前台同构即正常。
+     */
+    @Volatile var standbySize: Size? = null
+    private var standbyReader: ImageReader? = null
+    @Volatile private var standbyUnsupported = false
     private var targets: List<Surface> = emptyList()
     @Volatile private var params = Camera2ParamApplier.Params()
     private var firstFrameSeen = false
@@ -232,6 +244,34 @@ internal class SdCameraSource(
         }
     }
 
+    /** 帧收到即丢；Android 10+ 声明 GPU 采样用途，HAL 按预览类流处理 */
+    private fun standbySurface(): Surface? {
+        val size = standbySize ?: return null
+        standbyReader?.let { if (it.width == size.width && it.height == size.height) return it.surface }
+        releaseStandby()
+        return try {
+            val reader = if (android.os.Build.VERSION.SDK_INT >= 29) {
+                ImageReader.newInstance(size.width, size.height, ImageFormat.PRIVATE, 2,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE)
+            } else {
+                ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
+            }
+            reader.setOnImageAvailableListener({ r ->
+                try { r.acquireLatestImage()?.close() } catch (_: Throwable) {}
+            }, handler)
+            standbyReader = reader
+            reader.surface
+        } catch (t: Throwable) {
+            SdLog.w("后台替身预览创建失败: ${t.message}")
+            null
+        }
+    }
+
+    private fun releaseStandby() {
+        try { standbyReader?.close() } catch (_: Throwable) {}
+        standbyReader = null
+    }
+
     /**
      * 换编码器（分辨率/帧率/GOP/QP 变化）：不重开摄像头，停旧会话 → [releaseOld] → 用新 Surface 建会话。
      * 旧编码器必须在旧会话停掉之后再停，否则摄像头还往已释放的 Surface 写。
@@ -338,10 +378,13 @@ internal class SdCameraSource(
         try { session?.close() } catch (_: Throwable) {}
         session = null
         val preview = if (previewUnsupported) null else PreviewRegistry.current()
-        val t = if (preview != null) listOf(enc, preview) else listOf(enc)
+        val standby = if (preview == null && !standbyUnsupported) standbySurface() else null
+        val second = preview ?: standby
+        val t = if (second != null) listOf(enc, second) else listOf(enc)
         targets = t
         previewDesc = when {
             preview != null -> "屏幕预览"
+            standby != null -> "后台替身${standbySize?.width}x${standbySize?.height}"
             previewUnsupported -> "无(带预览会话配置失败,只写编码器)"
             else -> "无(界面不可见,只写编码器)"
         }
@@ -352,13 +395,17 @@ internal class SdCameraSource(
                     if (closed || t !== targets) { s.close(); return }
                     session = s
                     submitRepeating()
-                    SdLog.i("摄像头会话就绪 输出=${if (preview != null) "编码器+预览" else "仅编码器"}")
+                    SdLog.i("摄像头会话就绪 输出=编码器+$previewDesc")
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (preview != null) {
                         SdLog.w("带预览的会话配置失败 → 改为只写编码器（预览尺寸可能不匹配）")
                         previewUnsupported = true
+                        handler.post { createSession() }
+                    } else if (standby != null) {
+                        SdLog.w("带后台替身的会话配置失败 → 改为只写编码器")
+                        standbyUnsupported = true
                         handler.post { createSession() }
                     } else {
                         listener.onCameraError("摄像头会话配置失败（该分辨率可能不被支持）")
@@ -378,6 +425,7 @@ internal class SdCameraSource(
             session = null
             try { device?.close() } catch (_: Throwable) {}
             device = null
+            releaseStandby()
             thread.quitSafely()
         }
     }
