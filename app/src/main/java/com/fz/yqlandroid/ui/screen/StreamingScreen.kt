@@ -126,6 +126,11 @@ fun StreamingScreen(
     // ⭐ §71 单活互踢：同 deviceId 在另一台手机登录（不同安装实例）→ 本机被顶下线弹框
     var showKickedDialog by remember { mutableStateOf(false) }
     var kickedMessage by remember { mutableStateOf("") }
+
+    // ⭐ SRT全码 + 积分（后端随 TryDisconnect 下发，WebSocketManager 存入 token_prefs）
+    var srtFull by remember { mutableStateOf(false) }
+    var srtPoints by remember { mutableStateOf(0L) }
+    var srtHighRes by remember { mutableStateOf(false) }
     // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
     var showUpdatePrompt by remember { mutableStateOf(false) }
     var updatePromptText by remember { mutableStateOf("") }
@@ -357,6 +362,17 @@ fun StreamingScreen(
         } catch (_: Exception) { /* 权限引导失败不拦截推流 */ }
     }
 
+    // ⭐ 每 2s 从 token_prefs 读 SRT全码/积分，驱动画面上的余额显示
+    LaunchedEffect(Unit) {
+        while (true) {
+            val p = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
+            srtFull = p.getBoolean("srt_full", false)
+            srtPoints = p.getLong("srt_points", 0L)
+            srtHighRes = p.getBoolean("srt_high_res", false)
+            kotlinx.coroutines.delay(2000)
+        }
+    }
+
     // 🔥 初始化WebRTC（必须在预览之前完成）
     LaunchedEffect(Unit) {
         webRTCManager.setContext(context)
@@ -492,6 +508,40 @@ fun StreamingScreen(
                     Text(
                         text = line,
                         color = if (line.contains("✗")) Color(0xFFFFB74D) else Color(0xFF9CFF9C),
+                        fontSize = 10.sp,
+                        lineHeight = 13.sp
+                    )
+                }
+            }
+        }
+
+        // ⭐ SRT全码积分：仅开通 SRT全码 的账号显示（右上角），高清档(>1920)每分钟扣 1 积分
+        if (srtFull) {
+            val lowBalance = srtPoints <= 5
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 90.dp, end = 8.dp)
+                    .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalAlignment = Alignment.End
+            ) {
+                Text(
+                    text = "SRT积分 $srtPoints",
+                    color = if (lowBalance) Color(0xFFFF6B6B) else Color(0xFF9CFF9C),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (srtHighRes) "高清档 1积分/分钟" else "高清档(>1920) 1积分/分钟",
+                    color = Color(0xFFB0B0B0),
+                    fontSize = 10.sp,
+                    lineHeight = 13.sp
+                )
+                if (lowBalance) {
+                    Text(
+                        text = if (srtPoints <= 0L) "积分已用完，高清档将停推" else "积分不足，约剩 $srtPoints 分钟",
+                        color = Color(0xFFFF6B6B),
                         fontSize = 10.sp,
                         lineHeight = 13.sp
                     )
