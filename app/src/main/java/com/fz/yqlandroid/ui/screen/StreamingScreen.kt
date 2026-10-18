@@ -82,8 +82,8 @@ fun StreamingScreen(
     // 🔊 后台保活（对标 iOS BackgroundAudioManager）：无声音频 + WakeLock，防止息屏后推流被冻结
     val keepAliveManager = remember { com.fz.yqlandroid.manager.KeepAliveManager(context) }
 
-    // ⭐ §132 SRT 版（本版默认）发热对齐 3840(test-android/silu)：不强制常亮、无静音音频保活，
-    //   锁屏/熄屏照推（前台服务 camera + WakeLock）。force_webrtc 回退时维持原行为。
+    // ⭐ §132 SRT 版（本版默认）发热对齐 3840(test-android/silu)：不强制常亮，锁屏/熄屏照推
+    //   （保活见 KeepAliveManager，两种模式相同）。force_webrtc 回退时仍强制常亮。
     val srtMode = remember { WebRTCManager.isSrtTransport(context) }
     // ⭐ §134 SRT直推（默认 SRT + 自带摄像头）：预览用 SurfaceView 挂进 Camera2 会话
     val srtDirect = remember { WebRTCManager.isSrtDirect(context) }
@@ -247,7 +247,7 @@ fun StreamingScreen(
                 }
                 "gongzuo" -> {
                     isStreaming = true
-                    keepAliveManager.start(silentAudio = !srtMode)  // 🔊 唤醒工作：恢复保活
+                    keepAliveManager.start()  // 🔊 唤醒工作：恢复保活
                 }
                 "TryDisconnect" -> {
                     val needDisconnect = messageDict["needDisconnect"] as? Boolean ?: false
@@ -430,7 +430,7 @@ fun StreamingScreen(
             if (!isStreaming) {
                 println("jfh [Streaming] 🚀 开始自动推流: IP=$streamPushIp, key=$permanentToken")
                 webRTCManager.startPublish(streamPushIp, "tenantA", permanentToken)  // 🔥 app与iOS一致
-                keepAliveManager.start(silentAudio = !srtMode)  // 🔊 推流即启动后台保活，防止息屏后被冻结
+                keepAliveManager.start()  // 🔊 推流即启动后台保活，防止息屏后被冻结
                 isStreaming = true
             } else {
                 println("jfh [Streaming] ⏭️ 已在推流中，跳过")

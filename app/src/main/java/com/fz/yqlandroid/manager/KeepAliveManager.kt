@@ -5,6 +5,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import android.util.Log
@@ -39,16 +40,18 @@ class KeepAliveManager(context: Context) {
 
     @Volatile private var running = false
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var audioTrack: AudioTrack? = null
     private var writerThread: Thread? = null
 
-    /** 启动保活：前台服务(camera) + 无声音频 + WakeLock。重复调用安全（幂等）。 */
     /**
-     * @param silentAudio §132 SRT 版对齐 3840(test-android/silu)：只用前台服务(camera)+PARTIAL_WAKE_LOCK，
-     *   不再常驻静音 AudioTrack（多一路音频输出常开也是发热/耗电源）。WebRTC 回退模式仍为 true。
+     * 启动保活：前台服务(camera) + WakeLock + WifiLock + 无声音频。重复调用安全（幂等）。
+     *
+     * SRT 模式不强制常亮，熄屏后三星 One UI 会冻结没在播放媒体的进程、Wi-Fi 进省电，
+     * 只靠前台服务 + WakeLock 时 WebSocket 与 SRT 一起断；无声音频与 WifiLock 两种模式都必须开。
      */
     @Synchronized
-    fun start(silentAudio: Boolean = true) {
+    fun start() {
         if (running) {
             Log.d(TAG, "⏭️ 保活已在运行，跳过")
             return
@@ -59,18 +62,20 @@ class KeepAliveManager(context: Context) {
         //    必须挂 camera 类型前台服务系统才允许后台继续采集。
         com.fz.yqlandroid.service.StreamingForegroundService.start(appContext)
         acquireWakeLock()
-        if (silentAudio) startSilentAudio()
-        Log.d(TAG, "🔊 后台保活已启动（前台服务 + WakeLock${if (silentAudio) " + 无声音频" else "，无静音音频(§132 SRT)"}）")
-        Log.d("meidui", "🔋 [保活] 前台服务+WakeLock 已启动，静音音频=${if (silentAudio) "开" else "关(§132 对齐3840)"}")
+        acquireWifiLock()
+        startSilentAudio()
+        Log.d(TAG, "🔊 后台保活已启动（前台服务 + WakeLock + WifiLock + 无声音频）")
+        Log.d("meidui", "🔋 [保活] 前台服务+WakeLock+WifiLock+静音音频 已启动")
     }
 
-    /** 停止保活：释放前台服务、音频与 WakeLock。重复调用安全（幂等）。 */
+    /** 停止保活：释放前台服务、音频、WakeLock 与 WifiLock。重复调用安全（幂等）。 */
     @Synchronized
     fun stop() {
         if (!running) return
         running = false
         com.fz.yqlandroid.service.StreamingForegroundService.stop(appContext)
         stopSilentAudio()
+        releaseWifiLock()
         releaseWakeLock()
         Log.d(TAG, "🔇 后台保活已停止")
     }
@@ -98,6 +103,33 @@ class KeepAliveManager(context: Context) {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         } catch (e: Exception) {
             Log.e(TAG, "释放 WakeLock 失败: ${e.message}")
+        }
+    }
+
+    // ==================== WifiLock ====================
+
+    /** LOW_LATENCY 只在亮屏前台生效，熄屏推流要靠 HIGH_PERF */
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                val wm = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+                wifiLock = wm.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                    "$WAKELOCK_TAG:keepAlive"
+                ).apply { setReferenceCounted(false) }
+            }
+            if (wifiLock?.isHeld != true) wifiLock?.acquire()
+        } catch (e: Exception) {
+            Log.e(TAG, "获取 WifiLock 失败: ${e.message}")
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "释放 WifiLock 失败: ${e.message}")
         }
     }
 
