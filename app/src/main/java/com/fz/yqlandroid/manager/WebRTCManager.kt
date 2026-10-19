@@ -2860,6 +2860,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 setZoom(zoom)
             }
 
+            // PC「清晰度(P)」锐化：0..1 → 硬件 EDGE_MODE 关/标准/强（WebRTC 与 SRT直推共用）
+            "sharpness" -> {
+                (config["sharpness"] as? Number)?.toFloat()?.let {
+                    _sharpness = it.coerceIn(0f, 1f)
+                    applyCameraParams()
+                }
+            }
+
             // §106 PC 询问当前镜头能否 0.5 倍
             "queryLensCaps" -> reportLensCaps()
             
@@ -3167,6 +3175,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     // 硬件控制缓存状态（切档/切摄像头后可重放）
     private var _currentZoom: Float = 1.0f
+    /** PC「清晰度(P)」0..1；null = 没调过，保持相机默认边缘增强 */
+    @Volatile private var _sharpness: Float? = null
     val currentZoom: Float get() = _currentZoom
     private var _currentFocus: Float = 0.5f
     val currentFocus: Float get() = _currentFocus
@@ -3244,7 +3254,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             targetFps = captureFps(),
             antiBanding50Hz = antiFlickerEnabled,
             // §129/§134 SRT 模式关 OIS/EIS（silu 同款；SRT直推引擎按 srtParams.disableStabilization 再覆盖）；WebRTC 模式不变
-            disableStabilization = srtPublisher != null || srtEngine != null
+            disableStabilization = srtPublisher != null || srtEngine != null,
+            sharpness = _sharpness
         )
     }
 

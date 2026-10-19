@@ -52,7 +52,9 @@ object Camera2ParamApplier {
         // §141 SRT直推独立曝光（照 test-android CameraSource.applyExposure，只由 SdCameraSource 使用；
         //   WebRTC 反射通道不读这两项）：0 = 自动；只手动一项时另一项按切换前测光折算（曝光×ISO 不变）。
         val srtShutterNs: Long = 0L,
-        val srtIso: Int = 0
+        val srtIso: Int = 0,
+        // PC「清晰度(P)」0..1（iOS 是连续软件锐化）；Camera2 只有硬件 EDGE_MODE 三档：<0.1 关 / <0.5 标准 / 其余 强
+        val sharpness: Float? = null
     )
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
@@ -110,6 +112,7 @@ object Camera2ParamApplier {
             applyFocus(builder, characteristics, p)
             applyZoom(builder, characteristics, p)
             applyWhiteBalance(builder, characteristics, p)
+            applyEdge(builder, characteristics, p)
             if (p.disableStabilization) applyStabilizationOff(builder, characteristics)
 
             // 3) 一次性下发（不常驻循环）。
@@ -134,7 +137,31 @@ object Camera2ParamApplier {
         applyFocus(builder, characteristics, p)
         applyZoom(builder, characteristics, p)
         applyWhiteBalance(builder, characteristics, p)
+        applyEdge(builder, characteristics, p)
         if (p.disableStabilization) applyStabilizationOff(builder, characteristics)
+    }
+
+    // ===== 锐化：硬件边缘增强 EDGE_MODE（设备不支持的档位退到能用的） =====
+    private var lastEdgeLog = -1
+    private fun applyEdge(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
+        val s = p.sharpness ?: return
+        try {
+            val modes = c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: return
+            val want = when {
+                s < 0.1f -> CameraMetadata.EDGE_MODE_OFF
+                s < 0.5f -> CameraMetadata.EDGE_MODE_FAST
+                else -> CameraMetadata.EDGE_MODE_HIGH_QUALITY
+            }
+            val mode = listOf(want, CameraMetadata.EDGE_MODE_FAST, CameraMetadata.EDGE_MODE_OFF)
+                .firstOrNull { modes.contains(it) } ?: return
+            b.set(CaptureRequest.EDGE_MODE, mode)
+            if (mode != lastEdgeLog) {
+                lastEdgeLog = mode
+                Log.d("meidui", "🔪 锐化 清晰度=$s → EDGE_MODE=${when (mode) { 0 -> "关"; 1 -> "标准"; 2 -> "强"; else -> mode.toString() }}（设备可用=${modes.joinToString()}）")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "edge 写入失败: ${e.message}")
+        }
     }
 
     // ===== §129 防抖关闭（SRT 模式） =====
