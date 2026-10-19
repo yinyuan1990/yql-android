@@ -2404,12 +2404,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         return (sizeMax[Size(currentWidth, currentHeight)] ?: whole).coerceAtLeast(1)
     }
 
-    /** 不超过 [fps] 的最大「100 的整数约数」 */
+    /** 不超过 [fps] 的最大「100 的整数约数」；正好 40（PC 160 档，60Hz 市电的约数）原样保留 */
     private fun flickerSafeFps(fps: Int): Int =
-        intArrayOf(100, 50, 25, 20, 10, 5).firstOrNull { it <= fps } ?: 5
+        if (fps == 40) 40 else intArrayOf(100, 50, 25, 20, 10, 5).firstOrNull { it <= fps } ?: 5
 
     /**
-     * PC `anti_flicker`：serverFps=80/100/200 → 20/25/50fps（设备在当前分辨率跑不到时退到更低的约数）。
+     * PC `anti_flicker`：serverFps=80/100/160/200 → 20/25/40/50fps（设备在当前分辨率跑不到时退到更低的约数）。
      * 关闭时推送帧率保持不变（同 iOS），采集回到档位帧率。
      */
     fun setAntiFlicker(enabled: Boolean, serverFps: Int) {
