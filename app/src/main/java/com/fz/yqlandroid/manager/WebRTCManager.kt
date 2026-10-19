@@ -3278,10 +3278,32 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     fun setZoom(zoom: Float) {
         val minRatio = currentMinZoomRatio()
         val lower = if (minRatio < 1f) minRatio.coerceAtLeast(0.5f) else 1.0f
+        val leavingWide = _currentZoom < 1f && zoom >= 1f
         _currentZoom = zoom.coerceIn(lower, 10.0f)
-        applyCameraParams()
-        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x（请求 ${zoom}x，设备下限 $minRatio）")
+        // 三星等逻辑多摄：ZOOM_RATIO 从 <1 改回 ≥1 时 HAL 偶尔停在超广角不切回主摄（PC 显示 1x 画面仍是 0.5x），
+        //   离开超广角时带着新倍数重开一次相机，强制回主摄
+        if (leavingWide) reopenCameraForLens() else applyCameraParams()
+        Log.d(TAG, "🔍 Zoom设置: ${_currentZoom}x（请求 ${zoom}x，设备下限 $minRatio${if (leavingWide) "，离开超广角重开相机" else ""}）")
         reportLensCaps()
+    }
+
+    private fun reopenCameraForLens() {
+        val engine = srtEngine
+        if (engine != null) {
+            engine.setControls(buildCameraParams())
+            engine.restartCamera("0.5x→主摄（防超广角卡住）")
+            return
+        }
+        if (!isPreviewRunning) return
+        try {
+            val capFps = captureFps()
+            videoCapturer?.changeCaptureFormat(currentWidth, currentHeight, capFps)
+            appliedCaptureFps = capFps
+            applyCameraParamsWithRetry("0.5x→主摄", initialDelayMs = 300)
+        } catch (e: Exception) {
+            Log.e(TAG, "离开超广角重开相机失败: ${e.message}")
+            applyCameraParams()
+        }
     }
 
     // §106 按朝向缓存 ZOOM_RATIO 下限（true=前置），特性表不会变
