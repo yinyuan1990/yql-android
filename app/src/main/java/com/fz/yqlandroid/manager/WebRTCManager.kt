@@ -63,6 +63,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         // ⭐ 连接方式（0=SRS, 1=P2P），WebSocketManager 心跳读取上报，PC 跟随切换（与 iOS 一致）
         @Volatile var effectiveConnectstype: Int = 0
 
+        /** SRT直推当前档位（srtParams presets 键，如 srt2k/srt4k）；非 SRT直推 = ""。
+         *  随 CONFIG_STATE.profile 上报，后端按它判断 >1920 档按分钟扣积分 */
+        @Volatile var effectiveSrtProfile: String = ""
+
         /**
          * 金凤凰：登录页「推流方式」选 SRT 才走 SRT直推（登录成功写 token_prefs.force_webrtc=false）；
          *   没写过（老版本升级未重新登录 / 登出清空 token_prefs）一律按 SRS（原 WebRTC）。
@@ -1167,6 +1171,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     /** 推送帧率 = min(档位 fps, PC 设定)；码率 = 档位码率 × PC 清晰度% */
     private fun srtVideoReq(): com.fz.yqlandroid.manager.srtdirect.SrtDirectEngine.VideoReq {
         val plan = srtPlan()
+        effectiveSrtProfile = plan.profile
         val fps = minOf(currentFps, plan.fps).coerceAtLeast(1)
         val kbps = (plan.bitrateKbps * _currentQualityPercent / 100).coerceAtLeast(300)
         return com.fz.yqlandroid.manager.srtdirect.SrtDirectEngine.VideoReq(plan, fps, kbps)
@@ -1312,6 +1317,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     private fun stopSrtPublish() {
+        effectiveSrtProfile = ""
         srtEngine?.stopSender()
         com.fz.yqlandroid.manager.srtdirect.SrtLogReporter.stop()   // §143
         // §129 混合 SRT 推流器已退役；万一残留也一并停掉

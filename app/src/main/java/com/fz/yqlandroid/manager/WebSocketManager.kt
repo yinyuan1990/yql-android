@@ -694,6 +694,8 @@ class WebSocketManager private constructor() {
             "rtt" to rtt,
             "srtPlayHost" to (if (connectstype == 3) srtPlayHost else ""),
             "srtPlayPort" to (if (connectstype == 3) srtPlayPort else 0),
+            // SRT直推当前档位：后端 SrtPointsService 按它判断 srt2k/srt4k（>1920）按分钟扣积分
+            "profile" to (if (connectstype == 3) WebRTCManager.effectiveSrtProfile else ""),
             "deviceType" to mapOf(
                 "os" to "Android ${Build.VERSION.RELEASE}",
                 "model" to "${Build.MANUFACTURER} ${Build.MODEL}"
