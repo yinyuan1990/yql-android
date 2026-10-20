@@ -117,7 +117,7 @@ internal class SdSrtSender(
         if (!running) return
         val now = System.currentTimeMillis()
         if (noFrameWarned) {
-            SdLog.i("帧恢复送来（中断 ${now - lastOfferMs}ms）")
+            SdLog.i("帧恢复送来（中断 ${now - maxOf(lastOfferMs, connectedAtMs)}ms）")
             noFrameWarned = false
         }
         lastOfferMs = now
@@ -170,7 +170,7 @@ internal class SdSrtSender(
         synchronized(lock) {
             if (socket !== s) return
             val alive = (System.currentTimeMillis() - connectedAtMs) / 1000.0
-            readStats(s)
+            // 走到这里 socket 多半已关/已断，此时 bstats 读出的是垃圾值 → 用连接线程上一秒读的统计
             SdLog.w("断线 $reason；本次连接存活 ${"%.1f".format(alive)}s；断前 ${statsLine()}")
             lastError = reason
             state = "连接断开，重连中…"
@@ -281,7 +281,10 @@ internal class SdSrtSender(
 
     private fun readStats(s: SrtSocket) {
         try {
-            val st = s.bstats(false)
+            if (s.sockState != SockStatus.CONNECTED) return
+            // clear=true：mbpsSendRate 是距上次读取（≈1s）的区间速率；false 时是整条连接的平均值，看不出上行瞬时变化。
+            // *Total 计数不受 clear 影响
+            val st = s.bstats(true)
             sendMbps = st.mbpsSendRate
             rttMs = st.msRTT
             sentTotal = st.pktSentTotal

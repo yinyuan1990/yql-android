@@ -216,6 +216,13 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             m["rttMs"] = s.rttMs.toInt()
             m["sndBufMs"] = s.sndBufMs
             m["srtState"] = s.state.toString()
+            // 上行：sendKbps = 上一秒 SRT 实际发出（含 TS/SRT 头和重传）；encKbpsNow = 上一秒编码器实际输出；
+            //   uplinkKbps + uplinkLimited：已顶满时是实测上限，否则是下限（≥）；lateDrops = 上一秒迟到丢包数
+            m["sendKbps"] = lastSendKbps
+            m["encKbpsNow"] = lastEncKbps
+            m["uplinkKbps"] = uplink.estKbps
+            m["uplinkLimited"] = uplink.limited
+            m["lateDrops"] = lastLateDrops
         }
         val cam = camera ?: return m
         m["manualSupported"] = cam.manualSupported
@@ -363,6 +370,10 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
     private var lastLoss = 0L
     private var lastRetrans = 0L
     private var lastDrop = 0L
+    private val uplink = SdUplinkMeter()
+    @Volatile private var lastSendKbps = 0
+    @Volatile private var lastEncKbps = 0
+    @Volatile private var lastLateDrops = 0L
 
     private fun resetStatBaselines() {
         lastSent = 0; lastLoss = 0; lastRetrans = 0; lastDrop = 0
@@ -399,6 +410,16 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         lastSent = sent; lastLoss = loss; lastRetrans = retrans; lastDrop = drop
         val lossRate = if (dSent > 0) (dLoss.toDouble() / dSent).coerceIn(0.0, 1.0) else 0.0
 
+        val sendKbps = ((s?.sendMbps ?: 0.0) * 1000).toInt()
+        if (s != null && s.live) {
+            uplink.tick(sendKbps, s.sndBufMs, dDrop, s.currentTarget?.latencyMs ?: (r?.plan?.latencyMs ?: 800))
+        } else {
+            uplink.reset()
+        }
+        lastSendKbps = sendKbps
+        lastEncKbps = encKbps
+        lastLateDrops = dDrop
+
         // 峰值控制器
         var peakMsg = ""
         if (enc != null && r != null && s != null) {
@@ -429,6 +450,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             if (s != null) {
                 append(" | SRT 发送${"%.2f".format(s.sendMbps)}Mbps 估计${"%.1f".format(s.bandwidthMbps)}Mbps RTT${s.rttMs.toInt()}ms")
                 append(" 发送缓冲${s.sndBufMs}ms 在途${s.flightPkts} 本秒丢${dLoss} 重传${dRetrans} 迟到丢${dDrop} 断线丢帧${s.droppedFrames} 重连${s.reconnects}")
+                append(" 上行${uplink.desc}")
             }
             append(" | 峰值控制 ${peak.levelDesc}")
             batteryTempC?.let { append(" | 电池${"%.1f".format(it)}℃") }

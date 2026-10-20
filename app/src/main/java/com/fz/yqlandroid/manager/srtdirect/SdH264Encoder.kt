@@ -295,7 +295,10 @@ internal class SdH264Encoder(
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
             val p = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else -1
             val l = if (format.containsKey(MediaFormat.KEY_LEVEL)) format.getInteger(MediaFormat.KEY_LEVEL) else -1
-            outputFormatDesc = "profile=$p level=$l"
+            val desc = "profile=$p level=$l"
+            // 三星等 Codec2 编码器每帧都回调一次（带逐帧 QP），内容不变时不打日志
+            if (desc == outputFormatDesc) return
+            outputFormatDesc = desc
             SdLog.i("编码器输出格式 ${cfg.width}x${cfg.height} $outputFormatDesc")
         }
     }

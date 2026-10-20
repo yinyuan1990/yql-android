@@ -62,6 +62,9 @@ fun LoginScreen(
     var password by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var rememberPassword by remember { mutableStateOf(false) }
+    // 推流方式："srs" = 原 WebRTC（SRS/P2P，默认）；"srt" = SRT直推（MediaMTX，与 srtapp 同一套 srtdirect）。
+    //   选择存 login_prefs（登出不清），登录成功时写 token_prefs.force_webrtc
+    var publishMode by remember { mutableStateOf("srs") }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     // ⭐ §68 登录失败弹框（服务端失败原因；设备不匹配时后端已拼上"当前设备对应的账号"）
@@ -96,6 +99,7 @@ fun LoginScreen(
         val savedUsername = prefs.getString("username", "") ?: ""
         val savedPassword = prefs.getString("password", "") ?: ""
         val savedRemember = prefs.getBoolean("remember", false)
+        publishMode = if (prefs.getString("publish_mode", "srs") == "srt") "srt" else "srs"
         
         if (savedRemember && savedUsername.isNotEmpty()) {
             username = savedUsername
@@ -283,6 +287,42 @@ fun LoginScreen(
                             color = Color(0xFF1A1A1A)
                         )
                     }
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 30.dp),
+                        color = Color(0xFFF0F0F0)
+                    )
+
+                    // 推流方式：SRS（默认）/ SRT
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(text = "推流方式", fontSize = 16.sp, color = Color(0xFF1A1A1A))
+                        Spacer(modifier = Modifier.weight(1f))
+                        listOf("srs" to "SRS", "srt" to "SRT").forEach { (mode, label) ->
+                            val selected = publishMode == mode
+                            Box(
+                                modifier = Modifier
+                                    .padding(start = 8.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(if (selected) Color(0xFF65AEF7) else Color.Transparent)
+                                    .border(1.dp, if (selected) Color(0xFF65AEF7) else Color(0xFFB3B3B3), RoundedCornerShape(14.dp))
+                                    .clickable { publishMode = mode }
+                                    .padding(horizontal = 18.dp, vertical = 5.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontSize = 14.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selected) Color.White else Color(0xFF666666)
+                                )
+                            }
+                        }
+                    }
                     
                     // ⭐ §53.4-定稿（2026-07-28）：原「连接方式(多人/单人线路)」与「H264/H265 编码」
                     //   两组选项已移除。线路 = 推流前按"与观看端是否同 WiFi"自动决定（同 WiFi 才 P2P，
@@ -349,6 +389,7 @@ fun LoginScreen(
                                             remove("password")
                                         }
                                         putBoolean("remember", rememberPassword)
+                                        putString("publish_mode", publishMode)
                                         // ⭐ §140：摄像头一栏已移除，清掉老版本记住的选择
                                         remove("selected_camera_mode")
                                         apply()
@@ -378,7 +419,10 @@ fun LoginScreen(
                                         // ⭐ 摄像头模式运行时决策值（WebRTCManager.startPreview 读取，第四十八章）；
                                         //   §140 主版恒为自带（OTG 是独立 App），老版本存过 otg 也在这里覆盖掉
                                         putString("camera_mode", "builtin")
-                                        // ⭐ §131 推流方式固定 SRT（登录页不再显示选项），清掉 §129 测试期的旧选择
+                                        // 推流方式按登录页选择：SRT = SRT直推（srtdirect → MediaMTX，connectstype=3），
+                                        //   SRS = 原 WebRTC（SessionPolicy 决定 SRS/P2P）。§129 第一版 SRT（SrtPublisher→SRS）已废弃，
+                                        //   自带摄像头下不会走到。清掉 §129 测试期的旧选择
+                                        putBoolean("force_webrtc", publishMode != "srt")
                                         remove("publish_transport")
                                         // ⭐ §53.4.4 编码默认值改由总后台配置（本机硬编或观看端内核
                                         //   不支持时由 SessionPolicy/H265Support 自动回退 h264）。
