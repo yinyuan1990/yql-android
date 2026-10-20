@@ -2698,6 +2698,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // ===== §21.27 网络切换监听（统一入口，P2P/SRS 两模式共用；P2PManager 不再自注册监听）=====
     private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private var lastNetEventMs = 0L
+    @Volatile private var lastDefaultNetwork: android.net.Network? = null
 
     private fun startNetworkMonitoring() {
         if (netCallback != null) return
@@ -2712,12 +2713,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
                 // 蜂窝状态喂给 P2PManager（relay 策略用）；网络类型变化=切网事件
                 if (p2pManager.updateCellularState(cellular)) {
-                    onNetworkChanged("类型变化(蜂窝=$cellular)")
+                    onNetworkChanged("类型变化(蜂窝=$cellular)", switched = true)
                 }
             }
             override fun onAvailable(network: android.net.Network) {
-                // 换 WiFi / 断网恢复通常经历 onAvailable
-                onNetworkChanged("网络可用")
+                // 换 WiFi / 断网恢复通常经历 onAvailable；注册时系统会先回调一次当前网络，那次不算切网
+                val prev = lastDefaultNetwork
+                lastDefaultNetwork = network
+                onNetworkChanged("网络可用", switched = prev != null && prev != network)
             }
         }
         try {
@@ -2740,7 +2743,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     /** 切网事件统一入口：5s 节流 → WS 活着就立即健康检查；WS 已断就等 WS 重连回调（同一出口） */
-    private fun onNetworkChanged(reason: String) {
+    private fun onNetworkChanged(reason: String, switched: Boolean) {
         val now = System.currentTimeMillis()
         if (now - lastNetEventMs < 5000) return
         lastNetEventMs = now
@@ -2748,6 +2751,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         val wsConnected = WebSocketManager.instance.isConnected
         Log.d(TAG, "📶 [切网] $reason mode=$currentConnMode ws=$wsConnected")
         Log.d("meidui", "📶 [切网统一入口] $reason mode=$currentConnMode wsConnected=$wsConnected")
+        if (switched && currentConnMode == ConnMode.SRT) {
+            // SRT直推：媒体由 SdSrtSender 自己 2s 内重连；但 WS 旧 socket 挂在旧网络上不报错，要等 ping 超时
+            //   才发现 → 期间心跳全停，PC 判设备下线停拉流。主动重建 WS，连上后 onReconnected →
+            //   publishHealthCheck("WS重连") 统一处理（SRT 分支不重推）
+            srtLog("📶 切网($reason)：主动重建 WebSocket（ws=$wsConnected），SRT 自行重连")
+            WebSocketManager.instance.forceReconnect("切网($reason)")
+            return
+        }
         // ⭐ §53.12：切网**只标记"待重新决策"，绝不在这里立刻动作**。
         //   上一版在这里直接评估并可能 stopPublish+startPublish，与紧随其后的 publishHealthCheck
         //   （原有自愈出口）在同一个事件里抢：两者都会重启推流、顺序还不确定，

@@ -127,10 +127,17 @@ class WebSocketManager private constructor() {
     // ⭐ §71 本机安装实例ID（连接时从 DeviceIDManager 取）
     private var installId: String? = null
     
+    // ping 5s：切网后旧 socket 挂在旧网络上不会报错，只能靠 pong 超时发现（下一次 ping 前没收到 pong 即失败）
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(10, TimeUnit.SECONDS)
+        .pingInterval(5, TimeUnit.SECONDS)
         .build()
+
+    /** 连续重连失败次数（STOMP CONNECTED 清零），决定下一次重连等待 */
+    private var reconnectAttempt = 0
+
+    /** 回调来自已被替换的旧 socket（主动重连后旧连接迟到的 closed/failure）→ 忽略，防把新连接状态改成断开 */
+    private fun isStale(ws: WebSocket): Boolean = webSocket != null && ws !== webSocket
     
     private val gson = Gson()
     
@@ -171,20 +178,24 @@ class WebSocketManager private constructor() {
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 println("wb [WS] ✅ WebSocket已连接, response=${response.code}")
+                if (isStale(webSocket)) { webSocket.close(1000, "stale"); return }
                 sendStompConnect()
             }
             
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (isStale(webSocket)) return
                 handleStompFrame(text)
             }
             
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 println("wb [WS] 🔌 正在关闭: code=$code, reason=$reason")
+                if (isStale(webSocket)) return
                 updateState(false)
             }
             
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 println("wb [WS] 🔌 已关闭: code=$code, reason=$reason, 手动=$isManualDisconnect")
+                if (isStale(webSocket)) return
                 updateState(false)
                 // ⭐ §71 后端传输层硬踢（4001=kicked-by-new-install）：不重连，走被踢下线流程
                 if (code == 4001) {
@@ -200,6 +211,7 @@ class WebSocketManager private constructor() {
             
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 println("wb [WS] ❌ 连接失败: ${t.message}, response=${response?.code}")
+                if (isStale(webSocket)) return
                 updateState(false)
                 if (!isManualDisconnect) {
                     scheduleReconnect()  // 🔥 只有非手动断开才重连
@@ -254,6 +266,7 @@ class WebSocketManager private constructor() {
             "CONNECTED" -> {
                 println("wb [WS] ✅ STOMP已连接")
                 stompConnected = true
+                reconnectAttempt = 0
                 updateState(true)
                 
                 // 订阅设备配置通道 + P2P 信令通道（与 iOS 一致）
@@ -905,10 +918,27 @@ class WebSocketManager private constructor() {
     
     // MARK: - 重连
     
+    /**
+     * 切网等场景主动重建连接：旧 socket 可能还"连着"（挂在旧网络上没报错），不等 ping 超时。
+     * 手动断开（登出/切设备）后不动。
+     */
+    fun forceReconnect(reason: String) {
+        if (isManualDisconnect) return
+        val id = deviceId ?: return
+        val token = jwtToken ?: return
+        Log.d(TAG, "🔄 [$reason] 主动重建 WebSocket（旧连接 stomp=$stompConnected）")
+        stompConnected = false   // 让 connect() 不走「已连接跳过」
+        reconnectAttempt = 0
+        connect(id, token)
+    }
+
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
+        // 1s → 2s → 4s → 5s 封顶，加 0~0.5s 抖动：切网后尽快回来，后端重启时几千台设备又不会同一秒挤进来
+        val waitMs = minOf(5000L, 1000L shl minOf(reconnectAttempt, 3)) + (0..500).random()
+        reconnectAttempt++
         reconnectJob = scope.launch {
-            delay(5000) // 5秒后重连
+            delay(waitMs)
             val id = deviceId
             val token = jwtToken
             if (id != null && token != null) {
