@@ -132,7 +132,8 @@ fun StreamingScreen(
     var srtTrafficMb by remember { mutableStateOf(0L) }
     var srtTrafficFree by remember { mutableStateOf(false) }
     var srtDailyFreeGb by remember { mutableStateOf(0f) }
-    var srtRateGbh by remember { mutableStateOf(0.0) }   // 当前档位每小时消耗 GB（0 = 不耗流量）
+    var srtRateGbh by remember { mutableStateOf(0.0) }   // 当前每小时消耗 GB（档位 × 清晰度；0 = 不耗流量）
+    var srtClarityPct by remember { mutableStateOf(0) }
     // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
     var showUpdatePrompt by remember { mutableStateOf(false) }
     var updatePromptText by remember { mutableStateOf("") }
@@ -375,8 +376,11 @@ fun StreamingScreen(
             srtTrafficFree = p.getBoolean("srt_traffic_free", false)
             srtDailyFreeGb = p.getFloat("srt_daily_free_gb", 0f)
             val profile = WebRTCManager.effectiveSrtProfile
+            val currentGbh = p.getFloat("srt_current_gbh", -1f)
+            srtClarityPct = p.getInt("srt_clarity_pct", 0)
             srtRateGbh = try {
                 if (profile.isEmpty()) 0.0
+                else if (currentGbh >= 0f) currentGbh.toDouble()
                 else org.json.JSONObject(p.getString("srt_traffic_rates", "{}") ?: "{}").optDouble(profile, 0.0)
             } catch (_: Exception) { 0.0 }
             kotlinx.coroutines.delay(2000)
@@ -558,7 +562,8 @@ fun StreamingScreen(
                     )
                 }
                 Text(
-                    text = if (srtRateGbh > 0) "当前档位 ${rateText}GB/小时" else "当前档位不耗流量",
+                    text = if (srtRateGbh > 0) "当前每小时 ${rateText}GB" + (if (srtClarityPct > 0) "（清晰度 $srtClarityPct%）" else "")
+                           else "当前档位不耗流量",
                     color = Color(0xFFB0B0B0),
                     fontSize = 10.sp,
                     lineHeight = 13.sp

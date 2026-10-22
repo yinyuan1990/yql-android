@@ -603,6 +603,9 @@ class WebSocketManager private constructor() {
             (msgDict["srtTrafficFree"] as? Boolean)?.let { putBoolean("srt_traffic_free", it) }
             (msgDict["srtDailyFreeGb"] as? Number)?.let { putFloat("srt_daily_free_gb", it.toFloat()) }
             (msgDict["srtTrafficRates"] as? Map<*, *>)?.let { putString("srt_traffic_rates", org.json.JSONObject(it).toString()) }
+            // 当前档位按清晰度折算后的每小时消耗（档位每小时 × 清晰度 10% 一档）
+            (msgDict["srtCurrentGbh"] as? Number)?.let { putFloat("srt_current_gbh", it.toFloat()) }
+            (msgDict["srtClarityPct"] as? Number)?.let { putInt("srt_clarity_pct", it.toInt()) }
             (msgDict["srtHighRes"] as? Boolean)?.let { putBoolean("srt_high_res", it) }
             (msgDict["srtPointsExhausted"] as? Boolean)?.let { putBoolean("srt_points_exhausted", it) }
             apply()
