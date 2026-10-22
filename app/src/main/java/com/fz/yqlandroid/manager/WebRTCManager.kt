@@ -2945,7 +2945,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // 对焦距离: 0.0~1.0
             "focus" -> {
                 (config["focus"] as? Number)?.let { f ->
-                    setFocus(f.toFloat())
+                    setFocus(f.toFloat(), manual = config["manualFocus"] == true)
                 }
             }
 
@@ -3237,6 +3237,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     @Volatile private var _sharpness: Float? = null
     val currentZoom: Float get() = _currentZoom
     private var _currentFocus: Float = 0.5f
+    private var _focusManual = false   // 当前 _currentFocus 来自新版 PC（带 manualFocus）
     val currentFocus: Float get() = _currentFocus
     // §104 自动对焦开关：§107 起默认 true=自动；PC ptype=autoFocus 控制；收到 focus 值自动关掉
     private var _autoFocus: Boolean = true
@@ -3300,6 +3301,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             exposureEv = if (srtDirectMode) _srtExposureEv else null,
             focus = _currentFocus,
             autoFocus = _autoFocus,
+            focusManual = _focusManual,
             zoom = _currentZoom,
             // §141 SRT直推不走 cjfps/ISO% 那套手动曝光，改用 srtShutterNs/srtIso（test-android 算法，SdCameraSource 落地）
             shutterCjfps = if (_shutterEnabled && !srtDirectMode) _currentShutterSpeed else null,
@@ -3409,8 +3411,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     /** 设置对焦距离 (0.0 ~ 1.0)；0.5=连续自动对焦，其余=手动 */
-    fun setFocus(distance: Float) {
+    fun setFocus(distance: Float, manual: Boolean = false) {
         _currentFocus = distance.coerceIn(0f, 1f)
+        _focusManual = manual
         if (_autoFocus) {
             _autoFocus = false   // §104 手动更改 → 手动对焦
             Log.d(TAG, "🎯 收到手动焦距，自动对焦关闭")

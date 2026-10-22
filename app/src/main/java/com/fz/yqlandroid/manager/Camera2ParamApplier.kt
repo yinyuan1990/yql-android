@@ -41,6 +41,7 @@ object Camera2ParamApplier {
         val exposureEv: Float? = null,     // AE 曝光补偿(EV)，仅在未启用手动快门时生效
         val focus: Float? = null,          // 0..1；0.5=连续自动对焦，其余=手动对焦距离
         val autoFocus: Boolean = false,    // §104 true=连续自动对焦（忽略 focus）；false=按 focus 处理
+        val focusManual: Boolean = false,  // 新版 PC 下发的手动值（带 manualFocus）：0.5 也按手动，不当成「自动」
         val zoom: Float? = null,           // 0.5~max；变焦（<1 需设备 ZOOM_RATIO_RANGE 支持，否则夹到 1.0）
         val shutterCjfps: Int? = null,     // 快门 1/cjfps 秒(60~600)，非空=手动曝光(AE OFF)
         val manualIsoPercent: Int? = null, // ISO 增益 0~100（PC test_brightness）→ 映射设备 SENSITIVITY_RANGE；仅手动快门(AE OFF)生效
@@ -308,13 +309,15 @@ object Camera2ParamApplier {
             }
             val f = p.focus ?: return
             val minFocusDist = c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-            if (f == 0.5f || minFocusDist <= 0f) {
-                // 连续自动对焦
+            if ((f == 0.5f && !p.focusManual) || minFocusDist <= 0f) {
+                // 连续自动对焦（老版本 PC 用 0.5 表示自动）
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
             } else {
-                // 手动对焦：1=远(0屈光度) 0=近(minFocusDist)
+                // 手动对焦：1=远(0屈光度) 0=近(minFocusDist)。按 (1-f)² 换算：屈光度线性时 1 米到无穷远只占滑条最后 ~10%，
+                //   平方后约占 30%，远处调得更细（PC 安卓滑条显示 0~2.0，下发仍是 0~1）
+                val near = (1f - f).coerceIn(0f, 1f)
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, (1f - f).coerceIn(0f, 1f) * minFocusDist)
+                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, near * near * minFocusDist)
             }
         } catch (e: Exception) {
             Log.w(TAG, "focus 写入失败: ${e.message}")
