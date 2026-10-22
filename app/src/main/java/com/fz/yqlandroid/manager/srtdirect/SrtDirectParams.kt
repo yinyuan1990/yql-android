@@ -19,6 +19,7 @@ import org.json.JSONObject
 object SrtDirectParams {
     private const val PREFS = "srt_direct_prefs"
     private const val KEY_OVERRIDE = "override_json"
+    private const val KEY_LOGIN = "login_json"   // 登录下发的原样一份（PC「恢复默认」时回到它）
     const val DEFAULT_HOST = "118.178.33.144"
     const val DEFAULT_PORT = 8890
 
@@ -95,7 +96,17 @@ object SrtDirectParams {
         }
         loaded = true
         persist(ctx)
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_LOGIN, override.toString()).apply()
         SdLog.i("登录下发 srtParams ${if (override.length() == 0) "无（用内置默认）" else "已保存 ${override.toString().take(300)}"}")
+    }
+
+    /** PC「恢复默认」：丢掉 PC 临时改的（QP / 延迟等），回到登录下发的总后台值。没存过登录值返回 false */
+    fun resetToLogin(ctx: Context): Boolean {
+        val s = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LOGIN, null) ?: return false
+        override = try { JSONObject(s) } catch (_: Exception) { return false }
+        loaded = true
+        persist(ctx)
+        return true
     }
 
     /** STOMP `ptype=srt_params`：增量合并（只带改动项）。返回合并后的覆盖项 */

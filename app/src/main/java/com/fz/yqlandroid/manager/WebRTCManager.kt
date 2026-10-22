@@ -3006,6 +3006,24 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             // §141 PC「SRT设置」打开期间每秒问一次 → 回 srtCamState
             "srt_cam_query" -> reportSrtCamState((config["t0"] as? Number)?.toLong())
 
+            // 用户第 14 条：PC 关闭 / 切换账号 / 重新登录后第一次连上 → 「SRT设置」里 PC 临时改的全部回到服务器默认：
+            //   参数（QP / 延迟 / 锐化等）回登录下发的总后台值，快门/ISO/EV 回自动，PC 边缘锐化覆盖清掉，变焦回 1 倍
+            "srt_reset" -> {
+                if (!srtDirectMode) return
+                val ctx = srtCtx()
+                val paramsOk = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.resetToLogin(ctx)
+                _sharpness = null
+                _srtShutterNs = 0L; _srtIso = 0; _srtExposureEv = 0f
+                setZoom(1.0f)
+                val plan = srtPlan()
+                currentFps = minOf(plan.fps, targetOutputFps).coerceAtLeast(1)
+                currentBitrateKbps = plan.bitrateKbps
+                applySrtEncoding("PC恢复默认")
+                if (!applyCameraParams()) applyCameraParamsWithRetry("PC恢复默认曝光注入失败重试")
+                srtLog("PC 恢复默认（${config["reason"] ?: ""}）：参数${if (paramsOk) "回到登录下发值" else "没有登录记录，保持现状"}" +
+                        " [${plan.describe()}]，曝光自动，变焦 1 倍")
+            }
+
             // 🔥 白平衡（与iOS white_balance/applyWhiteBalance一致）
             "white_balance" -> {
                 val wb = (config["testWhiteBalance"] as? Number)
