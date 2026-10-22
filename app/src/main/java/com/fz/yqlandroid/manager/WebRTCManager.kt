@@ -64,7 +64,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         @Volatile var effectiveConnectstype: Int = 0
 
         /** SRT直推当前档位（srtParams presets 键，如 srt2k/srt4k）；非 SRT直推 = ""。
-         *  随 CONFIG_STATE.profile 上报，后端按它判断 >1920 档按分钟扣积分 */
+         *  随 CONFIG_STATE.profile 上报，后端按该档位每小时消耗按分钟扣流量 */
         @Volatile var effectiveSrtProfile: String = ""
 
         /**

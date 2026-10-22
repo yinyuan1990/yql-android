@@ -596,9 +596,13 @@ class WebSocketManager private constructor() {
             (msgDict["usedSeconds"] as? Number)?.let { putInt("used_seconds", it.toInt()) }
             putBoolean("is_daily_trial", isDailyTrial)
             (msgDict["activationRemainingSeconds"] as? Number)?.let { putInt("activation_remaining_seconds", it.toInt()) }
-            // ⭐ SRT全码 + 积分：后端随 TryDisconnect 下发，供推流页显示余额/每分钟扣分/余额低提醒
+            // ⭐ SRT全码 + 流量：后端随 TryDisconnect 下发，供推流页显示剩余流量/当前档位消耗/流量低提醒
+            //   srtPoints = 剩余流量 MB（含每日赠送）；srtTrafficRates = 各档位每小时消耗 GB
             (msgDict["srtFull"] as? Boolean)?.let { putBoolean("srt_full", it) }
             (msgDict["srtPoints"] as? Number)?.let { putLong("srt_points", it.toLong()) }
+            (msgDict["srtTrafficFree"] as? Boolean)?.let { putBoolean("srt_traffic_free", it) }
+            (msgDict["srtDailyFreeGb"] as? Number)?.let { putFloat("srt_daily_free_gb", it.toFloat()) }
+            (msgDict["srtTrafficRates"] as? Map<*, *>)?.let { putString("srt_traffic_rates", org.json.JSONObject(it).toString()) }
             (msgDict["srtHighRes"] as? Boolean)?.let { putBoolean("srt_high_res", it) }
             (msgDict["srtPointsExhausted"] as? Boolean)?.let { putBoolean("srt_points_exhausted", it) }
             apply()
@@ -707,7 +711,7 @@ class WebSocketManager private constructor() {
             "rtt" to rtt,
             "srtPlayHost" to (if (connectstype == 3) srtPlayHost else ""),
             "srtPlayPort" to (if (connectstype == 3) srtPlayPort else 0),
-            // SRT直推当前档位：后端 SrtPointsService 按它判断 srt2k/srt4k（>1920）按分钟扣积分
+            // SRT直推当前档位：后端 SrtPointsService 按它查该档位每小时消耗，按分钟扣流量
             "profile" to (if (connectstype == 3) WebRTCManager.effectiveSrtProfile else ""),
             "deviceType" to mapOf(
                 "os" to "Android ${Build.VERSION.RELEASE}",
@@ -729,8 +733,8 @@ class WebSocketManager private constructor() {
             "usedSeconds" to usedSeconds,
             "isDailyTrial" to isDailyTrial,
             "activationRemainingSeconds" to activationRemainingSeconds,
-            // ⭐ SRT全码/积分：从 prefs（后端 TryDisconnect 下发时存入）回填进 state，
-            //   随 CONFIG_STATE 透传给 PC，PC applySrtAccount(state) 读 srtFull/srtPoints
+            // ⭐ SRT全码/剩余流量：从 prefs（后端 TryDisconnect 下发时存入）回填进 state，
+            //   随 CONFIG_STATE 透传给 PC（新版 PC 直接读后端 TryDisconnect，这里给老版 PC 用）
             "srtFull" to (tokenPrefs?.getBoolean("srt_full", false) ?: false),
             "srtPoints" to (tokenPrefs?.getLong("srt_points", 0L) ?: 0L)
         )

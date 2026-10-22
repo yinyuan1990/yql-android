@@ -127,10 +127,12 @@ fun StreamingScreen(
     var showKickedDialog by remember { mutableStateOf(false) }
     var kickedMessage by remember { mutableStateOf("") }
 
-    // ⭐ SRT全码 + 积分（后端随 TryDisconnect 下发，WebSocketManager 存入 token_prefs）
+    // ⭐ SRT全码 + 流量（后端随 TryDisconnect 下发，WebSocketManager 存入 token_prefs）
     var srtFull by remember { mutableStateOf(false) }
-    var srtPoints by remember { mutableStateOf(0L) }
-    var srtHighRes by remember { mutableStateOf(false) }
+    var srtTrafficMb by remember { mutableStateOf(0L) }
+    var srtTrafficFree by remember { mutableStateOf(false) }
+    var srtDailyFreeGb by remember { mutableStateOf(0f) }
+    var srtRateGbh by remember { mutableStateOf(0.0) }   // 当前档位每小时消耗 GB（0 = 不耗流量）
     // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
     var showUpdatePrompt by remember { mutableStateOf(false) }
     var updatePromptText by remember { mutableStateOf("") }
@@ -364,13 +366,19 @@ fun StreamingScreen(
         } catch (_: Exception) { /* 权限引导失败不拦截推流 */ }
     }
 
-    // ⭐ 每 2s 从 token_prefs 读 SRT全码/积分，驱动画面上的余额显示
+    // ⭐ 每 2s 从 token_prefs 读 SRT全码/剩余流量/当前档位消耗，驱动画面上的流量显示
     LaunchedEffect(Unit) {
         while (true) {
             val p = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
             srtFull = p.getBoolean("srt_full", false)
-            srtPoints = p.getLong("srt_points", 0L)
-            srtHighRes = p.getBoolean("srt_high_res", false)
+            srtTrafficMb = p.getLong("srt_points", 0L)
+            srtTrafficFree = p.getBoolean("srt_traffic_free", false)
+            srtDailyFreeGb = p.getFloat("srt_daily_free_gb", 0f)
+            val profile = WebRTCManager.effectiveSrtProfile
+            srtRateGbh = try {
+                if (profile.isEmpty()) 0.0
+                else org.json.JSONObject(p.getString("srt_traffic_rates", "{}") ?: "{}").optDouble(profile, 0.0)
+            } catch (_: Exception) { 0.0 }
             kotlinx.coroutines.delay(2000)
         }
     }
@@ -519,9 +527,14 @@ fun StreamingScreen(
             }
         }
 
-        // ⭐ SRT全码积分：仅开通 SRT全码 的账号显示（右上角），高清档(>1920)每分钟扣 1 积分
-        if (srtFull) {
-            val lowBalance = srtPoints <= 5
+        // ⭐ 剩余流量（右上角）：开通 SRT全码 或 当前档位耗流量 时显示；每个档位每小时消耗由后台配，推流按分钟扣
+        if (srtFull || srtRateGbh > 0) {
+            val perMinuteMb = if (srtRateGbh > 0) maxOf(1L, Math.round(srtRateGbh * 1024 / 60)) else 0L
+            val minutesLeft = if (perMinuteMb > 0) srtTrafficMb / perMinuteMb else Long.MAX_VALUE
+            val lowBalance = perMinuteMb > 0 && minutesLeft < 30
+            val fmt2 = { v: Double -> String.format(java.util.Locale.US, "%.2f", v).trimEnd('0').trimEnd('.') }
+            val gbText = fmt2(srtTrafficMb / 1024.0)
+            val rateText = fmt2(srtRateGbh)
             Column(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -531,20 +544,28 @@ fun StreamingScreen(
                 horizontalAlignment = Alignment.End
             ) {
                 Text(
-                    text = "SRT积分 $srtPoints",
+                    text = "剩余流量 ${gbText}GB",
                     color = if (lowBalance) Color(0xFFFF6B6B) else Color(0xFF9CFF9C),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
                 )
+                if (srtTrafficFree && srtDailyFreeGb > 0f) {
+                    Text(
+                        text = "每日赠送 ${fmt2(srtDailyFreeGb.toDouble())}GB，隔天恢复",
+                        color = Color(0xFFB0B0B0),
+                        fontSize = 10.sp,
+                        lineHeight = 13.sp
+                    )
+                }
                 Text(
-                    text = if (srtHighRes) "高清档 1积分/分钟" else "高清档(>1920) 1积分/分钟",
+                    text = if (srtRateGbh > 0) "当前档位 ${rateText}GB/小时" else "当前档位不耗流量",
                     color = Color(0xFFB0B0B0),
                     fontSize = 10.sp,
                     lineHeight = 13.sp
                 )
                 if (lowBalance) {
                     Text(
-                        text = if (srtPoints <= 0L) "积分已用完，高清档将停推" else "积分不足，约剩 $srtPoints 分钟",
+                        text = if (srtTrafficMb <= 0L) "流量已用完，当前档位将停推" else "流量不足，约剩 $minutesLeft 分钟",
                         color = Color(0xFFFF6B6B),
                         fontSize = 10.sp,
                         lineHeight = 13.sp
