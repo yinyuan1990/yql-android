@@ -53,7 +53,7 @@ object Camera2ParamApplier {
         //   WebRTC 反射通道不读这两项）：0 = 自动；只手动一项时另一项按切换前测光折算（曝光×ISO 不变）。
         val srtShutterNs: Long = 0L,
         val srtIso: Int = 0,
-        // PC「清晰度(P)」0..1（iOS 是连续软件锐化）；Camera2 只有硬件 EDGE_MODE 三档：<0.1 关 / <0.5 标准 / 其余 强
+        // PC「边缘锐化」（原「清晰度(P)」）0..1（iOS 是连续软件锐化）；Camera2 只有硬件 EDGE_MODE 三档：<0.1 关 / <0.5 标准 / 其余 强
         val sharpness: Float? = null
     )
 

@@ -11,7 +11,8 @@ import org.json.JSONObject
  * ```
  * { presets: { low|standard|high|ultra|p4k: {width,height,fps,bitrateKbps, …可选覆盖任意全局键} },
  *   bitrateMode:1(VBR)/2(CBR), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
- *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization }
+ *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization,
+ *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }
  * ```
  * 档位里可再带 `peakKbps/latencyMs/gopSec/qp*` 等，覆盖全局值（如 4K 档峰值 24000、延迟 1000）。
  */
@@ -103,6 +104,14 @@ object SrtDirectParams {
         deepMerge(merged, patch)
         override = merged
         persist(ctx)
+    }
+
+    /** 总后台「SRT管理→参数设置」的边缘锐化 0~1（没配 = null，用相机默认） */
+    fun sharpness(ctx: Context): Float? {
+        load(ctx)
+        if (!override.has("sharpness") || override.isNull("sharpness")) return null
+        val v = override.optDouble("sharpness", Double.NaN)
+        return if (v.isNaN()) null else v.toFloat().coerceIn(0f, 1f)
     }
 
     /** 登录下发的 srtServer {host, port} */

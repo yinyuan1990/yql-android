@@ -2887,7 +2887,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 setZoom(zoom)
             }
 
-            // PC「清晰度(P)」锐化：0..1 → 硬件 EDGE_MODE 关/标准/强（WebRTC 与 SRT直推共用）
+            // PC「边缘锐化」（原「清晰度(P)」）：0..1 → 硬件 EDGE_MODE 关/标准/强（WebRTC 与 SRT直推共用）
             "sharpness" -> {
                 (config["sharpness"] as? Number)?.toFloat()?.let {
                     _sharpness = it.coerceIn(0f, 1f)
@@ -3049,6 +3049,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     return
                 }
                 com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.mergeRemote(ctx, patch)
+                if (patch.has("sharpness")) _sharpness = null   // 后台改了边缘锐化 → 按后台值（PC 再拖再覆盖）
                 srtLog("后台改参 ${patch.toString().take(300)} → 生效 [${srtPlan().describe()}]")
                 if (srtDirectMode) {
                     // 档位码率/帧率可能变了：按新档位值重算（推送帧率仍受 PC 设定封顶）
@@ -3230,6 +3231,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         st["reqIso"] = _srtIso
         st["ev"] = _srtExposureEv
         st["zoom"] = _currentZoom
+        st["sharpness"] = effectiveSharpness()   // PC「边缘锐化」滑条按手机实际值摆（null = 相机默认）
         // §148 PC「SRT设置」档位按钮上显示各档的生效分辨率/帧率/码率（总后台「SRT管理→参数设置」能改，PC 自己不知道）
         val ctx = srtCtx()
         st["presets"] = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.PROFILES.associateWith { k ->
@@ -3282,9 +3284,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             antiBanding50Hz = antiFlickerEnabled,
             // §129/§134 SRT 模式关 OIS/EIS（silu 同款；SRT直推引擎按 srtParams.disableStabilization 再覆盖）；WebRTC 模式不变
             disableStabilization = srtPublisher != null || srtEngine != null,
-            sharpness = _sharpness
+            sharpness = effectiveSharpness()
         )
     }
+
+    /** 边缘锐化：PC 拖过用 PC 的；否则 SRT直推用后台「参数设置」的（没配 = 相机默认） */
+    private fun effectiveSharpness(): Float? =
+        _sharpness ?: if (srtDirectMode) com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.sharpness(srtCtx()) else null
 
     /**
      * ⭐ 会话(重)建后的硬件参数重放（核心=AE帧率区间钉死）——带重试。
