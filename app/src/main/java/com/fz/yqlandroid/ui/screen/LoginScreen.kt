@@ -302,7 +302,7 @@ fun LoginScreen(
                     ) {
                         Text(text = "推流方式", fontSize = 16.sp, color = Color(0xFF1A1A1A))
                         Spacer(modifier = Modifier.weight(1f))
-                        listOf("srs" to "SRS", "srt" to "SRT").forEach { (mode, label) ->
+                        listOf("srs" to "SRS", "srt" to "SRS直推").forEach { (mode, label) ->
                             val selected = publishMode == mode
                             Box(
                                 modifier = Modifier

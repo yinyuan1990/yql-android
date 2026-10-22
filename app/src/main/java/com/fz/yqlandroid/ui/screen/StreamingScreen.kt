@@ -535,8 +535,9 @@ fun StreamingScreen(
             }
         }
 
-        // ⭐ 剩余流量（右上角）：开通 SRT全码 或 当前档位耗流量 时显示；每个档位每小时消耗由后台配，推流按分钟扣
-        if (srtFull || srtRateGbh > 0) {
+        // ⭐ 剩余流量（右上角）：「原画质已开通」+ 剩余流量 + 当前每小时消耗；每个档位每小时消耗由后台配，推流按分钟扣
+        //   用户第 15 条：只在开通原画质（后端 SRT全码）后显示，没开通不显示；手机上不出现 SRT 字样
+        if (srtFull) {
             val perMinuteMb = if (srtRateGbh > 0) maxOf(1L, Math.round(srtRateGbh * 1024 / 60)) else 0L
             val minutesLeft = if (perMinuteMb > 0) srtTrafficMb / perMinuteMb else Long.MAX_VALUE
             val lowBalance = perMinuteMb > 0 && minutesLeft < 30
@@ -551,6 +552,12 @@ fun StreamingScreen(
                     .padding(horizontal = 10.dp, vertical = 6.dp),
                 horizontalAlignment = Alignment.End
             ) {
+                Text(
+                    text = "原画质已开通",
+                    color = Color(0xFFFFD54F),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
                 Text(
                     text = "剩余流量 ${gbText}GB",
                     color = if (lowBalance) Color(0xFFFF6B6B) else Color(0xFF9CFF9C),

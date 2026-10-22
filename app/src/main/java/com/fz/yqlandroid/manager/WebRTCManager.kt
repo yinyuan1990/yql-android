@@ -1198,7 +1198,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
         override fun onSrtLost(reason: String) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                if (srtEngine != null) onConnectionStateChanged?.invoke("SRT断线,重连中...")
+                if (srtEngine != null) onConnectionStateChanged?.invoke("SRS断线,重连中...")
             }
         }
 
@@ -1236,7 +1236,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         currentConnMode = ConnMode.SRT
         effectiveConnectstype = 3
         H265Support.forceH264ForNonP2P()
-        SessionPolicy.setManualReason("SRT直推")
+        SessionPolicy.setManualReason("SRS直推")
         srtLastStateText = ""
         lastSrtTickMs = 0L
         val ctx = srtCtx()
@@ -1249,7 +1249,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             (ctx.getSharedPreferences("token_prefs", Context.MODE_PRIVATE).getString("username", "") ?: "").replace(":", ""))
         srtLog("═══ 开始推流 srt://$srtHost:$srtPort 流=$streamKey 档位=${profileName(currentProfile)}" +
                 " 推送${currentFps}fps 清晰度${_currentQualityPercent}% 参数[${srtPlan().describe()}] ═══")
-        onConnectionStateChanged?.invoke("SRT连接中...")
+        onConnectionStateChanged?.invoke("SRS连接中...")
 
         scope.launch {
             try {
@@ -1321,8 +1321,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             if (currentConnMode != ConnMode.SRT || srtEngine == null || !isPublishing) return@post
             WebSocketManager.publishingStreamKey = streamKey
             WebSocketManager.isPublishingFlag = 1
-            onConnectionStateChanged?.invoke("SRT直推中")
-            srtLastStateText = "SRT直推中"
+            onConnectionStateChanged?.invoke("SRS直推中")
+            srtLastStateText = "SRS直推中"
             srtLog("✅ 出流（第${attempt + 1}次连接）流名=$streamKey 拉流=srt://$srtHost:$srtPort?streamid=read:$streamKey → publishStatus=1")
         }
     }
@@ -1375,7 +1375,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             s.lossRate <= 0.05 && s.rttMs in 1..400 -> "fair"
             else -> "poor"
         }
-        val text = if (s.live) "SRT直推中" else if (s.connected) "SRT已连接,等关键帧" else "SRT连接中..."
+        val text = if (s.live) "SRS直推中" else if (s.connected) "SRS已连接,等关键帧" else "SRS连接中..."
         withContext(Dispatchers.Main) {
             onStatsUpdate?.invoke(s.encKbps, s.encFps, s.rttMs)
             if (text != srtLastStateText) {
