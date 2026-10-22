@@ -164,6 +164,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 // 峰值控制参数变了：控制器按新 plan 重置（运行中抬高过的 QP 回到 plan 值）
                 if (old != null && old.plan != r.plan) {
                     if (peak.curPMax != r.plan.qpPMax) enc.setPMaxQp(r.plan.qpPMax)
+                    if (peak.curPMax > old.plan.qpCeil) enc.setIMaxQp(r.plan.qpIMax)   // 拥塞保护放开过 I 帧上限
                     synchronized(peak) { peak.reset(r.plan, qpRuntimeOk()) }
                 }
                 val target = r.kbps * peak.ratePct / 100
@@ -428,7 +429,12 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 when (val st = res.step) {
                     is SdPeakController.Step.Qp -> {
                         enc.setPMaxQp(st.to)
-                        peakMsg = "${if (res.raised) "压峰值" else "回落"} P帧QP上限 ${st.from}→${st.to}（${res.reason}）"
+                        // 拥塞保护那一步越过 qpCeil 时 I 帧上限一起放（I 帧每个 GOP 一个，1440P 上 100KB+，不放码率降不下来），撤回时还原
+                        val jam = st.to > r.plan.qpCeil || st.from > r.plan.qpCeil
+                        if (jam) enc.setIMaxQp(if (st.to > r.plan.qpCeil) maxOf(st.to, r.plan.qpIMax) else r.plan.qpIMax)
+                        peakMsg = "${if (res.raised) "压峰值" else "回落"} P帧QP上限 ${st.from}→${st.to}" +
+                                (if (jam) "（I帧上限 ${if (st.to > r.plan.qpCeil) maxOf(st.to, r.plan.qpIMax) else r.plan.qpIMax}）" else "") +
+                                "（${res.reason}）"
                     }
                     is SdPeakController.Step.Rate -> {
                         val target = r.kbps * st.toPct / 100

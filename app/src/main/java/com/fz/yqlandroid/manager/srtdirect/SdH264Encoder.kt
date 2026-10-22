@@ -245,6 +245,23 @@ internal class SdH264Encoder(
         return true
     }
 
+    /** 运行中改 I 帧 QP 上限（拥塞保护用；同 [setPMaxQp]，Android 12+） */
+    fun setIMaxQp(qpMax: Int): Boolean {
+        if (Build.VERSION.SDK_INT < 31) return false
+        val c = codec ?: return false
+        handler.post {
+            try {
+                c.setParameters(Bundle().apply {
+                    putInt("video-qp-i-max", qpMax)
+                    if (isQualcomm(codecName)) putInt("vendor.qti-ext-enc-qp-range.qp-i-max", qpMax)
+                })
+            } catch (t: Throwable) {
+                SdLog.w("运行中改 I 帧 QP 上限失败: ${t.message}")
+            }
+        }
+        return true
+    }
+
     fun stop() {
         val c = codec
         codec = null

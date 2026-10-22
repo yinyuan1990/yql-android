@@ -6,9 +6,17 @@ package com.fz.yqlandroid.manager.srtdirect
  * - **超标**：实际码率 > peakKbps，或发送缓冲 > 45% latency，连续 holdSec 秒 →
  *   先 P 帧 QP 上限 += qpStep（≤ qpCeil，Android 12+ 运行中 setParameters）；
  *   QP 到顶或系统不支持运行中改 QP → 目标码率降 10%/档（最多 5 档到 50%）。
+ * - **拥塞保护**：上面两样到底后发送缓冲仍持续超标（上行真不够，不是单纯码率超峰值）→
+ *   QP 上限一步放到 [JAM_QP]（I 帧一起放，引擎处理），码率再降到最低 [JAM_RATE_MIN]%。
+ *   上行被视频挤满时 WebSocket 心跳/指令也过不去（PC 显示码率 0、调不了参数），拥塞久了 SRT 也会断。
  * - **平稳**：实际码率 ≤ 80% 峰值且发送缓冲 < 15% latency，连续 recoverSec 秒 → 撤销最近一步（后做的先撤）。
  */
 internal class SdPeakController {
+    companion object {
+        const val JAM_QP = 45
+        const val JAM_RATE_MIN = 20
+    }
+
     sealed class Step {
         data class Qp(val from: Int, val to: Int) : Step()
         data class Rate(val fromPct: Int, val toPct: Int) : Step()
@@ -66,12 +74,18 @@ internal class SdPeakController {
             val s: Step? = when {
                 qpRuntime && curPMax < p.qpCeil -> Step.Qp(curPMax, minOf(p.qpCeil, curPMax + p.qpStep))
                 ratePct > 50 -> Step.Rate(ratePct, ratePct - 10)
+                bufOver && qpRuntime && curPMax < maxOf(JAM_QP, p.qpCeil) -> Step.Qp(curPMax, maxOf(JAM_QP, p.qpCeil))
+                bufOver && ratePct > JAM_RATE_MIN -> Step.Rate(ratePct, ratePct - 10)
                 else -> null
             }
-            if (s == null) return Result(null, true, "$why（已到 QP 上限 ${p.qpCeil} 且码率 50%，无可再降）")
+            if (s == null) {
+                val floor = if (bufOver) "QP 上限 ${maxOf(JAM_QP, p.qpCeil)} 且码率 ${JAM_RATE_MIN}%" else "QP 上限 ${p.qpCeil} 且码率 50%"
+                return Result(null, true, "$why（已到 $floor，无可再降）")
+            }
+            val jam = (s is Step.Rate && ratePct <= 50) || (s is Step.Qp && s.to > p.qpCeil)
             apply(s)
             steps.addLast(s)
-            return Result(s, true, "$why 连续${p.holdSec}s")
+            return Result(s, true, "$why 连续${p.holdSec}s" + (if (jam) "，上行不够 → 拥塞保护" else ""))
         }
         if (calmSec >= p.recoverSec && steps.isNotEmpty()) {
             calmSec = 0
