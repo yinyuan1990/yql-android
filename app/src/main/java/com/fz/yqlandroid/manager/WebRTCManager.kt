@@ -21,8 +21,9 @@ enum class LadderProfile {
     STANDARD,   // 高清   (4:3)
     HIGH,       // 超清   (4:3)
     ULTRA,      // 超高帧 (16:9)
-    P4K,        // 超高清 (4:3)
-    SRT2K,      // 2K 2560x1440（仅 SRT直推，SRT全码专属；WebRTC 模式无此档 → 按 P4K）
+    P4K,        // 超高清 1920×1080 (16:9)（10-22 起，原 1920×1440）
+    P1440,      // 第 5 级「超超高帧」1920×1440 (4:3)（名字总后台可改）；部分机型给不了 1920×1440 会就近退到 1920×1080
+    SRT2K,      // 2K 2560x1440（仅 SRT直推，SRT全码专属；WebRTC 模式无此档 → 按 P1440）
     SRT4K       // 4K 3840x2160（同上）
 }
 
@@ -461,7 +462,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     // 🔥 与iOS一致的4档“目标分辨率”（3个4:3 + 1个16:9）
     //    Android 分辨率与iOS不同，按“就近原则”选设备最接近的分辨率直接采集（不缩放，与iOS getCaptureResolutionForProfile一致）
     private val iosTargets = mapOf(
-        LadderProfile.P4K to Triple(1920, 1440, false),      // 超高清 4:3
+        LadderProfile.P1440 to Triple(1920, 1440, false),    // 超超高帧 4:3（第 5 级）
+        LadderProfile.P4K to Triple(1920, 1080, true),       // 超高清 16:9（10-22 起 1920×1080）
         LadderProfile.HIGH to Triple(1440, 1080, false),     // 超清   4:3
         LadderProfile.STANDARD to Triple(1024, 768, false),  // 高清   4:3
         LadderProfile.ULTRA to Triple(1280, 720, true),      // 超高帧 16:9
@@ -511,6 +513,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             return minOf(want, sizeMaxFps[size] ?: maxFps, maxFps).coerceAtLeast(1)
         }
         
+        val p1440Cap = nearest(LadderProfile.P1440)
         val p4kCap = nearest(LadderProfile.P4K)
         val highCap = nearest(LadderProfile.HIGH)
         val stdCap = nearest(LadderProfile.STANDARD)
@@ -519,6 +522,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
         // ⭐ §77 各档码率：后端下发优先，未配置时用 LadderConfigStore 内置默认
         //   （2026-08-18 内置默认各档 max 统一 +1500，min 保持 60%）
+        val cfgP1440 = LadderConfigStore.entryOf(LadderProfile.P1440)
         val cfgP4k = LadderConfigStore.entryOf(LadderProfile.P4K)
         val cfgHigh = LadderConfigStore.entryOf(LadderProfile.HIGH)
         val cfgUltra = LadderConfigStore.entryOf(LadderProfile.ULTRA)
@@ -556,10 +560,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             LadderProfile.LOW to lowPreset,
             // ⭐ §77：码率取自 LadderConfigStore（后端下发 > 内置默认）。
             //   内置默认 2026-08-18 各档 max +1500：P4K 5500 / HIGH·ULTRA 5000 / STANDARD 4500 / LOW 3000
+            LadderProfile.P1440 to LadderPreset(
+                width = p1440Cap.width, height = p1440Cap.height,
+                fps = fpsFor(p1440Cap, LadderProfile.P1440), maxKbps = cfgP1440.maxKbps, minKbps = cfgP1440.minKbps,
+                maxPushFps = 60, scaleDown = 1.0, is16x9 = false
+            ),
             LadderProfile.P4K to LadderPreset(
                 width = p4kCap.width, height = p4kCap.height,
                 fps = fpsFor(p4kCap, LadderProfile.P4K), maxKbps = cfgP4k.maxKbps, minKbps = cfgP4k.minKbps,
-                maxPushFps = 60, scaleDown = 1.0, is16x9 = false
+                maxPushFps = 60, scaleDown = 1.0, is16x9 = true
             ),
             LadderProfile.HIGH to LadderPreset(
                 width = highCap.width, height = highCap.height,
@@ -777,6 +786,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     private fun profileName(profile: LadderProfile): String = when (profile) {
         LadderProfile.P4K -> "超高清(p4k)"
+        LadderProfile.P1440 -> "超超高帧(p1440)"
         LadderProfile.SRT2K -> "2K(srt2k)"
         LadderProfile.SRT4K -> "4K(srt4k)"
         LadderProfile.ULTRA -> "超高帧(ultra)"
@@ -1160,6 +1170,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         LadderProfile.HIGH -> "high"
         LadderProfile.ULTRA -> "ultra"
         LadderProfile.P4K -> "p4k"
+        LadderProfile.P1440 -> "p1440"
         LadderProfile.SRT2K -> "srt2k"
         LadderProfile.SRT4K -> "srt4k"
     }
@@ -2847,8 +2858,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             "type" -> {
                 val type = config["type"] as? String ?: ""
                 val profile = when (type.lowercase()) {
-                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P4K
-                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P4K
+                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P1440
+                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P1440
+                    "p1440" -> LadderProfile.P1440
                     "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH

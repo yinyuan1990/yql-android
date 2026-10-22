@@ -134,6 +134,7 @@ fun StreamingScreen(
     var srtDailyFreeGb by remember { mutableStateOf(0f) }
     var srtRateGbh by remember { mutableStateOf(0.0) }   // 当前每小时消耗 GB（档位 × 清晰度；0 = 不耗流量）
     var srtClarityPct by remember { mutableStateOf(0) }
+    var level5Name by remember { mutableStateOf("超超高帧") }   // 第 5 级 / 1920×1440 档名字（总后台可改）
     // ⭐ 需求#13（2026-07-31）：版本更新软提示（登录响应最新版本 ≠ 本地 versionName → 推流页进入时弹一次）
     var showUpdatePrompt by remember { mutableStateOf(false) }
     var updatePromptText by remember { mutableStateOf("") }
@@ -225,6 +226,7 @@ fun StreamingScreen(
                     selectedProfile = when (type.lowercase()) {
                         "srt2k" -> "2K"
                         "srt4k" -> "4K"
+                        "p1440" -> level5Name
                         "p4k", "4k" -> "超高清"
                         "ultra" -> "超高帧"
                         "high" -> "超清"
@@ -378,6 +380,7 @@ fun StreamingScreen(
             val profile = WebRTCManager.effectiveSrtProfile
             val currentGbh = p.getFloat("srt_current_gbh", -1f)
             srtClarityPct = p.getInt("srt_clarity_pct", 0)
+            level5Name = p.getString("level5_name", null)?.takeIf { it.isNotBlank() } ?: "超超高帧"
             srtRateGbh = try {
                 if (profile.isEmpty()) 0.0
                 else if (currentGbh >= 0f) currentGbh.toDouble()
@@ -405,6 +408,7 @@ fun StreamingScreen(
         selectedProfile = when (config.type.lowercase()) {
             "srt2k" -> "2K"
             "srt4k" -> "4K"
+            "p1440" -> level5Name
             "p4k", "4k" -> "超高清"
             "ultra" -> "超高帧"
             "high" -> "超清"
@@ -1012,8 +1016,10 @@ fun StreamingScreen(
                         //   等级1 高清会员 → 超低网+高清；等级2 → +超清；等级3 → +超高清；等级4 → 全部。
                         // ⭐ 2026-08-01 用户要求：主页档位「超高清」「超高帧」互换**显示位置**（名称/等级映射不变：
                         //   超高清仍=level3、超高帧仍=level4，只是列表顺序把两者对调）
-                        listOf("超低网", "高清", "超清", "超高帧", "超高清").forEach { name ->
+                        // 10-22：第 5 级「超超高帧」（1920×1440，名字总后台可改）放最前，等级 5 才标绿
+                        listOf(level5Name, "超低网", "高清", "超清", "超高帧", "超高清").forEach { name ->
                             val requiredLevel = when (name) {
+                                level5Name -> 5
                                 "超低网", "高清" -> 1
                                 "超清" -> 2
                                 "超高清" -> 3          // 名称/等级不变

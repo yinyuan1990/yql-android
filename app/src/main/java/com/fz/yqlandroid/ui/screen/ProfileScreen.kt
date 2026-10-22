@@ -141,10 +141,11 @@ fun ProfileScreen(
     val activated = tokenPrefs.getBoolean("activated", false)
     val activationLevel = tokenPrefs.getInt("activation_level", 0)
     val levelText = if (!activated) "试用用户" else when (activationLevel) {
+        5 -> (tokenPrefs.getString("level5_name", null)?.takeIf { it.isNotBlank() } ?: "超超高帧")   // 第 5 级，名字总后台可改
         4 -> "超高清"; 3 -> "超高帧"; 2 -> "超清"; 1 -> "高清"; else -> "试用用户"
     }
     val levelColor = if (!activated) Color(0xFF808080) else when (activationLevel) {
-        4 -> Color(0xFFFF6B00); 3 -> Color(0xFFFFD700); 2 -> Color(0xFF007AFF); 1 -> Color(0xFF34C759); else -> Color(0xFF808080)
+        5 -> Color(0xFFE91E63); 4 -> Color(0xFFFF6B00); 3 -> Color(0xFFFFD700); 2 -> Color(0xFF007AFF); 1 -> Color(0xFF34C759); else -> Color(0xFF808080)
     }
     
     // 退出登录确认

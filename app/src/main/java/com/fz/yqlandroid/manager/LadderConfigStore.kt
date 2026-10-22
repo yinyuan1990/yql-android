@@ -37,6 +37,7 @@ object LadderConfigStore {
 
     /** 后台 JSON 里的档位名（与 iOS、后端三方约定一致，别改） */
     const val P4K = "p4k"
+    const val P1440 = "p1440"
     const val HIGH = "high"
     const val ULTRA = "ultra"
     const val STANDARD = "standard"
@@ -47,7 +48,8 @@ object LadderConfigStore {
      * w/h = 目标分辨率（就近匹配的锚点），fps=0 表示不指定（由 desiredFps + 设备能力决定）。
      */
     private val DEFAULTS: Map<String, Entry> = mapOf(
-        P4K to Entry(1920, 1440, 0, 5500, 3300),
+        P1440 to Entry(1920, 1440, 0, 5500, 3300),   // 第 5 级「超超高帧」（原 p4k 的值）
+        P4K to Entry(1920, 1080, 0, 5000, 3000),     // 10-22 起 1920×1080
         HIGH to Entry(1440, 1080, 0, 5000, 3000),
         ULTRA to Entry(1280, 720, 0, 5000, 3000),
         STANDARD to Entry(1024, 768, 0, 4500, 2700),
@@ -97,7 +99,7 @@ object LadderConfigStore {
             val root = JSONObject(json)
             remoteCaptureFps = root.optInt("captureFps", 0).coerceIn(0, 240)
             val parsed = mutableMapOf<String, Entry>()
-            for (name in listOf(P4K, HIGH, ULTRA, STANDARD, LOW)) {
+            for (name in listOf(P1440, P4K, HIGH, ULTRA, STANDARD, LOW)) {
                 val o = root.optJSONObject(name) ?: continue
                 val def = DEFAULTS[name]!!
                 // 逐字段兜底：后端缺项/给 0 就用默认值那一项
@@ -130,7 +132,8 @@ object LadderConfigStore {
     fun entryOf(name: String): Entry = remote[name] ?: DEFAULTS[name] ?: DEFAULTS[STANDARD]!!
 
     fun nameOf(profile: LadderProfile): String = when (profile) {
-        LadderProfile.P4K, LadderProfile.SRT2K, LadderProfile.SRT4K -> P4K
+        LadderProfile.P4K -> P4K
+        LadderProfile.P1440, LadderProfile.SRT2K, LadderProfile.SRT4K -> P1440
         LadderProfile.HIGH -> HIGH
         LadderProfile.ULTRA -> ULTRA
         LadderProfile.STANDARD -> STANDARD

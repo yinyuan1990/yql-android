@@ -601,6 +601,8 @@ class WebSocketManager private constructor() {
             (msgDict["srtFull"] as? Boolean)?.let { putBoolean("srt_full", it) }
             (msgDict["srtPoints"] as? Number)?.let { putLong("srt_points", it.toLong()) }
             (msgDict["srtTrafficFree"] as? Boolean)?.let { putBoolean("srt_traffic_free", it) }
+            // 第 5 级（超超高帧 = 1920×1440 档）名字，总后台可改
+            (msgDict["level5Name"] as? String)?.takeIf { it.isNotBlank() }?.let { putString("level5_name", it) }
             (msgDict["srtDailyFreeGb"] as? Number)?.let { putFloat("srt_daily_free_gb", it.toFloat()) }
             (msgDict["srtTrafficRates"] as? Map<*, *>)?.let { putString("srt_traffic_rates", org.json.JSONObject(it).toString()) }
             // 当前档位按清晰度折算后的每小时消耗（档位每小时 × 清晰度 10% 一档）
@@ -739,7 +741,9 @@ class WebSocketManager private constructor() {
             // ⭐ SRT全码/剩余流量：从 prefs（后端 TryDisconnect 下发时存入）回填进 state，
             //   随 CONFIG_STATE 透传给 PC（新版 PC 直接读后端 TryDisconnect，这里给老版 PC 用）
             "srtFull" to (tokenPrefs?.getBoolean("srt_full", false) ?: false),
-            "srtPoints" to (tokenPrefs?.getLong("srt_points", 0L) ?: 0L)
+            "srtPoints" to (tokenPrefs?.getLong("srt_points", 0L) ?: 0L),
+            // 支持第 5 级档位 p1440（1920×1440）：PC 据此才显示该档按钮（老版本 App 不认 p1440）
+            "supportsP1440" to true
         )
         
         val payload = mapOf(
