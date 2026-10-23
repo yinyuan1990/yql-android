@@ -2858,9 +2858,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             "type" -> {
                 val type = config["type"] as? String ?: ""
                 val profile = when (type.lowercase()) {
-                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P1440
-                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P1440
-                    "p1440" -> LadderProfile.P1440
+                    // SRT码档（1920×1440 / 2K / 4K）只在 SRT直推有；SRS 没有这几档 → 按超高清 1920×1080
+                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P4K
+                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P4K
+                    "p1440" -> if (srtDirectMode) LadderProfile.P1440 else LadderProfile.P4K
                     "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH

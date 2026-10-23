@@ -1023,10 +1023,10 @@ fun StreamingScreen(
                         //   等级1 高清会员 → 超低网+高清；等级2 → +超清；等级3 → +超高清；等级4 → 全部。
                         // ⭐ 2026-08-01 用户要求：主页档位「超高清」「超高帧」互换**显示位置**（名称/等级映射不变：
                         //   超高清仍=level3、超高帧仍=level4，只是列表顺序把两者对调）
-                        // 10-22：第 5 级「超超高帧」（1920×1440，名字总后台可改）放最前，等级 5 才标绿
-                        listOf(level5Name, "超低网", "高清", "超清", "超高帧", "超高清").forEach { name ->
+                        // 10-23：1920×1440（「超超高帧」，名字总后台可改）是 SRT码档：只有 SRT直推显示，开通原画质（SRT全码）才标绿；SRS 没有这一档
+                        (if (srtDirect) listOf(level5Name) else emptyList<String>())
+                            .plus(listOf("超低网", "高清", "超清", "超高帧", "超高清")).forEach { name ->
                             val requiredLevel = when (name) {
-                                level5Name -> 5
                                 "超低网", "高清" -> 1
                                 "超清" -> 2
                                 "超高清" -> 3          // 名称/等级不变
@@ -1035,7 +1035,7 @@ fun StreamingScreen(
                             QualityRadioItem(
                                 name = name,
                                 isSelected = selectedProfile == name,
-                                unlocked = memberActivated && memberLevel >= requiredLevel,
+                                unlocked = if (name == level5Name && srtDirect) srtFull else memberActivated && memberLevel >= requiredLevel,
                                 modifier = Modifier.weight(1f),   // 五档等分，窄屏也放得下
                                 onClick = { } // 仅显示，不操作
                             )
