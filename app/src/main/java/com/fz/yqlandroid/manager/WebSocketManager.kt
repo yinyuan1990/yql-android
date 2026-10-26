@@ -718,6 +718,8 @@ class WebSocketManager private constructor() {
             "srtPlayPort" to (if (connectstype == 3) srtPlayPort else 0),
             // SRT直推当前档位：后端 SrtPointsService 按它查该档位每小时消耗，按分钟扣流量
             "profile" to (if (connectstype == 3) WebRTCManager.effectiveSrtProfile else ""),
+            // 当前档位（任何模式）：PC 档位显示跟它走（登录 / 没 PC 在线时手机自己回超低网）
+            "curType" to WebRTCManager.currentTypeKey,
             "deviceType" to mapOf(
                 "os" to "Android ${Build.VERSION.RELEASE}",
                 "model" to "${Build.MANUFACTURER} ${Build.MODEL}"
