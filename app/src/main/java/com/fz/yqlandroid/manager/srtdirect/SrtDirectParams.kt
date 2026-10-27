@@ -12,7 +12,7 @@ import org.json.JSONObject
  * { presets: { low|standard|high|ultra|p4k: {width,height,fps,bitrateKbps, …可选覆盖任意全局键} },
  *   bitrateMode:1(VBR)/2(CBR), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
  *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization,
- *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }
+ *   sharpness(边缘锐化 0~1，可不填 = 相机默认), noiseReduction(降噪 0~1，可不填 = 相机默认) }
  * ```
  * 档位里可再带 `peakKbps/latencyMs/gopSec/qp*` 等，覆盖全局值（如 4K 档峰值 24000、延迟 1000）。
  */
@@ -124,6 +124,14 @@ object SrtDirectParams {
         if (!override.has("sharpness") || override.isNull("sharpness")) return null
         val v = override.optDouble("sharpness", Double.NaN)
         return if (v.isNaN()) null else v.toFloat().coerceIn(0f, 1f)
+    }
+
+    /** 单帧降噪 0~1（总后台「参数设置」/ PC「SRT设置」，没配 = null，用相机默认）；安卓映射到 Camera2 NOISE_REDUCTION_MODE */
+    fun noiseReduction(ctx: Context): Float? {
+        load(ctx)
+        if (!override.has("noiseReduction") || override.isNull("noiseReduction")) return null
+        val v = override.optDouble("noiseReduction", Double.NaN)
+        return if (v.isNaN() || v < 0) null else v.toFloat().coerceIn(0f, 1f)   // PC「默认」发 -1
     }
 
     /** 登录下发的 srtServer {host, port} */

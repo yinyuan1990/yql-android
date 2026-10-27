@@ -3294,6 +3294,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         st["sharpness"] = effectiveSharpness()   // PC「边缘锐化」滑条按手机实际值摆（null = 相机默认）
         // §148 PC「SRT设置」档位按钮上显示各档的生效分辨率/帧率/码率（总后台「SRT管理→参数设置」能改，PC 自己不知道）
         val ctx = srtCtx()
+        st["noiseReduction"] = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.noiseReduction(ctx)   // null = 相机默认
         st["presets"] = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.PROFILES.associateWith { k ->
             val p = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.plan(ctx, k)
             mapOf("width" to p.width, "height" to p.height, "fps" to p.fps, "kbps" to p.bitrateKbps)
@@ -3345,7 +3346,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             antiBanding50Hz = antiFlickerEnabled,
             // §129/§134 SRT 模式关 OIS/EIS（silu 同款；SRT直推引擎按 srtParams.disableStabilization 再覆盖）；WebRTC 模式不变
             disableStabilization = srtPublisher != null || srtEngine != null,
-            sharpness = effectiveSharpness()
+            sharpness = effectiveSharpness(),
+            noiseReduction = if (srtDirectMode) com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.noiseReduction(srtCtx()) else null
         )
     }
 
