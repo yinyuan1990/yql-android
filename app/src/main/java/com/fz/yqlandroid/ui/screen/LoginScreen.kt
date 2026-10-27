@@ -62,9 +62,11 @@ fun LoginScreen(
     var password by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var rememberPassword by remember { mutableStateOf(false) }
-    // 推流方式："srs" = 原 WebRTC（SRS/P2P，默认）；"srt" = SRT直推（MediaMTX，与 srtapp 同一套 srtdirect）。
-    //   选择存 login_prefs（登出不清），登录成功时写 token_prefs.force_webrtc
-    var publishMode by remember { mutableStateOf("srs") }
+    // 推流方式："srt" = SRT直推（MediaMTX，与 srtapp 同一套 srtdirect）= 「登录」按钮；
+    //   "srs" = 原 WebRTC（SRS/P2P）= 左上角「老版本登录」。存 login_prefs，登录成功时写 token_prefs.force_webrtc
+    var publishMode by remember { mutableStateOf("srt") }
+    // 左上角「老版本登录」在登录表单外面，点击时调表单里定义的登录流程
+    var loginWithMode: (String) -> Unit = {}
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     // ⭐ §68 登录失败弹框（服务端失败原因；设备不匹配时后端已拼上"当前设备对应的账号"）
@@ -99,7 +101,6 @@ fun LoginScreen(
         val savedUsername = prefs.getString("username", "") ?: ""
         val savedPassword = prefs.getString("password", "") ?: ""
         val savedRemember = prefs.getBoolean("remember", false)
-        publishMode = if (prefs.getString("publish_mode", "srs") == "srt") "srt" else "srs"
         
         if (savedRemember && savedUsername.isNotEmpty()) {
             username = savedUsername
@@ -288,42 +289,7 @@ fun LoginScreen(
                         )
                     }
 
-                    HorizontalDivider(
-                        modifier = Modifier.padding(start = 30.dp),
-                        color = Color(0xFFF0F0F0)
-                    )
-
-                    // 推流方式：SRS（默认）/ SRT
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(text = "推流方式", fontSize = 16.sp, color = Color(0xFF1A1A1A))
-                        Spacer(modifier = Modifier.weight(1f))
-                        listOf("srs" to "SRS", "srt" to "SRS直推").forEach { (mode, label) ->
-                            val selected = publishMode == mode
-                            Box(
-                                modifier = Modifier
-                                    .padding(start = 8.dp)
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(if (selected) Color(0xFF65AEF7) else Color.Transparent)
-                                    .border(1.dp, if (selected) Color(0xFF65AEF7) else Color(0xFFB3B3B3), RoundedCornerShape(14.dp))
-                                    .clickable { publishMode = mode }
-                                    .padding(horizontal = 18.dp, vertical = 5.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = label,
-                                    fontSize = 14.sp,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (selected) Color.White else Color(0xFF666666)
-                                )
-                            }
-                        }
-                    }
-                    
+                    // 推流方式不在表单里选：「登录」= SRT直推，左上角「老版本登录」= SRS
                     // ⭐ §53.4-定稿（2026-07-28）：原「连接方式(多人/单人线路)」与「H264/H265 编码」
                     //   两组选项已移除。线路 = 推流前按"与观看端是否同 WiFi"自动决定（同 WiFi 才 P2P，
                     //   否则 SRS）；编码 = 总后台配置（默认 H265，本机硬编或观看端内核不支持则回退 H264）。
@@ -547,19 +513,20 @@ fun LoginScreen(
                     }
             }
 
-            Button(
-                onClick = {
-                    if (username.isBlank() || password.isBlank()) {
-                        errorMessage = "请输入账号和密码"
-                        return@Button
-                    }
+            // mode："srt" =「登录」，"srs" = 左上角「老版本登录」
+            loginWithMode = { mode ->
+                if (username.isBlank() || password.isBlank()) {
+                    errorMessage = "请输入账号和密码"
+                } else {
+                    publishMode = mode
                     // ⭐ §130 登录前查推流要用的权限：没开就先弹引导（必需项开齐才放行，建议项可跳过）
-                    if (LoginPermissionCheck.shouldShowGuide(context)) {
-                        showPermissionGuide = true
-                        return@Button
-                    }
-                    performLogin()
-                },
+                    if (LoginPermissionCheck.shouldShowGuide(context)) showPermissionGuide = true
+                    else performLogin()
+                }
+            }
+
+            Button(
+                onClick = { loginWithMode("srt") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp),
@@ -652,6 +619,18 @@ fun LoginScreen(
                         }
                     }
             )
+        }
+
+        // 左上角「老版本登录」：同一套账号密码，走 SRS（原 WebRTC）
+        TextButton(
+            onClick = { loginWithMode("srs") },
+            enabled = !isLoading,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .statusBarsPadding()
+                .padding(start = 6.dp, top = 4.dp)
+        ) {
+            Text(text = "老版本登录", fontSize = 14.sp, color = Color(0xFF65AEF7), fontWeight = FontWeight.Medium)
         }
     }
 
