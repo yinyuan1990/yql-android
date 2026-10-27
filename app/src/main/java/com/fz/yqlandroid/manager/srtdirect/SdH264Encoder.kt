@@ -141,6 +141,8 @@ internal class SdH264Encoder(
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         f.setInteger(MediaFormat.KEY_BIT_RATE, cfg.bitrateKbps * 1000)
         f.setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
+        // 相机 AE 区间没有正好 [fps,fps] 时会跑更高的固定档（20→[24,24]、25→[30,30]），输入 Surface 按 fps 均匀丢帧
+        if (Build.VERSION.SDK_INT >= 29) f.setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, cfg.fps.toFloat())
         if (Build.VERSION.SDK_INT >= 25) {
             f.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, cfg.gopSec.toFloat())
         } else {

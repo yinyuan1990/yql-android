@@ -621,7 +621,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         if (srtDirectMode) {
             currentProfile = profile
             val plan = srtPlan()
-            currentFps = minOf(plan.fps, targetOutputFps).coerceAtLeast(1)
+            currentFps = srtPushFps(plan)
             currentBitrateKbps = plan.bitrateKbps
             currentMinBitrateKbps = plan.bitrateKbps
             currentWidth = plan.width
@@ -1188,11 +1188,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     private fun srtPlan(): com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.Plan =
         com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.plan(srtCtx(), srtProfileKey(currentProfile))
 
-    /** 推送帧率 = min(档位 fps, PC 设定)；码率 = 档位码率 × PC 清晰度% */
+    /** 切档 / 后台改参 / 重置时的推送帧率：min(档位 fps, PC 设定)；防频闪开启时保持防频闪帧率 */
+    private fun srtPushFps(plan: com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.Plan): Int =
+        (if (antiFlickerEnabled) minOf(targetOutputFps, thermalFpsCap) else minOf(plan.fps, targetOutputFps)).coerceAtLeast(1)
+
+    /** 推送帧率 = min(档位 fps, PC 设定)，防频闪开启时按防频闪帧率（不受档位 fps 封顶）；码率 = 档位码率 × PC 清晰度% */
     private fun srtVideoReq(): com.fz.yqlandroid.manager.srtdirect.SrtDirectEngine.VideoReq {
         val plan = srtPlan()
         effectiveSrtProfile = plan.profile
-        val fps = minOf(currentFps, plan.fps).coerceAtLeast(1)
+        val fps = (if (antiFlickerEnabled) currentFps else minOf(currentFps, plan.fps)).coerceAtLeast(1)
         val kbps = (plan.bitrateKbps * _currentQualityPercent / 100).coerceAtLeast(300)
         return com.fz.yqlandroid.manager.srtdirect.SrtDirectEngine.VideoReq(plan, fps, kbps)
     }
@@ -2472,6 +2476,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             val fps = flickerSafeFps(minOf(want, deviceMaxCaptureFps()))
             setPushFps(fps, "防频闪(${serverFps}÷4)")
         }
+        // SRT直推：防频闪帧率不受档位 fps 封顶，开 / 关都按新帧率换编码器 + 钉 AE 区间
+        if (srtEngine != null) applySrtEncoding(if (enabled) "防频闪开启" else "防频闪关闭")
         ensureCaptureFps(if (enabled) "防频闪开启" else "防频闪关闭")
         applyCameraParams()
         Log.d("meidui", "🔦 [防频闪] ${if (enabled) "开启" else "关闭"} 请求=${serverFps}÷4 推送=${currentFps}fps " +
@@ -3039,7 +3045,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 _srtShutterNs = 0L; _srtIso = 0; _srtExposureEv = 0f
                 setZoom(1.0f)
                 val plan = srtPlan()
-                currentFps = minOf(plan.fps, targetOutputFps).coerceAtLeast(1)
+                currentFps = srtPushFps(plan)
                 currentBitrateKbps = plan.bitrateKbps
                 applySrtEncoding("PC恢复默认")
                 if (!applyCameraParams()) applyCameraParamsWithRetry("PC恢复默认曝光注入失败重试")
@@ -3107,7 +3113,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 if (srtDirectMode) {
                     // 档位码率/帧率可能变了：按新档位值重算（推送帧率仍受 PC 设定封顶）
                     val plan = srtPlan()
-                    currentFps = minOf(plan.fps, targetOutputFps).coerceAtLeast(1)
+                    currentFps = srtPushFps(plan)
                     currentBitrateKbps = plan.bitrateKbps
                     applySrtEncoding("后台改参")
                     applyCameraParams()   // 防抖开关可能变了
