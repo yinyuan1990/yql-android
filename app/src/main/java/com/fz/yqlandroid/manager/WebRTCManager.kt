@@ -3506,7 +3506,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      * 设置目标推送FPS
      * 后端下发的FPS需要除以4（与iOS一致）
      */
-    fun setTargetFps(backendFps: Int) = setPushFps(backendFps / 4, "后端set_fps(${backendFps}÷4)")
+    fun setTargetFps(backendFps: Int) {
+        // SRT直推防频闪开着：推送帧率按防频闪走，PC 发的 fps（切档补发 / 档位上限）不覆盖
+        if (srtEngine != null && antiFlickerEnabled) {
+            srtLogIgnoredOnce("fps", backendFps, "🔦 防频闪开启中，忽略 fps=$backendFps（推送保持 ${currentFps}fps）")
+            return
+        }
+        setPushFps(backendFps / 4, "后端set_fps(${backendFps}÷4)")
+    }
 
     /**
      * 推送帧率落地（**推送口径真实值，不再 ÷4**）。
