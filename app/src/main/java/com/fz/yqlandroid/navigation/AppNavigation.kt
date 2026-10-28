@@ -1,9 +1,17 @@
 package com.fz.yqlandroid.navigation
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
@@ -109,6 +117,29 @@ fun AppNavHost(
     navController: NavHostController = rememberNavController(),
     appViewModel: AppViewModel = viewModel()
 ) {
+    // 推流页画在 NavHost 底下：从推流页进个人中心 / 改密码 / 关于 / 留言 / 绑定列表时推流页不销毁
+    //   （销毁 = 停推流 + 断 WebSocket，PC 那边就掉线了），只是被盖住；去扫码（要用相机）、退出登录才销毁
+    val route = navController.currentBackStackEntryAsState().value?.destination?.route
+    val streamingKeptPrev = remember { mutableStateOf(false) }
+    val streamingKept = route == Screen.Streaming.route ||
+            (route != null && route in ROUTES_OVER_STREAMING && streamingKeptPrev.value)
+    SideEffect { streamingKeptPrev.value = streamingKept }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+    if (streamingKept) {
+        StreamingScreen(
+            appViewModel = appViewModel,
+            onLogout = {
+                appViewModel.logout()
+                navController.navigate(Screen.Login.route) {
+                    popUpTo(Screen.Streaming.route) { inclusive = true }
+                }
+            },
+            onNavigateToProfile = {
+                navController.navigate(Screen.Profile.route)
+            }
+        )
+    }
     NavHost(
         navController = navController,
         startDestination = Screen.Splash.route
@@ -163,24 +194,12 @@ fun AppNavHost(
             )
         }
         
-        // 推流页
-        composable(Screen.Streaming.route) {
-            StreamingScreen(
-                appViewModel = appViewModel,
-                onLogout = {
-                    appViewModel.logout()
-                    navController.navigate(Screen.Login.route) {
-                        popUpTo(Screen.Streaming.route) { inclusive = true }
-                    }
-                },
-                onNavigateToProfile = {
-                    navController.navigate(Screen.Profile.route)
-                }
-            )
-        }
+        // 推流页：内容画在 NavHost 底下（见上面 streamingKept），这里只占位
+        composable(Screen.Streaming.route) { }
         
         // 个人中心页
         composable(Screen.Profile.route) {
+            OverStreaming {
             ProfileScreen(
                 appViewModel = appViewModel,
                 onNavigateBack = {
@@ -210,10 +229,12 @@ fun AppNavHost(
                     }
                 }
             )
+            }
         }
 
         // 修改密码页
         composable(Screen.ChangePassword.route) {
+            OverStreaming {
             ChangePasswordScreen(
                 appViewModel = appViewModel,
                 onNavigateBack = {
@@ -226,22 +247,27 @@ fun AppNavHost(
                     }
                 }
             )
+            }
         }
 
         // 关于我们（本地隐私政策 HTML，对标 iOS LocalWebView）
         composable(Screen.AboutUs.route) {
+            OverStreaming {
             LocalWebViewScreen(
                 title = "关于我们",
                 assetFileName = "privacy_policy.html",
                 onNavigateBack = { navController.popBackStack() }
             )
+            }
         }
 
         // 问题反馈页
         composable(Screen.Message.route) {
+            OverStreaming {
             MessageScreen(
                 onNavigateBack = { navController.popBackStack() }
             )
+            }
         }
         
         // 扫码绑定页（from=login 为登录流程默认跳 Streaming；from=profile 为个人中心入口，成功后回 Profile）
@@ -284,9 +310,36 @@ fun AppNavHost(
 
         // 已绑定控制端列表页（对标 iOS BindingListView + UnbindView）
         composable(Screen.BindingList.route) {
+            OverStreaming {
             BindingListScreen(
                 onNavigateBack = { navController.popBackStack() }
             )
+            }
         }
+    }
+    }
+}
+
+/** 推流页上面这几页打开时推流页留在底下继续推 */
+private val ROUTES_OVER_STREAMING = setOf(
+    Screen.Profile.route, Screen.ChangePassword.route, Screen.AboutUs.route,
+    Screen.Message.route, Screen.BindingList.route,
+)
+
+/** 盖在推流页上的页面：吃掉所有触摸，点空白处不会点到底下推流页的按钮 */
+@Composable
+private fun OverStreaming(content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        awaitPointerEvent(PointerEventPass.Final).changes.forEach { it.consume() }
+                    }
+                }
+            }
+    ) {
+        content()
     }
 }
