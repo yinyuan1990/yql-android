@@ -224,10 +224,7 @@ fun StreamingScreen(
                 "type" -> {
                     val type = config["type"] as? String ?: ""
                     selectedProfile = when (type.lowercase()) {
-                        "srt2k" -> "2K"
-                        "srt4k" -> "4K"
-                        "p1440" -> level5Name
-                        "p4k", "4k" -> "超高清"
+                        "srt2k", "srt4k", "p1440", "p4k", "4k" -> "超高清"   // 金凤凰不支持 SRT码档，按 p4k 显示
                         "ultra" -> "超高帧"
                         "high" -> "超清"
                         "standard" -> "高清"
@@ -373,7 +370,7 @@ fun StreamingScreen(
     LaunchedEffect(Unit) {
         while (true) {
             val p = context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE)
-            srtFull = p.getBoolean("srt_full", false)
+            srtFull = false   // 金凤凰不支持 SRT全码（10-28）：不显示原画质 / 剩余流量
             srtTrafficMb = p.getLong("srt_points", 0L)
             srtTrafficFree = p.getBoolean("srt_traffic_free", false)
             srtDailyFreeGb = p.getFloat("srt_daily_free_gb", 0f)
@@ -406,10 +403,7 @@ fun StreamingScreen(
         config.focus?.let { focusValue = it }
         config.bitrate?.let { fluencyValue = it.toFloat() }
         selectedProfile = when (config.type.lowercase()) {
-            "srt2k" -> "2K"
-            "srt4k" -> "4K"
-            "p1440" -> level5Name
-            "p4k", "4k" -> "超高清"
+            "srt2k", "srt4k", "p1440", "p4k", "4k" -> "超高清"
             "ultra" -> "超高帧"
             "high" -> "超清"
             "low" -> "超低网"    // ⭐ 对齐 iOS 5 档：初始映射此前缺 low，登录后档位高亮错到「高清」
@@ -1023,9 +1017,8 @@ fun StreamingScreen(
                         //   等级1 高清会员 → 超低网+高清；等级2 → +超清；等级3 → +超高清；等级4 → 全部。
                         // ⭐ 2026-08-01 用户要求：主页档位「超高清」「超高帧」互换**显示位置**（名称/等级映射不变：
                         //   超高清仍=level3、超高帧仍=level4，只是列表顺序把两者对调）
-                        // 1920×1440（「超超高帧」，名字总后台可改）是 SRT码档：SRT直推且开通原画质（SRT全码）才显示，和 PC 一致；SRS 没有这一档
-                        (if (srtDirect && srtFull) listOf(level5Name) else emptyList<String>())
-                            .plus(listOf("超低网", "高清", "超清", "超高帧", "超高清")).forEach { name ->
+                        // 1920×1440（「超超高帧」）是 SRT码档，10-28 起金凤凰不支持，不显示
+                        listOf("超低网", "高清", "超清", "超高帧", "超高清").forEach { name ->
                             val requiredLevel = when (name) {
                                 "超低网", "高清" -> 1
                                 "超清" -> 2
@@ -1035,7 +1028,7 @@ fun StreamingScreen(
                             QualityRadioItem(
                                 name = name,
                                 isSelected = selectedProfile == name,
-                                unlocked = if (name == level5Name && srtDirect) srtFull else memberActivated && memberLevel >= requiredLevel,
+                                unlocked = memberActivated && memberLevel >= requiredLevel,
                                 modifier = Modifier.weight(1f),   // 五档等分，窄屏也放得下
                                 onClick = { } // 仅显示，不操作
                             )

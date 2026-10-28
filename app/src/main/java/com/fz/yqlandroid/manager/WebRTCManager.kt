@@ -2886,11 +2886,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             "type" -> {
                 val type = config["type"] as? String ?: ""
                 val profile = when (type.lowercase()) {
-                    // SRT码档（1920×1440 / 2K / 4K）只在 SRT直推有；SRS 没有这几档 → 按超高清 1920×1080
-                    "srt2k" -> if (srtDirectMode) LadderProfile.SRT2K else LadderProfile.P4K
-                    "srt4k" -> if (srtDirectMode) LadderProfile.SRT4K else LadderProfile.P4K
-                    "p1440" -> if (srtDirectMode) LadderProfile.P1440 else LadderProfile.P4K
-                    "p4k", "4k" -> LadderProfile.P4K
+                    // 10-28 起金凤凰不支持 SRT全码：SRT码档（1920×1440 / 2K / 4K）一律按超高清 1920×1080
+                    //   （要用这几档装 jfhcs / 健康养生）
+                    "srt2k", "srt4k", "p1440", "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH
                     // §21.28 超低网独立成档（PC 发 type="low"；此前落 else 与高清同档）

@@ -598,7 +598,8 @@ class WebSocketManager private constructor() {
             (msgDict["activationRemainingSeconds"] as? Number)?.let { putInt("activation_remaining_seconds", it.toInt()) }
             // ⭐ SRT全码 + 流量：后端随 TryDisconnect 下发，供推流页显示剩余流量/当前档位消耗/流量低提醒
             //   srtPoints = 剩余流量 MB（含每日赠送）；srtTrafficRates = 各档位每小时消耗 GB
-            (msgDict["srtFull"] as? Boolean)?.let { putBoolean("srt_full", it) }
+            // 金凤凰不支持 SRT全码（10-28）：不管后端怎么报都按没开通
+            putBoolean("srt_full", false)
             (msgDict["srtPoints"] as? Number)?.let { putLong("srt_points", it.toLong()) }
             (msgDict["srtTrafficFree"] as? Boolean)?.let { putBoolean("srt_traffic_free", it) }
             // 第 5 级（超超高帧 = 1920×1440 档）名字，总后台可改
@@ -742,10 +743,10 @@ class WebSocketManager private constructor() {
             "activationRemainingSeconds" to activationRemainingSeconds,
             // ⭐ SRT全码/剩余流量：从 prefs（后端 TryDisconnect 下发时存入）回填进 state，
             //   随 CONFIG_STATE 透传给 PC（新版 PC 直接读后端 TryDisconnect，这里给老版 PC 用）
-            "srtFull" to (tokenPrefs?.getBoolean("srt_full", false) ?: false),
+            "srtFull" to false,   // 金凤凰不支持 SRT全码（10-28）
             "srtPoints" to (tokenPrefs?.getLong("srt_points", 0L) ?: 0L),
-            // 支持第 5 级档位 p1440（1920×1440）：PC 据此才显示该档按钮（老版本 App 不认 p1440）
-            "supportsP1440" to true
+            // 不支持 1920×1440（SRT码档）：PC 据此不显示该档按钮
+            "supportsP1440" to false
         )
         
         val payload = mapOf(
