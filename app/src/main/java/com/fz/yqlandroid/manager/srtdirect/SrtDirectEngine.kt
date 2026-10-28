@@ -147,6 +147,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         post {
             val old = req
             req = r
+            if (old != null && old.plan.profile != r.plan.profile) { qpCapOffProfile = null; overTargetSec = 0 }
             if (!cameraRunning) return@post
             val enc = encoder
             val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
@@ -156,7 +157,8 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                     r.fps != enc.config.fps || r.plan.gopSec != enc.config.gopSec ||
                     r.plan.bitrateMode != enc.config.bitrateMode ||
                     r.plan.qpIMin != enc.config.qpIMin || r.plan.qpIMax != enc.config.qpIMax ||
-                    r.plan.qpPMin != enc.config.qpPMin || r.plan.qpPMax != enc.config.qpPMax
+                    r.plan.qpPMin != enc.config.qpPMin || r.plan.qpPMax != enc.config.qpPMax ||
+                    (qpCapOffProfile == r.plan.profile) != enc.config.noQp
             if (!need && old == r) return@post   // 同一条指令多处重复落地（切档后又同步码率等），无变化不动
             if (need) {
                 rebuildEncoder(id, r, reason)
@@ -250,12 +252,18 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
     private fun qpRuntimeOk(): Boolean =
         android.os.Build.VERSION.SDK_INT >= 31 && encoder?.qpConfigured == true
 
+    // 码率失控保护：高通等编码器守 QP 上限不守码率（复杂画面 1080P 目标 1.6M 实际 10~22M，清晰度拉到底也下不来）
+    //   → 实际码率连续 3s > 目标 2 倍，这一档去掉 QP 上下限重建编码器，之后只靠码率控制；换档恢复
+    @Volatile private var qpCapOffProfile: String? = null
+    private var overTargetSec = 0
+
     private fun encConfig(w: Int, h: Int, r: VideoReq) = SdH264Encoder.Config(
         width = w, height = h, fps = r.fps, bitrateKbps = r.kbps,
         bitrateMode = r.plan.bitrateMode,
         qpIMin = r.plan.qpIMin, qpIMax = r.plan.qpIMax,
         qpPMin = r.plan.qpPMin, qpPMax = r.plan.qpPMax,
         gopSec = r.plan.gopSec,
+        noQp = qpCapOffProfile == r.plan.profile,
     )
 
     /** 首次启动：请求尺寸 → 1080p → 720p 逐个试 */
@@ -285,7 +293,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         onEncoderReady(cameraId, enc, r)
         cam.switchEncoder(enc.inputSurface!!, effectiveControls()) { old?.stop() }
         SdLog.i("换编码器（$reason）$fromDesc → ${size.width}x${size.height}@${r.fps} 目标${r.kbps}kbps" +
-                " GOP${r.plan.gopSec}s QP I${r.plan.qpIMin}~${r.plan.qpIMax} P${r.plan.qpPMin}~${r.plan.qpPMax}（SRT 不断）")
+                " GOP${r.plan.gopSec}s QP ${if (enc.config.noQp) "不设（码率失控保护）" else "I${r.plan.qpIMin}~${r.plan.qpIMax} P${r.plan.qpPMin}~${r.plan.qpPMax}"}（SRT 不断）")
     }
 
     private fun onEncoderReady(cameraId: String, enc: SdH264Encoder, r: VideoReq) {
@@ -445,6 +453,26 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 }
                 SdLog.i("峰值控制 $peakMsg")
             }
+        }
+
+        if (enc != null && r != null && encAlive && enc.qpConfigured && !enc.config.noQp) {
+            val target = r.kbps * peak.ratePct / 100
+            overTargetSec = if (encKbps > target * 2 && encKbps > 1000) overTargetSec + 1 else 0
+            if (overTargetSec >= 3) {
+                overTargetSec = 0
+                val prof = r.plan.profile
+                SdLog.w("⚠️ 码率失控：实际 ${encKbps}kbps 连续 3s > 目标 ${target}kbps 的 2 倍（QP 上限挡住了码率控制）" +
+                        " → 档位 $prof 去掉 QP 上下限重建编码器，之后只靠码率")
+                post {
+                    val cur = req ?: return@post
+                    if (!cameraRunning || cur.plan.profile != prof) return@post
+                    qpCapOffProfile = prof
+                    val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
+                    rebuildEncoder(id, cur, "码率失控保护")
+                }
+            }
+        } else {
+            overTargetSec = 0
         }
 
         val line = buildString {
