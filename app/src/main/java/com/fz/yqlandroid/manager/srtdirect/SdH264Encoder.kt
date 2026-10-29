@@ -37,8 +37,6 @@ internal class SdH264Encoder(
         val qpPMin: Int,
         val qpPMax: Int,
         val gopSec: Int,
-        /** 不设 QP 上下限、只靠码率控制（码率失控保护） */
-        val noQp: Boolean = false,
     )
 
     companion object {
@@ -110,7 +108,6 @@ internal class SdH264Encoder(
     fun start() {
         var lastError: Throwable? = null
         for ((name, opts) in TIERS) {
-            if (cfg.noQp && opts and (OPT_QP or OPT_VENDOR_QP) != 0) continue
             val c = try { MediaCodec.createEncoderByType(MIME) } catch (t: Throwable) {
                 throw IllegalStateException("创建 H.264 编码器失败: ${t.message}", t)
             }
@@ -126,8 +123,7 @@ internal class SdH264Encoder(
                 qpConfigured = opts and OPT_QP != 0
                 SdLog.i("编码器就绪 ${c.name} 降级档[$name] ${cfg.width}x${cfg.height}@${cfg.fps} 目标${cfg.bitrateKbps}kbps" +
                         " ${if (cfg.bitrateMode == 2) "CBR" else "VBR"} GOP${cfg.gopSec}s" +
-                        " QP ${if (qpConfigured) "I${cfg.qpIMin}~${cfg.qpIMax} P${cfg.qpPMin}~${cfg.qpPMax}（已设进 configure）"
-                               else if (cfg.noQp) "不设（码率失控保护）" else "未设(编码器不认)"}")
+                        " QP ${if (qpConfigured) "I${cfg.qpIMin}~${cfg.qpIMax} P${cfg.qpPMin}~${cfg.qpPMax}（已设进 configure）" else "未设(编码器不认)"}")
                 return
             } catch (t: Throwable) {
                 lastError = t
@@ -232,7 +228,7 @@ internal class SdH264Encoder(
      * @return false = 系统版本不支持运行中改 QP（调用方改用降码率）
      */
     fun setPMaxQp(qpMax: Int): Boolean {
-        if (Build.VERSION.SDK_INT < 31 || cfg.noQp) return false
+        if (Build.VERSION.SDK_INT < 31) return false
         val c = codec ?: return false
         handler.post {
             try {
@@ -253,7 +249,7 @@ internal class SdH264Encoder(
 
     /** 运行中改 I 帧 QP 上限（拥塞保护用；同 [setPMaxQp]，Android 12+） */
     fun setIMaxQp(qpMax: Int): Boolean {
-        if (Build.VERSION.SDK_INT < 31 || cfg.noQp) return false
+        if (Build.VERSION.SDK_INT < 31) return false
         val c = codec ?: return false
         handler.post {
             try {
