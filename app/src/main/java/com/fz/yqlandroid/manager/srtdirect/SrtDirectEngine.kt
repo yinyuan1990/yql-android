@@ -148,6 +148,12 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             val old = req
             req = r
             if (old != null && old.plan.profile != r.plan.profile) { qpCapOffProfile = null; overTargetSec = 0 }
+            // PC 改了 QP：按新 QP 重建（码率又失控会再触发保护）
+            if (old != null && old.plan.profile == r.plan.profile && qpCapOffProfile != null &&
+                (old.plan.qpIMin != r.plan.qpIMin || old.plan.qpIMax != r.plan.qpIMax ||
+                        old.plan.qpPMin != r.plan.qpPMin || old.plan.qpPMax != r.plan.qpPMax)) {
+                qpCapOffProfile = null; overTargetSec = 0
+            }
             if (!cameraRunning) return@post
             val enc = encoder
             val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
@@ -212,6 +218,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             m["qpPMin"] = qc?.qpPMin ?: r.plan.qpPMin
             m["qpPMax"] = qc?.qpPMax ?: r.plan.qpPMax
             m["qpOk"] = enc?.qpConfigured ?: true
+            m["qpOff"] = enc?.config?.noQp ?: false   // 码率失控保护去掉了 QP 上下限
             m["qpAvg"] = enc?.statQp ?: -1
             m["qpPMaxNow"] = synchronized(peak) { peak.curPMax }
         }
