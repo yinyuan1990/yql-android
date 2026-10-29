@@ -114,6 +114,9 @@ internal class SdCameraSource(
     /** 会话实际出帧计数（采集 fps 统计用） */
     @Volatile var frameCount = 0L
         private set
+    private var lastPhysId: String? = null
+    private var physSwitches = 0
+    private var lastPhysLogMs = 0L
     @Volatile var previewDesc: String = "-"
         private set
     @Volatile var curExposureNs = 0L
@@ -173,11 +176,31 @@ internal class SdCameraSource(
                 lastAutoExposureNs = curExposureNs
                 lastAutoIso = curIso
             }
+            // 逻辑多摄（三星等）由 HAL 自己在主摄 / 超广角之间切：切的时候记一笔，每秒最多一行
+            val phys = if (android.os.Build.VERSION.SDK_INT >= 29)
+                result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) else null
+            if (phys != null) {
+                val prev = lastPhysId
+                if (prev != null && prev != phys) {
+                    physSwitches++
+                    val now = System.currentTimeMillis()
+                    if (now - lastPhysLogMs >= 1000) {
+                        lastPhysLogMs = now
+                        SdLog.i("📷 物理摄像头切换 $prev→$phys（累计 $physSwitches 次） 焦距=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)} " +
+                                "exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms iso=$curIso")
+                    }
+                }
+                lastPhysId = phys
+            }
             if (n % 150 == 0L) {
                 val durMs = curFrameDurNs / 1_000_000.0
                 SdLog.i("cam exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms frameDur=${"%.1f".format(durMs)}ms" +
                         "(≈${if (durMs > 0) (1000.0 / durMs).toInt() else -1}fps) aeRange=${request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)}" +
-                        " iso=$curIso aeMode=${result.get(CaptureResult.CONTROL_AE_MODE)} 预览=$previewDesc")
+                        " iso=$curIso aeMode=${result.get(CaptureResult.CONTROL_AE_MODE)}" +
+                        " af=${result.get(CaptureResult.CONTROL_AF_MODE)}/${result.get(CaptureResult.CONTROL_AF_STATE)}" +
+                        " 焦距=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { "%.2f".format(it) }}" +
+                        " 镜头=${result.get(CaptureResult.LENS_STATE)} 物理=${phys ?: "-"}（切$physSwitches）" +
+                        " 预览=$previewDesc")
             }
         }
     }

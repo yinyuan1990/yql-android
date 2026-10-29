@@ -330,11 +330,21 @@ object Camera2ParamApplier {
     }
 
     // ===== 对焦 =====
+    @Volatile private var lastFocusLog: String? = null
+
+    /** 对焦模式 / 焦距变了才写 SRT 日志（applyFocus 每次改任何相机参数都会跑） */
+    private fun logFocus(desc: String) {
+        if (desc == lastFocusLog) return
+        lastFocusLog = desc
+        com.fz.yqlandroid.manager.srtdirect.SdLog.i("🎯 对焦 $desc")
+    }
+
     private fun applyFocus(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
         try {
             // §104 自动对焦开关优先：开着就下连续 AF，focus 值不看
             if (p.autoFocus) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                logFocus("自动（PC 自动对焦开）")
                 return
             }
             val f = p.focus ?: return
@@ -342,12 +352,17 @@ object Camera2ParamApplier {
             if ((f == 0.5f && !p.focusManual) || minFocusDist <= 0f) {
                 // 连续自动对焦（老版本 PC 用 0.5 表示自动）
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                logFocus(if (minFocusDist <= 0f) "自动（定焦镜头，不能手动） focus=$f" else "自动（老版 PC focus=0.5）")
             } else {
                 // 手动对焦：1=远(0屈光度) 0=近(minFocusDist)。按 (1-f)² 换算：屈光度线性时 1 米到无穷远只占滑条最后 ~10%，
                 //   平方后约占 30%，远处调得更细（PC 安卓滑条显示 0~2.0，下发仍是 0~1）
                 val near = (1f - f).coerceIn(0f, 1f)
+                val dist = near * near * minFocusDist
                 b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
-                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, near * near * minFocusDist)
+                b.set(CaptureRequest.LENS_FOCUS_DISTANCE, dist)
+                val cm = if (dist > 0f) "≈${(100f / dist).toInt()}cm" else "无穷远"
+                logFocus("手动 focus=${"%.3f".format(f)}（PC 显示 ${"%.2f".format(f * 2)}） → 焦距 ${"%.2f".format(dist)} 屈光度 $cm" +
+                        "（最近 ${"%.2f".format(minFocusDist)} = ${"%.0f".format(100f / minFocusDist)}cm，占 ${(near * near * 100).toInt()}%）")
             }
         } catch (e: Exception) {
             Log.w(TAG, "focus 写入失败: ${e.message}")
