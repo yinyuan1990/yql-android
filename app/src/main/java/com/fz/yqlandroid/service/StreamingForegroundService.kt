@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import com.fz.yqlandroid.manager.srtdirect.SdLog
 
 /**
  * 🔊 推流前台服务（camera 类型）—— 后台推流断流的根治方案。
@@ -29,28 +30,59 @@ class StreamingForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        try {
-            val notification = buildNotification()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // API 30+：显式声明 camera|microphone 类型（34+ 强校验与 Manifest 声明一致）
-                startForeground(
-                    NOTIF_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
-            } else {
-                // API 24~29：普通前台服务即可让 App 保持「非后台」状态，相机不被断
-                startForeground(NOTIF_ID, notification)
+        val notification = try { buildNotification() } catch (e: Exception) {
+            fail("建通知失败", e)
+            return START_STICKY
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // API 30+：显式声明类型（34+ 强校验与 Manifest 声明一致）；
+            //   microphone 类型要求已授予录音权限，没给时退到只声明 camera，免得整个前台服务起不来
+            val tries = listOf(
+                "camera|microphone" to (ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE),
+                "camera" to ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA,
+            )
+            var lastErr: Exception? = null
+            for ((name, type) in tries) {
+                try {
+                    startForeground(NOTIF_ID, notification, type)
+                    markStarted(name)
+                    return START_STICKY
+                } catch (e: Exception) {
+                    lastErr = e
+                    SdLog.w("前台服务声明 $name 失败: ${e.javaClass.simpleName} ${e.message?.take(160)}")
+                }
             }
-            Log.d(TAG, "✅ 前台服务已启动（camera 保活）")
-        } catch (e: Exception) {
-            Log.e(TAG, "启动前台服务失败: ${e.message}")
+            fail("声明失败", lastErr)
+        } else {
+            // API 24~29：普通前台服务即可让 App 保持「非后台」状态，相机不被断
+            try {
+                startForeground(NOTIF_ID, notification)
+                markStarted("普通")
+            } catch (e: Exception) {
+                fail("声明失败", e)
+            }
         }
         return START_STICKY
     }
 
+    private fun markStarted(typeName: String) {
+        declareCount++
+        val actual = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) " 实际类型=0x${Integer.toHexString(foregroundServiceType)}" else ""
+        state = "运行中($typeName$actual 第${declareCount}次声明 ${timeNow()})"
+        Log.d(TAG, "✅ 前台服务已启动（camera 保活）$state")
+        SdLog.i("🛡️ 前台服务$state")
+    }
+
+    private fun fail(what: String, e: Exception?) {
+        state = "$what(${timeNow()}): ${e?.javaClass?.simpleName} ${e?.message?.take(160)}"
+        Log.e(TAG, "启动前台服务失败: $state")
+        SdLog.w("前台服务$state")
+    }
+
     override fun onDestroy() {
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+        state = "已停止(${timeNow()})"
         Log.d(TAG, "🔴 前台服务已停止")
         super.onDestroy()
     }
@@ -87,6 +119,14 @@ class StreamingForegroundService : Service() {
         private const val CHANNEL_ID = "streaming_keepalive"
         private const val NOTIF_ID = 1001
 
+        /** 最近一次声明 / 失败 / 停止的结果，进后台时写进 SRT 日志 */
+        @Volatile var state: String = "未启动"
+            private set
+        @Volatile private var declareCount = 0
+
+        private fun timeNow(): String =
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+
         fun start(context: Context) {
             val intent = Intent(context, StreamingForegroundService::class.java)
             try {
@@ -96,7 +136,9 @@ class StreamingForegroundService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
+                state = "启动请求失败(${timeNow()}): ${e.javaClass.simpleName} ${e.message?.take(160)}"
                 Log.e(TAG, "start 失败: ${e.message}")
+                SdLog.w("前台服务$state")
             }
         }
 

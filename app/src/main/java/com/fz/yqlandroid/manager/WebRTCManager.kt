@@ -1223,6 +1223,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
         override fun onCameraFirstFrame() {
             cameraDead = false
+            captureRecoveryFails = 0
         }
     }
 
@@ -2558,6 +2559,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             override fun onCameraOpening(name: String?) { cameraDead = false }
             override fun onFirstFrameAvailable() {
                 cameraDead = false
+                captureRecoveryFails = 0
                 // ⭐ 确定性重放点：每次采集会话(重)建后首帧到达 = captureSession 必然就绪、
                 //    currentSession 必然已指向新会话 → 此刻重放硬件参数（核心=AE帧率区间钉死60），
                 //    根治「切档后 AE 没钉上 → 采集掉 30 且切回原挡位也回不去」的注入竞态。
@@ -2574,6 +2576,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
     @Volatile private var captureRecoveryScheduled = false
     @Volatile private var lastCaptureRecoveryMs = 0L
+    @Volatile private var captureRecoveryFails = 0
 
     /**
      * ⭐ 相机错误自愈——修「CAMERA_IN_USE 后永远 capFps=0」。
@@ -2587,17 +2590,21 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
      */
     private fun scheduleCaptureRecovery(reason: String) {
         if (!isPreviewRunning || !autoRecoverEnabled) return
-        val now = System.currentTimeMillis()
-        if (captureRecoveryScheduled || now - lastCaptureRecoveryMs < 5_000) {
-            Log.d("meidui", "⏭️ [相机自愈] 已排队/节流中，跳过($reason)")
+        if (captureRecoveryScheduled) {
+            Log.d("meidui", "⏭️ [相机自愈] 已排队，跳过($reason)")
             return
         }
+        // 重开失败会再回到这里：不再被节流吞掉，按 5s（连续失败 6 次后 15s）间隔一直重试，
+        //   直到出帧 / 回前台 / 停流——后台被系统收相机时，权限恢复后能自己续上
+        val gap = if (captureRecoveryFails < 6) 5_000L else 15_000L
+        val wait = maxOf(2_000L, lastCaptureRecoveryMs + gap - System.currentTimeMillis())
+        captureRecoveryFails++
         captureRecoveryScheduled = true
-        lastCaptureRecoveryMs = now
-        Log.d("meidui", "🔄 [相机自愈] $reason → 2s后重开采集会话")
+        Log.d("meidui", "🔄 [相机自愈] $reason → ${wait}ms后重开采集会话（第${captureRecoveryFails}次）")
         scope.launch {
-            delay(2000)
+            delay(wait)
             captureRecoveryScheduled = false
+            lastCaptureRecoveryMs = System.currentTimeMillis()
             if (!cameraDead || !isPreviewRunning) return@launch   // 期间已自行恢复/已停流
             // §134 SRT直推：关设备重开（编码器 Surface/SRT 不动）
             srtEngine?.let { engine ->

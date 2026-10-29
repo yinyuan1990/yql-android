@@ -108,8 +108,18 @@ fun StreamingScreen(
     val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                webRTCManager.recoverCaptureIfNeeded("onResume")
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    if (keepAliveManager.isRunning) {
+                        com.fz.yqlandroid.manager.srtdirect.SdLog.i("📱 App 回到前台：重新声明前台服务")
+                        keepAliveManager.refreshForeground()
+                    }
+                    webRTCManager.recoverCaptureIfNeeded("onResume")
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    com.fz.yqlandroid.manager.srtdirect.SdLog.i("📴 App 进入后台/熄屏：${keepAliveManager.describe()}")
+                }
+                else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -438,6 +448,8 @@ fun StreamingScreen(
         println("jfh [Streaming] 推流参数: streamPushIp='$streamPushIp', permanentToken='${permanentToken.take(10)}...', jwtToken='${jwtToken.take(10)}...'")
         
         if (streamPushIp.isNotEmpty() && permanentToken.isNotEmpty()) {
+            // 前台服务要趁 App 可见时声明才有后台用相机的权限，进页就起，不等 2 秒后的推流
+            if (permissionsState.allPermissionsGranted) keepAliveManager.start()
             // 等权限 + 预览就绪后自动推
             println("jfh [Streaming] ⏳ 等待2秒后自动推流...")
             kotlinx.coroutines.delay(2000)

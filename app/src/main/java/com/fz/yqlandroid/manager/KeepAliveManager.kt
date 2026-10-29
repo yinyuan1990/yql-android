@@ -68,6 +68,31 @@ class KeepAliveManager(context: Context) {
         Log.d("meidui", "🔋 [保活] 前台服务+WakeLock+WifiLock+静音音频 已启动")
     }
 
+    val isRunning: Boolean get() = running
+
+    /**
+     * App 回到前台时重新声明前台服务。系统只给「App 可见时声明」的前台服务后台用相机的权限，
+     * 这份权限丢了（被别的相机 App 抢过、服务被系统重启等）退后台约 5 秒就会 CAMERA_DISABLED，只能在前台补回来。
+     */
+    @Synchronized
+    fun refreshForeground() {
+        if (!running) return
+        com.fz.yqlandroid.service.StreamingForegroundService.start(appContext)
+    }
+
+    /** 进后台时写进 SRT 日志的保活状态 */
+    fun describe(): String {
+        val batteryIgnored = try {
+            powerManager.isIgnoringBatteryOptimizations(appContext.packageName)
+        } catch (_: Exception) { false }
+        val notifOn = try {
+            (appContext.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager)
+                .areNotificationsEnabled()
+        } catch (_: Exception) { false }
+        return "保活=${if (running) "开" else "关"} 前台服务=${com.fz.yqlandroid.service.StreamingForegroundService.state} " +
+                "忽略电池优化=${if (batteryIgnored) "是" else "否"} 通知=${if (notifOn) "开" else "关"}"
+    }
+
     /** 停止保活：释放前台服务、音频、WakeLock 与 WifiLock。重复调用安全（幂等）。 */
     @Synchronized
     fun stop() {
