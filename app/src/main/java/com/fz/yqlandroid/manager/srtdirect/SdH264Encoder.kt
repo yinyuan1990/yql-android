@@ -188,7 +188,7 @@ internal class SdH264Encoder(
 
     private fun supportedBitrateMode(c: MediaCodec, want: Int): Int = try {
         val caps = c.codecInfo.getCapabilitiesForType(MIME).encoderCapabilities
-        if (caps.isBitrateModeSupported(want)) want else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+        if (caps == null || caps.isBitrateModeSupported(want)) want else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
     } catch (_: Throwable) { want }
 
     /** 立即要一个关键帧 */
