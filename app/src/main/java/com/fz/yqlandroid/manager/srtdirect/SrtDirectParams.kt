@@ -109,6 +109,17 @@ object SrtDirectParams {
         return true
     }
 
+    /**
+     * 总后台「保存并下发」（STOMP srt_params 带 replace=true）：整份替换，后台清空的键（锐化 / 降噪 / 档位单独值）才能回默认；
+     * 同时作为 PC「恢复默认」的基准（原来只有登录时才更新基准）
+     */
+    fun replaceFromAdmin(ctx: Context, params: JSONObject) {
+        load(ctx)
+        override = JSONObject(params.toString())
+        persist(ctx)
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_LOGIN, override.toString()).apply()
+    }
+
     /** STOMP `ptype=srt_params`：增量合并（只带改动项）。返回合并后的覆盖项 */
     fun mergeRemote(ctx: Context, patch: JSONObject) {
         load(ctx)

@@ -3112,9 +3112,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     srtLog("⚠️ srt_params 解析失败: ${e.message} config=$config")
                     return
                 }
-                com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.mergeRemote(ctx, patch)
-                if (patch.has("sharpness")) _sharpness = null   // 后台改了边缘锐化 → 按后台值（PC 再拖再覆盖）
-                srtLog("后台改参 ${patch.toString().take(300)} → 生效 [${srtPlan().describe()}]")
+                val replace = config["replace"] == true
+                if (replace) {
+                    com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.replaceFromAdmin(ctx, patch)
+                    _sharpness = null
+                } else {
+                    com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.mergeRemote(ctx, patch)
+                    if (patch.has("sharpness")) _sharpness = null   // 后台改了边缘锐化 → 按后台值（PC 再拖再覆盖）
+                }
+                srtLog("${if (replace) "总后台下发(整份替换)" else "后台改参"} ${patch.toString().take(300)} → 生效 [${srtPlan().describe()}]")
                 if (srtDirectMode) {
                     // 档位码率/帧率可能变了：按新档位值重算（推送帧率仍受 PC 设定封顶）
                     val plan = srtPlan()
