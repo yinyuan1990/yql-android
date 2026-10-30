@@ -200,6 +200,7 @@ internal class SdCameraSource(
                         " af=${result.get(CaptureResult.CONTROL_AF_MODE)}/${result.get(CaptureResult.CONTROL_AF_STATE)}" +
                         " 焦距=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { "%.2f".format(it) }}" +
                         " 镜头=${result.get(CaptureResult.LENS_STATE)} 物理=${phys ?: "-"}（切$physSwitches）" +
+                        " 降噪=${Camera2ParamApplier.nrName(result.get(CaptureResult.NOISE_REDUCTION_MODE))}" +
                         " 预览=$previewDesc")
             }
         }

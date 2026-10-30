@@ -149,8 +149,18 @@ object Camera2ParamApplier {
     // ===== 降噪：NOISE_REDUCTION_MODE（设备不支持的档位退到能用的）=====
     // Camera2 只能选强度，是否融合前后帧由厂商 HAL 决定；HIGH_QUALITY 可能降帧，FAST/MINIMAL 规范要求不降帧
     private var lastNrLog = -1
+    private const val NR_DEFAULT_LOGGED = -2
+    fun nrName(mode: Int?): String = when (mode) {
+        null -> "?"; 0 -> "关"; 1 -> "标准(FAST)"; 2 -> "强(HQ)"; 3 -> "轻(MINIMAL)"; 4 -> "ZSL"; else -> mode.toString()
+    }
     private fun applyNoiseReduction(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
-        val n = p.noiseReduction ?: return
+        val n = p.noiseReduction ?: run {
+            if (lastNrLog != NR_DEFAULT_LOGGED) {
+                lastNrLog = NR_DEFAULT_LOGGED
+                com.fz.yqlandroid.manager.srtdirect.SdLog.i("🧹 降噪 默认（不设，用相机录像模板自带的，实际档位看 cam 行「降噪=」）")
+            }
+            return
+        }
         try {
             val modes = c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: return
             val minimal = if (android.os.Build.VERSION.SDK_INT >= 23) CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL else CameraMetadata.NOISE_REDUCTION_MODE_FAST
@@ -165,7 +175,7 @@ object Camera2ParamApplier {
             b.set(CaptureRequest.NOISE_REDUCTION_MODE, mode)
             if (mode != lastNrLog) {
                 lastNrLog = mode
-                Log.d("meidui", "🧹 降噪 $n → NOISE_REDUCTION_MODE=${when (mode) { 0 -> "关"; 1 -> "标准(FAST)"; 2 -> "强(HQ)"; 3 -> "轻(MINIMAL)"; else -> mode.toString() }}（设备可用=${modes.joinToString()}）")
+                com.fz.yqlandroid.manager.srtdirect.SdLog.i("🧹 降噪 $n → ${nrName(mode)}（这台可用：${modes.joinToString { nrName(it) }}）")
             }
         } catch (e: Exception) {
             Log.w(TAG, "noiseReduction 写入失败: ${e.message}")
