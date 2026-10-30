@@ -56,8 +56,6 @@ object Camera2ParamApplier {
         val srtIso: Int = 0,
         // PC「边缘锐化」（原「清晰度(P)」）0..1（iOS 是连续软件锐化）；Camera2 只有硬件 EDGE_MODE 三档：<0.1 关 / <0.5 标准 / 其余 强
         val sharpness: Float? = null,
-        // SRT直推降噪 0..1 → Camera2 NOISE_REDUCTION_MODE：<0.1 关 / <0.4 轻(MINIMAL) / <0.75 标准(FAST) / 其余 强(HIGH_QUALITY)；null = 相机默认
-        val noiseReduction: Float? = null
     )
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
@@ -116,7 +114,6 @@ object Camera2ParamApplier {
             applyZoom(builder, characteristics, p)
             applyWhiteBalance(builder, characteristics, p)
             applyEdge(builder, characteristics, p)
-            applyNoiseReduction(builder, characteristics, p)
             if (p.disableStabilization) applyStabilizationOff(builder, characteristics)
 
             // 3) 一次性下发（不常驻循环）。
@@ -142,44 +139,12 @@ object Camera2ParamApplier {
         applyZoom(builder, characteristics, p)
         applyWhiteBalance(builder, characteristics, p)
         applyEdge(builder, characteristics, p)
-        applyNoiseReduction(builder, characteristics, p)
         if (p.disableStabilization) applyStabilizationOff(builder, characteristics)
     }
 
-    // ===== 降噪：NOISE_REDUCTION_MODE（设备不支持的档位退到能用的）=====
-    // Camera2 只能选强度，是否融合前后帧由厂商 HAL 决定；HIGH_QUALITY 可能降帧，FAST/MINIMAL 规范要求不降帧
-    private var lastNrLog = -1
-    private const val NR_DEFAULT_LOGGED = -2
+    // 降噪不设，交给相机硬件（TEMPLATE_RECORD 自带，和参考 App 一样）；cam 日志行回读实际档位
     fun nrName(mode: Int?): String = when (mode) {
         null -> "?"; 0 -> "关"; 1 -> "标准(FAST)"; 2 -> "强(HQ)"; 3 -> "轻(MINIMAL)"; 4 -> "ZSL"; else -> mode.toString()
-    }
-    private fun applyNoiseReduction(b: CaptureRequest.Builder, c: CameraCharacteristics, p: Params) {
-        val n = p.noiseReduction ?: run {
-            if (lastNrLog != NR_DEFAULT_LOGGED) {
-                lastNrLog = NR_DEFAULT_LOGGED
-                com.fz.yqlandroid.manager.srtdirect.SdLog.i("🧹 降噪 默认（不设，用相机录像模板自带的，实际档位看 cam 行「降噪=」）")
-            }
-            return
-        }
-        try {
-            val modes = c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: return
-            val minimal = if (android.os.Build.VERSION.SDK_INT >= 23) CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL else CameraMetadata.NOISE_REDUCTION_MODE_FAST
-            val want = when {
-                n < 0.1f -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
-                n < 0.4f -> minimal
-                n < 0.75f -> CameraMetadata.NOISE_REDUCTION_MODE_FAST
-                else -> CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
-            }
-            val mode = listOf(want, CameraMetadata.NOISE_REDUCTION_MODE_FAST, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
-                .firstOrNull { modes.contains(it) } ?: return
-            b.set(CaptureRequest.NOISE_REDUCTION_MODE, mode)
-            if (mode != lastNrLog) {
-                lastNrLog = mode
-                com.fz.yqlandroid.manager.srtdirect.SdLog.i("🧹 降噪 $n → ${nrName(mode)}（这台可用：${modes.joinToString { nrName(it) }}）")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "noiseReduction 写入失败: ${e.message}")
-        }
     }
 
     // ===== 锐化：硬件边缘增强 EDGE_MODE（设备不支持的档位退到能用的） =====
