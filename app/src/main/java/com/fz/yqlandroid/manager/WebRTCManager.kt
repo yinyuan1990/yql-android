@@ -198,10 +198,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     //    用于“相同/接近分辨率时 60fps 优先”的选档策略：只有当没有 60fps 选项时才退回 30fps。
     private var backSizeMaxFps: Map<Size, Int> = emptyMap()
     private var frontSizeMaxFps: Map<Size, Int> = emptyMap()
-    // SRT直推相机直接写编码器（Surface 输出）：按 SurfaceTexture 查各分辨率最高帧率（三星等 YUV 只报 30，Surface 能到 60）
-    private var backSurfaceMaxFps: Map<Size, Int> = emptyMap()
-    private var frontSurfaceMaxFps: Map<Size, Int> = emptyMap()
-    
     // 预览渲染器
     private var localRenderer: SurfaceViewRenderer? = null
     
@@ -361,14 +357,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     // 与整机 AE 上界取 min（部分机型 minFrameDuration 给出的理论值高于实际可用 AE 帧率）
                     sizeMaxFps[s] = minOf(perSize, aeMaxFps).coerceAtLeast(1)
                 }
-                val surfaceMaxFps = HashMap<Size, Int>()
-                try {
-                    map.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.forEach { s ->
-                        val d = map.getOutputMinFrameDuration(android.graphics.SurfaceTexture::class.java, s)
-                        surfaceMaxFps[s] = (if (d > 0) minOf((1_000_000_000.0 / d).toInt(), aeMaxFps) else aeMaxFps).coerceAtLeast(1)
-                    }
-                } catch (_: Exception) {}
-                
                 // ⭐ [meidui] 全量采集能力打印（用户排查「60fps 优先却全是 30」）：
                 //    - AE帧率区间 = 普通采集会话（WebRTC Camera2 走的就是这种）能跑的帧率上限，
                 //      若所有区间上界都是 30 → 该镜头普通会话根本给不了 60，选档退 30 是设备限制；
@@ -410,7 +398,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         backCameraFormats = sizes
                         backMaxFps = aeMaxFps
                         backSizeMaxFps = sizeMaxFps
-                        backSurfaceMaxFps = surfaceMaxFps
                         Log.d(TAG, "📷 后置摄像头: ${sizes.size}种分辨率, 整机最大${aeMaxFps}fps")
                         sizes.take(8).forEach { Log.d(TAG, "   ${it.width}x${it.height} @最大${sizeMaxFps[it]}fps") }
                     }
@@ -418,7 +405,6 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         frontCameraFormats = sizes
                         frontMaxFps = aeMaxFps
                         frontSizeMaxFps = sizeMaxFps
-                        frontSurfaceMaxFps = surfaceMaxFps
                         Log.d(TAG, "📷 前置摄像头: ${sizes.size}种分辨率, 整机最大${aeMaxFps}fps")
                         sizes.take(8).forEach { Log.d(TAG, "   ${it.width}x${it.height} @最大${sizeMaxFps[it]}fps") }
                     }
@@ -2465,12 +2451,10 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     @Volatile private var antiFlickerEnabled = false
 
     private fun deviceMaxCaptureFps(): Int {
-        val sizeMax = if (srtEngine != null) {
-            if (isFrontCamera) frontSurfaceMaxFps else backSurfaceMaxFps
-        } else {
-            if (isFrontCamera) frontSizeMaxFps else backSizeMaxFps
-        }
+        val sizeMax = if (isFrontCamera) frontSizeMaxFps else backSizeMaxFps
         val whole = if (isFrontCamera) frontMaxFps else backMaxFps
+        // SRT直推（相机直写编码器）不按分辨率表封顶：三星 640x480 按 YUV / Surface 都报 30，实际 AE [60,60] 能跑 50
+        if (srtEngine != null) return whole.coerceAtLeast(1)
         return (sizeMax[Size(currentWidth, currentHeight)] ?: whole).coerceAtLeast(1)
     }
 
@@ -2503,7 +2487,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 "手动快门 1/${if (expNs > 0) 1_000_000_000L / expNs else 0}s（手动时相机 50Hz 防闪不生效，条纹只是不滚动）"
             else "自动曝光（相机开 50Hz 防闪）"
             srtLog("🔦 防频闪${if (wasEnabled) "开" else "关"}→${if (enabled) "开" else "关"} 请求=${serverFps}÷4" +
-                    " 推送 ${fpsBefore}→${currentFps}fps 设备上限=${deviceMaxCaptureFps()}fps(${currentWidth}x${currentHeight}，按 Surface 输出)" +
+                    " 推送 ${fpsBefore}→${currentFps}fps 设备上限=${deviceMaxCaptureFps()}fps(${currentWidth}x${currentHeight}，SRT直推按整机 AE 上限)" +
                     " 档位=${profileName(currentProfile)} $exposure" +
                     (if (enabled && fpsBefore == currentFps) "；推送帧率没变" else ""))
             applySrtEncoding(if (enabled) "防频闪开启" else "防频闪关闭")
