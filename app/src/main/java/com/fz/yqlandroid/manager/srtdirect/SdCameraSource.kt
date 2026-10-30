@@ -201,9 +201,18 @@ internal class SdCameraSource(
                         " 焦距=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { "%.2f".format(it) }}" +
                         " 镜头=${result.get(CaptureResult.LENS_STATE)} 物理=${phys ?: "-"}（切$physSwitches）" +
                         " 降噪=${Camera2ParamApplier.nrName(result.get(CaptureResult.NOISE_REDUCTION_MODE))}" +
+                        " 防频闪=${if (params.antiBanding50Hz) "开" else "关"}(相机防闪=${antibandingName(result.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE))})" +
                         " 预览=$previewDesc")
             }
         }
+    }
+
+    private fun antibandingName(m: Int?): String = when (m) {
+        android.hardware.camera2.CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_OFF -> "关"
+        android.hardware.camera2.CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_50HZ -> "50Hz"
+        android.hardware.camera2.CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_60HZ -> "60Hz"
+        android.hardware.camera2.CameraMetadata.CONTROL_AE_ANTIBANDING_MODE_AUTO -> "自动"
+        else -> "-"
     }
 
     @SuppressLint("MissingPermission")

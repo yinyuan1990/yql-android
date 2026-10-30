@@ -1274,7 +1274,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         com.fz.yqlandroid.manager.srtdirect.SrtLogReporter.start(streamKey,
             (ctx.getSharedPreferences("token_prefs", Context.MODE_PRIVATE).getString("username", "") ?: "").replace(":", ""))
         srtLog("═══ 开始推流 srt://$srtHost:$srtPort 流=$streamKey 档位=${profileName(currentProfile)}" +
-                " 推送${currentFps}fps 清晰度${_currentQualityPercent}% 参数[${srtPlan().describe()}] ═══")
+                " 推送${currentFps}fps 防频闪=${if (antiFlickerEnabled) "开" else "关"} 清晰度${_currentQualityPercent}% 参数[${srtPlan().describe()}] ═══")
         onConnectionStateChanged?.invoke("SRS连接中...")
 
         scope.launch {
@@ -2487,6 +2487,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             Log.d("meidui", "🔦 [防频闪] OTG 模式忽略（UVC 帧率按描述符协商）")
             return
         }
+        val wasEnabled = antiFlickerEnabled
+        val fpsBefore = currentFps
         antiFlickerEnabled = enabled
         if (enabled) {
             val want = (if (serverFps > 0) serverFps else 80) / 4
@@ -2495,8 +2497,15 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
         // SRT直推：防频闪帧率不受档位 fps 封顶，开 / 关都按新帧率换编码器 + 钉 AE 区间
         if (srtEngine != null) {
-            srtLog("🔦 防频闪${if (enabled) "开启" else "关闭"} 请求=${serverFps}÷4 推送=${currentFps}fps" +
-                    " 设备上限=${deviceMaxCaptureFps()}fps(${currentWidth}x${currentHeight}，按 Surface 输出)")
+            val cs = srtEngine?.cameraState()
+            val expNs = (cs?.get("curExpNs") as? Number)?.toLong() ?: 0L
+            val exposure = if (cs?.get("aeAuto") == false)
+                "手动快门 1/${if (expNs > 0) 1_000_000_000L / expNs else 0}s（手动时相机 50Hz 防闪不生效，条纹只是不滚动）"
+            else "自动曝光（相机开 50Hz 防闪）"
+            srtLog("🔦 防频闪${if (wasEnabled) "开" else "关"}→${if (enabled) "开" else "关"} 请求=${serverFps}÷4" +
+                    " 推送 ${fpsBefore}→${currentFps}fps 设备上限=${deviceMaxCaptureFps()}fps(${currentWidth}x${currentHeight}，按 Surface 输出)" +
+                    " 档位=${profileName(currentProfile)} $exposure" +
+                    (if (enabled && fpsBefore == currentFps) "；推送帧率没变" else ""))
             applySrtEncoding(if (enabled) "防频闪开启" else "防频闪关闭")
         }
         ensureCaptureFps(if (enabled) "防频闪开启" else "防频闪关闭")
@@ -3161,6 +3170,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 }
                 val serverFps = (config["fps"] as? Number)?.toInt() ?: 80
                 Log.d("meidui", "🔦 [防频闪] 收到 PC 指令 enabled=$enabled fps=$serverFps")
+                srtLog("🔦 收到 PC 抗频闪指令 ${if (enabled) "开 $serverFps" else "关"}（手机当前 ${if (antiFlickerEnabled) "开" else "关"} 推送${currentFps}fps）")
                 setAntiFlicker(enabled, serverFps)
             }
 
@@ -3323,6 +3333,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         st["ev"] = _srtExposureEv
         st["zoom"] = _currentZoom
         st["sharpness"] = effectiveSharpness()   // PC「边缘锐化」滑条按手机实际值摆（null = 相机默认）
+        st["antiFlicker"] = antiFlickerEnabled
         st["bitrateMode"] = srtEngine?.encoderBitrateMode ?: srtPlan().bitrateMode   // 1=动态码率(VBR) 2=静态码率(CBR)，编码器不支持 CBR 时是实际退回的 1
         // §148 PC「SRT设置」档位按钮上显示各档的生效分辨率/帧率/码率（总后台「SRT管理→参数设置」能改，PC 自己不知道）
         val ctx = srtCtx()
