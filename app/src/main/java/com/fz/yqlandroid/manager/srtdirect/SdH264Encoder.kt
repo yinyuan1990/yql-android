@@ -11,7 +11,8 @@ import android.view.Surface
 
 /**
  * §134 硬件 H.264 编码器（Surface 输入，Camera2 直写零拷贝）——拷自 test-android `H264Encoder`，加：
- * - QP 只设一个上限（`video-qp-i/p/b-max` 同一个值 = [Config.qpPMax]），不设下限（和参考 App、iOS MaxAllowedFrameQP 一样）；
+ * - QP 只设一个上限（`video-qp-i/p/b-max` 同一个值 = [Config.qpPMax]），VBR 不设下限（和参考 App、iOS MaxAllowedFrameQP 一样）；
+ *   CBR 时可再设下限（`video-qp-i/p/b-min` = 总后台 [Config.cbrQpMin]）；
  * - GOP 秒数、码率模式由 [Config] 给（后台 srtParams 下发）；
  * - 运行中 [setPMaxQp] 尝试 setParameters 改 P 帧 QP 上限（峰值控制器用），[setBitrate] 改目标码率；
  * - 每秒统计 I/P 帧大小（I 帧最近一帧、P 帧均值/峰值）。
@@ -32,6 +33,8 @@ internal class SdH264Encoder(
         val bitrateKbps: Int,
         /** MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_*：1=VBR 2=CBR */
         val bitrateMode: Int,
+        /** 实际是 CBR 时设的 QP 下限（I/P/B 同一个），0 = 不设 */
+        val cbrQpMin: Int,
         val qpIMin: Int,
         val qpIMax: Int,
         val qpPMin: Int,
@@ -125,7 +128,8 @@ internal class SdH264Encoder(
                 qpConfigured = opts and OPT_QP != 0
                 SdLog.i("编码器就绪 ${c.name} 降级档[$name] ${cfg.width}x${cfg.height}@${cfg.fps} 目标${cfg.bitrateKbps}kbps" +
                         " ${if (actualBitrateMode == 2) "CBR" else "VBR"}${if (actualBitrateMode != cfg.bitrateMode) "(编码器不支持CBR，退回VBR)" else ""} GOP${cfg.gopSec}s" +
-                        " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个，不设下限）" else "未设(编码器不认)"}")
+                        " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个）" else "未设(编码器不认)"}" +
+                        " QP下限 ${if (qpConfigured && cbrQpMinEff() > 0) "${cbrQpMinEff()}（CBR）" else "不设"}")
                 return
             } catch (t: Throwable) {
                 lastError = t
@@ -165,13 +169,23 @@ internal class SdH264Encoder(
             if (Build.VERSION.SDK_INT >= 30) f.setInteger(MediaFormat.KEY_LATENCY, 1)
         }
         if (opts and OPT_QP != 0) {
-            // 不设下限：画面简单 / 降噪后编码器能把 QP 降下去多花码率换细节（有下限时会顶在下限，码率花不完）
+            // VBR 不设下限：画面简单 / 降噪后编码器能把 QP 降下去多花码率换细节（有下限时会顶在下限，码率花不完）
             f.setInteger("video-qp-i-max", cfg.qpPMax)
             f.setInteger("video-qp-p-max", cfg.qpPMax)
             f.setInteger("video-qp-b-max", cfg.qpPMax)
+            val qpMin = cbrQpMinEff()
+            if (qpMin > 0) {
+                f.setInteger("video-qp-i-min", qpMin)
+                f.setInteger("video-qp-p-min", qpMin)
+                f.setInteger("video-qp-b-min", qpMin)
+            }
         }
         return f
     }
+
+    /** 总后台「CBR QP下限」：只在实际是 CBR 时生效，不超过 QP 上限 */
+    private fun cbrQpMinEff(): Int =
+        if (actualBitrateMode == 2 && cfg.cbrQpMin > 0) minOf(cfg.cbrQpMin, cfg.qpPMax) else 0
 
     /** H.264 附录 A：按宏块数/宏块速率选最低够用的 Level（1080p30=4.0 … 4K30=5.1） */
     private fun avcLevelFor(w: Int, h: Int, fps: Int): Int {

@@ -157,6 +157,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                     size.width != encodeWidth || size.height != encodeHeight ||
                     r.fps != enc.config.fps || r.plan.gopSec != enc.config.gopSec ||
                     r.plan.bitrateMode != enc.config.bitrateMode ||
+                    r.plan.cbrQpMin != enc.config.cbrQpMin ||
                     r.plan.qpPMax != enc.config.qpPMax
             if (!need && old == r) return@post   // 同一条指令多处重复落地（切档后又同步码率等），无变化不动
             if (need) {
@@ -254,6 +255,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
     private fun encConfig(w: Int, h: Int, r: VideoReq) = SdH264Encoder.Config(
         width = w, height = h, fps = r.fps, bitrateKbps = r.kbps,
         bitrateMode = r.plan.bitrateMode,
+        cbrQpMin = r.plan.cbrQpMin,
         qpIMin = r.plan.qpIMin, qpIMax = r.plan.qpIMax,
         qpPMin = r.plan.qpPMin, qpPMax = r.plan.qpPMax,
         gopSec = r.plan.gopSec,

@@ -10,7 +10,7 @@ import org.json.JSONObject
  * 结构：
  * ```
  * { presets: { low|standard|high|ultra|p4k: {width,height,fps,bitrateKbps, …可选覆盖任意全局键} },
- *   bitrateMode:1(VBR)/2(CBR), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
+ *   bitrateMode:1(VBR)/2(CBR), cbrQpMin(只在 CBR 时设的 QP 下限，0/不填=不设), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
  *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization,
  *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }（降噪不再手动设，交给相机硬件；老后台带的 noiseReduction 忽略）
  * ```
@@ -55,6 +55,8 @@ object SrtDirectParams {
         val fps: Int,
         val bitrateKbps: Int,
         val bitrateMode: Int,
+        /** CBR 时设的 QP 下限（I/P/B 同一个），0 = 不设；VBR 不用 */
+        val cbrQpMin: Int,
         val qpIMin: Int,
         val qpIMax: Int,
         val qpPMin: Int,
@@ -72,7 +74,7 @@ object SrtDirectParams {
     ) {
         fun describe(): String =
             "$profile ${width}x${height}@$fps ${bitrateKbps}kbps ${if (bitrateMode == 2) "CBR" else "VBR"}" +
-                    " QP上限$qpPMax GOP${gopSec}s 延迟${latencyMs}ms" +
+                    " QP上限$qpPMax${if (bitrateMode == 2 && cbrQpMin > 0) " CBR下限$cbrQpMin" else ""} GOP${gopSec}s 延迟${latencyMs}ms" +
                     " 限速${if (maxBwKbps > 0) "${maxBwKbps}kbps" else "不限"} 峰值${peakKbps}kbps" +
                     " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s)" else "关"}" +
                     " 关防抖=$disableStabilization"
@@ -176,6 +178,7 @@ object SrtDirectParams {
             fps = pre.optInt("fps", 25).coerceIn(5, 60),
             bitrateKbps = pre.optInt("bitrateKbps", 8000).coerceIn(300, 80000),
             bitrateMode = if (int("bitrateMode", 1) == 2) 2 else 1,
+            cbrQpMin = int("cbrQpMin", 0).coerceIn(0, 51),
             qpIMin = qpIMin,
             qpIMax = int("qpIMax", 30).coerceIn(qpIMin, 51),
             qpPMin = qpPMin,
