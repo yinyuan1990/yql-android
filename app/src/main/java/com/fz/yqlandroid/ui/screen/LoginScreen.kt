@@ -77,9 +77,11 @@ fun LoginScreen(
     // ⭐ 摄像头模式（第四十八章）："builtin"=自带(Camera2) / "otg"=外接OTG(UVC)，仅 Android
     // ⭐⭐ 2026-08-04 拆分：本仓库为主版"金凤凰"（自带摄像头），推流恒为 builtin；
     //   OTG 已拆为独立 App"金凤凰OTG"（仓库 android-otg，包名 com.fz.yqlandroid.otg，可同装）。
-    //   §140 登录页的「摄像头」一栏（含 OTG 下载入口）已移除，推流恒为 builtin。代码同构，OTG 代码保留不删。
+    //   登录页「摄像头」一栏只作 OTG 下载入口，推流恒为 builtin。代码同构，OTG 代码保留不删。
     // ⭐ §130 登录前权限引导弹框
     var showPermissionGuide by remember { mutableStateOf(false) }
+    // 「外接OTG」下载弹框
+    var showOtgDownloadDialog by remember { mutableStateOf(false) }
     // ⭐ 强制更新：非空 = 后台配置的最低版本高于本地 → 弹不可关闭弹窗（AppUpdateManager 公共接口）
     var forceUpdate by remember { mutableStateOf<com.fz.yqlandroid.manager.AppUpdateManager.ForceUpdate?>(null) }
     // ⭐ 设备号弹框（点击设备号显示完整 ID + 复制）
@@ -294,8 +296,42 @@ fun LoginScreen(
                     //   两组选项已移除。线路 = 推流前按"与观看端是否同 WiFi"自动决定（同 WiFi 才 P2P，
                     //   否则 SRS）；编码 = 总后台配置（默认 H265，本机硬编或观看端内核不支持则回退 H264）。
                     //   决策逻辑在 `manager/SessionPolicy.kt`（与 iOS 同构）。
-                    // ⭐ §140：「摄像头：自带 / 外接OTG」一栏也已移除——OTG 是独立 App（金凤凰OTG），
-                    //   主版恒为自带摄像头（登录时 camera_mode 固定写 builtin）。
+                    // 「摄像头：自带 / 外接OTG」：主版恒为自带摄像头（登录时 camera_mode 固定写 builtin），
+                    //   「外接OTG」只是独立 App「金凤凰OTG」的下载入口（点击弹框下载）
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 30.dp),
+                        color = Color(0xFFF0F0F0)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "摄像头",
+                            fontSize = 16.sp,
+                            color = Color(0xFF1A1A1A)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        listOf("builtin" to "自带", "otg" to "外接OTG").forEach { (mode, label) ->
+                            val selected = mode == "builtin"
+                            Box(
+                                modifier = Modifier
+                                    .padding(end = 8.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(if (selected) Color(0xFF65AEF7) else Color(0xFFF0F0F0))
+                                    .clickable { if (mode == "otg") showOtgDownloadDialog = true }
+                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontSize = 14.sp,
+                                    color = if (selected) Color.White else Color(0xFF666666)
+                                )
+                            }
+                        }
+                    }
                 }
             }
             
@@ -632,6 +668,34 @@ fun LoginScreen(
         ) {
             Text(text = "老版本登录", fontSize = 14.sp, color = Color(0xFF65AEF7), fontWeight = FontWeight.Medium)
         }
+    }
+
+    // 「外接OTG」下载弹框：地址取总后台「App更新配置」otg 块，取不到用固定的 otg.apk
+    if (showOtgDownloadDialog) {
+        AlertDialog(
+            onDismissRequest = { showOtgDownloadDialog = false },
+            title = { Text("金凤凰OTG") },
+            text = {
+                Text("外接OTG摄像头功能已升级为独立App「金凤凰OTG」，可与本App同时安装。点击下方按钮直接下载安装。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    scope.launch {
+                        val url = com.fz.yqlandroid.manager.AppUpdateManager.fetchOtgDownloadUrl()
+                            ?: "http://dl.jinfenghuang.vip/updatesoft/otg.apk"
+                        try {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                            showOtgDownloadDialog = false
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "打开下载链接失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }) { Text("立即下载") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showOtgDownloadDialog = false }) { Text("取消") }
+            }
+        )
     }
 
     // ⭐ 设备号弹框：完整 ID + 复制按钮
