@@ -3303,6 +3303,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         st["ev"] = _srtExposureEv
         st["zoom"] = _currentZoom
         st["sharpness"] = effectiveSharpness()   // PC「边缘锐化」滑条按手机实际值摆（null = 相机默认）
+        st["bitrateMode"] = srtEngine?.encoderBitrateMode ?: srtPlan().bitrateMode   // 1=动态码率(VBR) 2=静态码率(CBR)，编码器不支持 CBR 时是实际退回的 1
         // §148 PC「SRT设置」档位按钮上显示各档的生效分辨率/帧率/码率（总后台「SRT管理→参数设置」能改，PC 自己不知道）
         val ctx = srtCtx()
         st["presets"] = com.fz.yqlandroid.manager.srtdirect.SrtDirectParams.PROFILES.associateWith { k ->

@@ -75,6 +75,8 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
     @Volatile var encodeHeight = 0
         private set
     val encoderDesc: String get() = encoder?.let { "${it.codecName} 降级档${it.tierName}" } ?: "-"
+    /** 编码器实际用的码率模式（1=VBR 2=CBR；没建好 = null） */
+    val encoderBitrateMode: Int? get() = encoder?.actualBitrateMode
 
     // ---------- 摄像头 + 编码器 ----------
 

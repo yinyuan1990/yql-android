@@ -70,6 +70,9 @@ internal class SdH264Encoder(
         private set
     var outputFormatDesc: String = ""
         private set
+    /** 实际设进编码器的码率模式：要 CBR 但编码器不支持时退回 VBR */
+    var actualBitrateMode: Int = cfg.bitrateMode
+        private set
     val config: Config get() = cfg
 
     @Volatile private var csd: ByteArray? = null
@@ -109,6 +112,7 @@ internal class SdH264Encoder(
             val c = try { MediaCodec.createEncoderByType(MIME) } catch (t: Throwable) {
                 throw IllegalStateException("创建 H.264 编码器失败: ${t.message}", t)
             }
+            actualBitrateMode = supportedBitrateMode(c, cfg.bitrateMode)
             val format = buildFormat(opts)
             try {
                 c.setCallback(callback, handler)
@@ -120,7 +124,7 @@ internal class SdH264Encoder(
                 tierName = name
                 qpConfigured = opts and OPT_QP != 0
                 SdLog.i("编码器就绪 ${c.name} 降级档[$name] ${cfg.width}x${cfg.height}@${cfg.fps} 目标${cfg.bitrateKbps}kbps" +
-                        " ${if (cfg.bitrateMode == 2) "CBR" else "VBR"} GOP${cfg.gopSec}s" +
+                        " ${if (actualBitrateMode == 2) "CBR" else "VBR"}${if (actualBitrateMode != cfg.bitrateMode) "(编码器不支持CBR，退回VBR)" else ""} GOP${cfg.gopSec}s" +
                         " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个，不设下限）" else "未设(编码器不认)"}")
                 return
             } catch (t: Throwable) {
@@ -146,7 +150,7 @@ internal class SdH264Encoder(
         } else {
             f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, cfg.gopSec)
         }
-        f.setInteger(MediaFormat.KEY_BITRATE_MODE, cfg.bitrateMode)
+        f.setInteger(MediaFormat.KEY_BITRATE_MODE, actualBitrateMode)
         if (opts and OPT_PROFILE != 0) {
             f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
             f.setInteger(MediaFormat.KEY_LEVEL, avcLevelFor(cfg.width, cfg.height, cfg.fps))
@@ -181,6 +185,11 @@ internal class SdH264Encoder(
             else -> MediaCodecInfo.CodecProfileLevel.AVCLevel52
         }
     }
+
+    private fun supportedBitrateMode(c: MediaCodec, want: Int): Int = try {
+        val caps = c.codecInfo.getCapabilitiesForType(MIME).encoderCapabilities
+        if (caps.isBitrateModeSupported(want)) want else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+    } catch (_: Throwable) { want }
 
     /** 立即要一个关键帧 */
     fun requestKeyFrame() {
