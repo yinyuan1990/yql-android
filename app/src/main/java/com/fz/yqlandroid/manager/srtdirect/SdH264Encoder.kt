@@ -11,7 +11,7 @@ import android.view.Surface
 
 /**
  * §134 硬件 H.264 编码器（Surface 输入，Camera2 直写零拷贝）——拷自 test-android `H264Encoder`，加：
- * - I/P 帧 QP **上下限**分开设（`video-qp-i-min/max`、`video-qp-p-min/max`；高通再加 `vendor.qti-ext-enc-qp-range.*`）；
+ * - QP 只设一个上限（`video-qp-i/p/b-max` 同一个值 = [Config.qpPMax]），不设下限（和参考 App、iOS MaxAllowedFrameQP 一样）；
  * - GOP 秒数、码率模式由 [Config] 给（后台 srtParams 下发）；
  * - 运行中 [setPMaxQp] 尝试 setParameters 改 P 帧 QP 上限（峰值控制器用），[setBitrate] 改目标码率；
  * - 每秒统计 I/P 帧大小（I 帧最近一帧、P 帧均值/峰值）。
@@ -41,18 +41,16 @@ internal class SdH264Encoder(
 
     companion object {
         private const val MIME = MediaFormat.MIMETYPE_VIDEO_AVC
-        private const val OPT_VENDOR_QP = 1
         private const val OPT_QP = 2
         private const val OPT_PROFILE = 4
         private const val OPT_EXTRA = 8   // priority / operating-rate / color-range / prepend-sps-pps / 统计
 
         /** 逐级降级：名称 → 启用的可选项 */
         private val TIERS = listOf(
-            "1 全部(含厂商QP键)" to (OPT_VENDOR_QP or OPT_QP or OPT_PROFILE or OPT_EXTRA),
-            "2 全部(标准QP键)" to (OPT_QP or OPT_PROFILE or OPT_EXTRA),
-            "3 去掉QP上下限" to (OPT_PROFILE or OPT_EXTRA),
-            "4 去掉Profile/Level" to OPT_EXTRA,
-            "5 最简配置" to 0,
+            "1 全部(QP上限)" to (OPT_QP or OPT_PROFILE or OPT_EXTRA),
+            "2 去掉QP上限" to (OPT_PROFILE or OPT_EXTRA),
+            "3 去掉Profile/Level" to OPT_EXTRA,
+            "4 最简配置" to 0,
         )
     }
 
@@ -111,7 +109,7 @@ internal class SdH264Encoder(
             val c = try { MediaCodec.createEncoderByType(MIME) } catch (t: Throwable) {
                 throw IllegalStateException("创建 H.264 编码器失败: ${t.message}", t)
             }
-            val format = buildFormat(c.name, opts)
+            val format = buildFormat(opts)
             try {
                 c.setCallback(callback, handler)
                 c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -123,7 +121,7 @@ internal class SdH264Encoder(
                 qpConfigured = opts and OPT_QP != 0
                 SdLog.i("编码器就绪 ${c.name} 降级档[$name] ${cfg.width}x${cfg.height}@${cfg.fps} 目标${cfg.bitrateKbps}kbps" +
                         " ${if (cfg.bitrateMode == 2) "CBR" else "VBR"} GOP${cfg.gopSec}s" +
-                        " QP ${if (qpConfigured) "I${cfg.qpIMin}~${cfg.qpIMax} P${cfg.qpPMin}~${cfg.qpPMax}（已设进 configure）" else "未设(编码器不认)"}")
+                        " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个，不设下限）" else "未设(编码器不认)"}")
                 return
             } catch (t: Throwable) {
                 lastError = t
@@ -136,7 +134,7 @@ internal class SdH264Encoder(
         throw IllegalStateException("编码器所有降级档都配置失败: ${lastError?.message}", lastError)
     }
 
-    private fun buildFormat(name: String, opts: Int): MediaFormat {
+    private fun buildFormat(opts: Int): MediaFormat {
         val f = MediaFormat.createVideoFormat(MIME, cfg.width, cfg.height)
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         f.setInteger(MediaFormat.KEY_BIT_RATE, cfg.bitrateKbps * 1000)
@@ -163,21 +161,10 @@ internal class SdH264Encoder(
             if (Build.VERSION.SDK_INT >= 30) f.setInteger(MediaFormat.KEY_LATENCY, 1)
         }
         if (opts and OPT_QP != 0) {
-            f.setInteger("video-qp-i-min", cfg.qpIMin)
-            f.setInteger("video-qp-i-max", cfg.qpIMax)
-            f.setInteger("video-qp-p-min", cfg.qpPMin)
+            // 不设下限：画面简单 / 降噪后编码器能把 QP 降下去多花码率换细节（有下限时会顶在下限，码率花不完）
+            f.setInteger("video-qp-i-max", cfg.qpPMax)
             f.setInteger("video-qp-p-max", cfg.qpPMax)
-            f.setInteger("video-qp-b-min", cfg.qpPMin)
             f.setInteger("video-qp-b-max", cfg.qpPMax)
-        }
-        if (opts and OPT_VENDOR_QP != 0 && isQualcomm(name)) {
-            // 高通私有键：Android 12 以下标准 QP 键不生效时靠它
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-i-min", cfg.qpIMin)
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-i-max", cfg.qpIMax)
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-p-min", cfg.qpPMin)
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-p-max", cfg.qpPMax)
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-b-min", cfg.qpPMin)
-            f.setInteger("vendor.qti-ext-enc-qp-range.qp-b-max", cfg.qpPMax)
         }
         return f
     }
@@ -193,11 +180,6 @@ internal class SdH264Encoder(
             mbs <= 36_864 && mbps <= 983_040 -> MediaCodecInfo.CodecProfileLevel.AVCLevel51
             else -> MediaCodecInfo.CodecProfileLevel.AVCLevel52
         }
-    }
-
-    private fun isQualcomm(name: String): Boolean {
-        val n = name.lowercase()
-        return n.contains("qcom") || n.contains("qti")
     }
 
     /** 立即要一个关键帧 */
@@ -223,7 +205,7 @@ internal class SdH264Encoder(
     }
 
     /**
-     * 运行中改 P 帧 QP 上限（Android 12+ 标准键可在 setParameters 里用；高通另带私有键）。
+     * 运行中改 P 帧 QP 上限（Android 12+ 标准键可在 setParameters 里用）。
      * setParameters 对不认识的键是静默忽略的——**是否真的生效要看统计行的平均 QP**（Android 13+ 才有）。
      * @return false = 系统版本不支持运行中改 QP（调用方改用降码率）
      */
@@ -235,10 +217,6 @@ internal class SdH264Encoder(
                 c.setParameters(Bundle().apply {
                     putInt("video-qp-p-max", qpMax)
                     putInt("video-qp-b-max", qpMax)
-                    if (isQualcomm(codecName)) {
-                        putInt("vendor.qti-ext-enc-qp-range.qp-p-max", qpMax)
-                        putInt("vendor.qti-ext-enc-qp-range.qp-b-max", qpMax)
-                    }
                 })
             } catch (t: Throwable) {
                 SdLog.w("运行中改 P 帧 QP 上限失败: ${t.message}")
@@ -255,7 +233,6 @@ internal class SdH264Encoder(
             try {
                 c.setParameters(Bundle().apply {
                     putInt("video-qp-i-max", qpMax)
-                    if (isQualcomm(codecName)) putInt("vendor.qti-ext-enc-qp-range.qp-i-max", qpMax)
                 })
             } catch (t: Throwable) {
                 SdLog.w("运行中改 I 帧 QP 上限失败: ${t.message}")

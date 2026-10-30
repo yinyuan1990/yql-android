@@ -72,7 +72,7 @@ object SrtDirectParams {
     ) {
         fun describe(): String =
             "$profile ${width}x${height}@$fps ${bitrateKbps}kbps ${if (bitrateMode == 2) "CBR" else "VBR"}" +
-                    " QP I$qpIMin~$qpIMax P$qpPMin~$qpPMax GOP${gopSec}s 延迟${latencyMs}ms" +
+                    " QP上限$qpPMax GOP${gopSec}s 延迟${latencyMs}ms" +
                     " 限速${if (maxBwKbps > 0) "${maxBwKbps}kbps" else "不限"} 峰值${peakKbps}kbps" +
                     " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s)" else "关"}" +
                     " 关防抖=$disableStabilization"
@@ -176,7 +176,8 @@ object SrtDirectParams {
             qpIMin = qpIMin,
             qpIMax = int("qpIMax", 30).coerceIn(qpIMin, 51),
             qpPMin = qpPMin,
-            qpPMax = int("qpPMax", 33).coerceIn(qpPMin, 51),
+            // 编码器只用这一个 QP 上限（I/P 同一个，不设下限），不再被下限抬高
+            qpPMax = int("qpPMax", 33).coerceIn(10, 51),
             gopSec = int("gopSec", 2).coerceIn(1, 10),
             latencyMs = int("latencyMs", 800).coerceIn(80, 5000),
             maxBwKbps = int("maxBwKbps", 0).coerceIn(0, 200000),

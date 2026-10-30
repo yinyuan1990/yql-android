@@ -155,8 +155,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                     size.width != encodeWidth || size.height != encodeHeight ||
                     r.fps != enc.config.fps || r.plan.gopSec != enc.config.gopSec ||
                     r.plan.bitrateMode != enc.config.bitrateMode ||
-                    r.plan.qpIMin != enc.config.qpIMin || r.plan.qpIMax != enc.config.qpIMax ||
-                    r.plan.qpPMin != enc.config.qpPMin || r.plan.qpPMax != enc.config.qpPMax
+                    r.plan.qpPMax != enc.config.qpPMax
             if (!need && old == r) return@post   // 同一条指令多处重复落地（切档后又同步码率等），无变化不动
             if (need) {
                 rebuildEncoder(id, r, reason)
@@ -285,7 +284,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         onEncoderReady(cameraId, enc, r)
         cam.switchEncoder(enc.inputSurface!!, effectiveControls()) { old?.stop() }
         SdLog.i("换编码器（$reason）$fromDesc → ${size.width}x${size.height}@${r.fps} 目标${r.kbps}kbps" +
-                " GOP${r.plan.gopSec}s QP I${r.plan.qpIMin}~${r.plan.qpIMax} P${r.plan.qpPMin}~${r.plan.qpPMax}（SRT 不断）")
+                " GOP${r.plan.gopSec}s QP上限${r.plan.qpPMax}（SRT 不断）")
     }
 
     private fun onEncoderReady(cameraId: String, enc: SdH264Encoder, r: VideoReq) {
