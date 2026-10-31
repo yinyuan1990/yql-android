@@ -117,6 +117,11 @@ internal class SdCameraSource(
     private var lastPhysId: String? = null
     private var physSwitches = 0
     private var lastPhysLogMs = 0L
+    /** 当前会话输出绑定的物理主摄（null = 走逻辑摄像头，由 HAL 自己选镜头） */
+    private var lockedPhysId: String? = null
+    /** 绑主摄的会话配置失败过（换编码器尺寸时再试） */
+    @Volatile private var physLockUnsupported = false
+    private var mainPhysCache: Pair<String, String?>? = null
     @Volatile var previewDesc: String = "-"
         private set
     @Volatile var curExposureNs = 0L
@@ -187,7 +192,8 @@ internal class SdCameraSource(
                     if (now - lastPhysLogMs >= 1000) {
                         lastPhysLogMs = now
                         SdLog.i("📷 物理摄像头切换 $prev→$phys（累计 $physSwitches 次） 焦距=${result.get(CaptureResult.LENS_FOCUS_DISTANCE)} " +
-                                "exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms iso=$curIso")
+                                "exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms iso=$curIso" +
+                                (lockedPhysId?.let { "（画面已绑主摄 $it，不受影响）" } ?: ""))
                     }
                 }
                 lastPhysId = phys
@@ -320,6 +326,7 @@ internal class SdCameraSource(
             encoderSurface = newSurface
             params = newParams
             previewUnsupported = false
+            physLockUnsupported = false
             if (device != null && !closed) createSession()
         }
     }
@@ -345,8 +352,52 @@ internal class SdCameraSource(
     fun setControls(p: Camera2ParamApplier.Params) {
         handler.post {
             params = p
-            submitRepeating()
+            val lock = wantPhysLock(p)
+            if (lock != lockedPhysId && device != null && !closed) {
+                SdLog.i("📷 ${if (lock != null) "绑主摄 $lock" else "解除绑主摄（变焦≠1x 或已关闭）"} → 重建会话")
+                createSession()
+            } else {
+                submitRepeating()
+            }
         }
+    }
+
+    /**
+     * 逻辑多摄的主摄物理 id：焦距最接近逻辑摄像头标称焦距的那个。
+     * 三星等逻辑多摄近距离会自己在主摄 / 超广角之间来回切（4186652825：1.3 秒一次、画面一亮一暗），绑定后输出只来自主摄。
+     */
+    private fun mainPhysicalId(): String? {
+        if (android.os.Build.VERSION.SDK_INT < 28) return null
+        mainPhysCache?.let { if (it.first == cameraId) return it.second }
+        val c = chars ?: return null
+        val logical = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
+        val id = if (!logical) null else try {
+            val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val target = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+            val phys = c.physicalCameraIds.toList()
+            val focal = phys.associateWith {
+                cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+            }
+            val pick = if (target == null) null
+                else phys.filter { focal[it] != null }.minByOrNull { Math.abs(focal[it]!! - target) }
+            (pick ?: phys.firstOrNull()).also {
+                SdLog.i("📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$it")
+            }
+        } catch (t: Throwable) {
+            SdLog.w("读物理摄像头失败（不绑主摄）: ${t.message}")
+            null
+        }
+        mainPhysCache = cameraId to id
+        return id
+    }
+
+    /** 绑主摄只在 1x：物理流不吃逻辑摄像头的变焦（0.5x / 放大要交给 HAL 选镜头） */
+    private fun wantPhysLock(p: Camera2ParamApplier.Params): String? {
+        if (!p.lockMainLens || physLockUnsupported) return null
+        val z = p.zoom ?: 1f
+        if (z < 0.99f || z > 1.01f) return null
+        return mainPhysicalId()
     }
 
     val isRunning: Boolean get() = device != null && session != null
@@ -424,18 +475,22 @@ internal class SdCameraSource(
             previewUnsupported -> "无(带预览会话配置失败,只写编码器)"
             else -> "无(界面不可见,只写编码器)"
         }
-        try {
-            @Suppress("DEPRECATION")
-            camera.createCaptureSession(t, object : CameraCaptureSession.StateCallback() {
+        val lock = wantPhysLock(params)
+        lockedPhysId = lock
+        val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (closed || t !== targets) { s.close(); return }
                     session = s
                     submitRepeating()
-                    SdLog.i("摄像头会话就绪 输出=编码器+$previewDesc")
+                    SdLog.i("摄像头会话就绪 输出=编码器+$previewDesc" + (lock?.let { " 绑主摄=物理$it" } ?: ""))
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    if (preview != null) {
+                    if (lock != null) {
+                        SdLog.w("绑主摄 $lock 的会话配置失败 → 改回逻辑摄像头（HAL 自己选镜头）")
+                        physLockUnsupported = true
+                        handler.post { createSession() }
+                    } else if (preview != null) {
                         SdLog.w("带预览的会话配置失败 → 改为只写编码器（预览尺寸可能不匹配）")
                         previewUnsupported = true
                         handler.post { createSession() }
@@ -447,9 +502,24 @@ internal class SdCameraSource(
                         listener.onCameraError("摄像头会话配置失败（该分辨率可能不被支持）")
                     }
                 }
-            }, handler)
+            }
+        try {
+            if (lock != null && android.os.Build.VERSION.SDK_INT >= 28) {
+                val outs = t.map { android.hardware.camera2.params.OutputConfiguration(it).apply { setPhysicalCameraId(lock) } }
+                @Suppress("DEPRECATION")
+                camera.createCaptureSessionByOutputConfigurations(outs, callback, handler)
+            } else {
+                @Suppress("DEPRECATION")
+                camera.createCaptureSession(t, callback, handler)
+            }
         } catch (t2: Throwable) {
-            listener.onCameraError("创建摄像头会话失败: ${t2.message}")
+            if (lock != null) {
+                SdLog.w("绑主摄 $lock 建会话异常 → 改回逻辑摄像头: ${t2.message}")
+                physLockUnsupported = true
+                handler.post { createSession() }
+            } else {
+                listener.onCameraError("创建摄像头会话失败: ${t2.message}")
+            }
         }
     }
 

@@ -9,6 +9,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.util.Log
 import com.fz.yqlandroid.config.APIConfig
+import com.fz.yqlandroid.manager.srtdirect.SdLog
 import com.google.gson.Gson
 import kotlinx.coroutines.*
 import okhttp3.*
@@ -135,6 +136,8 @@ class WebSocketManager private constructor() {
 
     /** 连续重连失败次数（STOMP CONNECTED 清零），决定下一次重连等待 */
     private var reconnectAttempt = 0
+    /** 异常断开的时刻（重连上清零），SRT 日志写断了多久 */
+    private var downSinceMs = 0L
 
     /** 回调来自已被替换的旧 socket（主动重连后旧连接迟到的 closed/failure）→ 忽略，防把新连接状态改成断开 */
     private fun isStale(ws: WebSocket): Boolean = webSocket != null && ws !== webSocket
@@ -190,13 +193,13 @@ class WebSocketManager private constructor() {
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 println("wb [WS] 🔌 正在关闭: code=$code, reason=$reason")
                 if (isStale(webSocket)) return
-                updateState(false)
+                markDown("服务器关闭 code=$code")
             }
             
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 println("wb [WS] 🔌 已关闭: code=$code, reason=$reason, 手动=$isManualDisconnect")
                 if (isStale(webSocket)) return
-                updateState(false)
+                markDown("已关闭 code=$code")
                 // ⭐ §71 后端传输层硬踢（4001=kicked-by-new-install）：不重连，走被踢下线流程
                 if (code == 4001) {
                     isManualDisconnect = true
@@ -212,7 +215,7 @@ class WebSocketManager private constructor() {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 println("wb [WS] ❌ 连接失败: ${t.message}, response=${response?.code}")
                 if (isStale(webSocket)) return
-                updateState(false)
+                markDown("连接失败 ${t.message}${response?.code?.let { " HTTP $it" } ?: ""}")
                 if (!isManualDisconnect) {
                     scheduleReconnect()  // 🔥 只有非手动断开才重连
                 }
@@ -266,6 +269,10 @@ class WebSocketManager private constructor() {
             "CONNECTED" -> {
                 println("wb [WS] ✅ STOMP已连接")
                 stompConnected = true
+                if (downSinceMs > 0) {
+                    SdLog.i("✅ 指令通道(WS)重连上：断了 ${(System.currentTimeMillis() - downSinceMs) / 1000}s，重试 $reconnectAttempt 次")
+                    downSinceMs = 0
+                }
                 reconnectAttempt = 0
                 updateState(true)
                 
@@ -962,6 +969,19 @@ class WebSocketManager private constructor() {
         }
     }
     
+    /**
+     * 异常断开。stompConnected 必须一起清掉：不清的话重连时 [connect] 以为还连着直接跳过，
+     * 指令通道永远回不来（画面照推，PC 控制 / 唤醒不了，20s 后手机自己回超低网）。
+     */
+    private fun markDown(why: String) {
+        stompConnected = false
+        updateState(false)
+        if (!isManualDisconnect && downSinceMs == 0L) {
+            downSinceMs = System.currentTimeMillis()
+            SdLog.w("🔌 指令通道(WS)断开：$why，自动重连")
+        }
+    }
+
     private fun updateState(connected: Boolean) {
         isConnected = connected
         connectionStatus = if (connected) "已连接" else "未连接"

@@ -246,6 +246,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         return controls.copy(
             targetFps = r?.fps ?: controls.targetFps,
             disableStabilization = r?.plan?.disableStabilization ?: true,
+            lockMainLens = r?.plan?.lockMainLens ?: true,
         )
     }
 

@@ -56,6 +56,8 @@ object Camera2ParamApplier {
         val srtIso: Int = 0,
         // PC「边缘锐化」（原「清晰度(P)」）0..1（iOS 是连续软件锐化）；Camera2 只有硬件 EDGE_MODE 三档：<0.1 关 / <0.5 标准 / 其余 强
         val sharpness: Float? = null,
+        // SRT直推：逻辑多摄 1x 时输出绑主摄（只由 SdCameraSource 使用）
+        val lockMainLens: Boolean = false,
     )
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
