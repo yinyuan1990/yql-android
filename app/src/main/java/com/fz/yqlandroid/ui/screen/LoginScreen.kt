@@ -62,8 +62,8 @@ fun LoginScreen(
     var password by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var rememberPassword by remember { mutableStateOf(false) }
-    // 推流方式："srt" = SRT直推（MediaMTX，与 srtapp 同一套 srtdirect）= 「登录」按钮；
-    //   "srs" = 原 WebRTC（SRS/P2P）= 左上角「老版本登录」。存 login_prefs，登录成功时写 token_prefs.force_webrtc
+    // 推流方式："srt" = SRT直推（MediaMTX，与 srtapp 同一套 srtdirect）；"srs" = 原 WebRTC（SRS/P2P）= 左上角「老版本登录」；
+    //   "default" =「登录」按钮，登录成功后按后端 loginPublishMode 定（没下发 = srt）。存 login_prefs，登录成功时写 token_prefs.force_webrtc
     var publishMode by remember { mutableStateOf("srt") }
     // 左上角「老版本登录」在登录表单外面，点击时调表单里定义的登录流程
     var loginWithMode: (String) -> Unit = {}
@@ -399,6 +399,9 @@ fun LoginScreen(
                             
                             result.fold(
                                 onSuccess = { response ->
+                                    if (publishMode == "default") {
+                                        publishMode = if (response.loginPublishMode == "srs") "srs" else "srt"
+                                    }
                                     // 🔥 Step 1: 保存登录凭证（与iOS一致）
                                     val prefs = context.getSharedPreferences("login_prefs", Context.MODE_PRIVATE)
                                     prefs.edit().apply {
@@ -582,7 +585,7 @@ fun LoginScreen(
             }
 
             Button(
-                onClick = { loginWithMode("srt") },
+                onClick = { loginWithMode("default") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp),
