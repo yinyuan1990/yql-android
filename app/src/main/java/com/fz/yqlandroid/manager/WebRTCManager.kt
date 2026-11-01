@@ -815,6 +815,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
         renderer.setMirror(isFrontCamera)
         renderer.setEnableHardwareScaler(true)
+        // 页内从 SRT 切到 SRS 时采集已在跑（startPreview 会直接返回），新预览控件要自己挂上
+        localVideoTrack?.addSink(renderer)
     }
     
     fun startPreview() {
@@ -2445,7 +2447,58 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     }
 
     /** §132 本机推流方式是否 SRT（启动时读一次；force_webrtc 回退开关只在重启 App 后生效） */
-    private val srtTransport: Boolean by lazy { isSrtTransport(context) }
+    private val srtTransportAtStart: Boolean by lazy { isSrtTransport(context) }
+    /** 推流页内切 SRS / SRT（switchPublishModeInPlace）后的值；null = 用进页时读的 */
+    @Volatile private var srtTransportOverride: Boolean? = null
+    private val srtTransport: Boolean get() = srtTransportOverride ?: srtTransportAtStart
+
+    /** 推流页内切了推流方式（true = SRT直推）：界面据此换预览控件（后台时等回前台重组再换） */
+    var onPublishModeSwitched: ((Boolean) -> Unit)? = null
+
+    /**
+     * 总后台 / PC 下发推流方式：不退回登录页，在推流页里直接切 SRS ↔ SRT。
+     * 原来退登录页自动重登，登录页是 Compose 界面，App 在后台不重组 → 要等用户点开 App 才登上去；
+     * 登录时 SRT 节点 / srtParams / SRS 推流地址都已存好，换方式不用重新登录。主线程调用。
+     */
+    fun switchPublishModeInPlace(mode: String) {
+        val toSrt = mode == "srt"
+        if (usingOtgCamera || toSrt == srtTransport) return
+        val ip = srsIP
+        val appName = app
+        val key = baseStreamKey
+        val wasPublishing = isPublishing || publishStarting
+        srtLog("🔀 推流方式切换 ${if (toSrt) "SRS → SRT" else "SRT → SRS"}（页内切换，不重新登录）推流中=$wasPublishing")
+        Log.d("meidui", "🔀 [推流方式] 页内切换 → ${if (toSrt) "SRT" else "SRS"}，推流中=$wasPublishing")
+
+        stopPublish()
+        stopPreview()
+        if (toSrt) {
+            localRenderer?.let { r ->
+                try { localVideoTrack?.removeSink(r) } catch (_: Exception) {}
+                try { r.release() } catch (_: Exception) {}
+            }
+            localRenderer = null
+        } else {
+            srtEngine?.release()
+            srtEngine = null
+            currentConnMode = ConnMode.SRS
+        }
+
+        context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("force_webrtc", !toSrt).apply()
+        context.getSharedPreferences("login_prefs", Context.MODE_PRIVATE).edit()
+            .putString("publish_mode", mode).apply()
+        srtTransportOverride = toSrt
+        if (!toSrt) initialize()
+
+        onPublishModeSwitched?.invoke(toSrt)
+        try {
+            startPreview()
+        } catch (e: Exception) {
+            Log.e(TAG, "切换推流方式后启动采集失败: ${e.message}")
+        }
+        if (wasPublishing && key.isNotEmpty()) startPublish(ip, appName, key)
+    }
 
     // MARK: - §126 防频闪（对齐 iOS onAntiFlickerCommand + lockFrameRate）
     // 50Hz 市电灯光按 100Hz 闪：采集帧率是 100 的整数约数时，每帧都在灯光同一相位开始曝光，

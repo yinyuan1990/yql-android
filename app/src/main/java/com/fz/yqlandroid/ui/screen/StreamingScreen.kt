@@ -86,7 +86,7 @@ fun StreamingScreen(
     //   （保活见 KeepAliveManager，两种模式相同）。force_webrtc 回退时仍强制常亮。
     val srtMode = remember { WebRTCManager.isSrtTransport(context) }
     // ⭐ §134 SRT直推（默认 SRT + 自带摄像头）：预览用 SurfaceView 挂进 Camera2 会话
-    val srtDirect = remember { WebRTCManager.isSrtDirect(context) }
+    var srtDirect by remember { mutableStateOf(WebRTCManager.isSrtDirect(context)) }
 
     // 🖥️ 前台常亮（对标 iOS isIdleTimerDisabled）：进入推流页时禁止自动息屏，离开时恢复
     //   §132：SRT 模式不加（屏幕按系统设置自动熄灭，熄屏后预览不再绘制，推流继续）
@@ -220,23 +220,20 @@ fun StreamingScreen(
             android.util.Log.d("meidui", "ℹ️ [线路] 收到已废弃的 onNotSameWifi（§53.4 改为自动重新协商），忽略")
         }
         
+        webRTCManager.onPublishModeSwitched = { toSrt -> srtDirect = toSrt }
+
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
         WebSocketManager.instance.onConfigUpdate = { config ->
             val ptype = config["ptype"] as? String ?: ""
-            // 总后台 / PC 切推流方式：和「关闭」一样退回登录页，登录页按新方式自动重登一次
+            // 总后台 / PC 切推流方式：推流页内直接切（不退登录页，App 在后台也能切完）
             if (ptype == "publish_mode") {
                 val sw = com.fz.yqlandroid.manager.PublishModeSwitch
                 val mode = sw.normalize(config["mode"])
                 if (mode != null && mode != sw.currentMode(context)) {
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        if (sw.pendingMode != null) return@post
-                        android.util.Log.d("meidui", "🔀 [推流方式] 总后台 / PC 下发 ${sw.modeName(mode)} → 退回登录页自动重登")
-                        android.widget.Toast.makeText(context, "推流方式切换为${sw.modeName(mode)}，正在重新登录…", android.widget.Toast.LENGTH_SHORT).show()
-                        sw.pendingMode = mode
-                        if (isStreaming) webRTCManager.stopPublish()
-                        keepAliveManager.stop()
-                        WebSocketManager.instance.disconnect()
-                        onLogout()
+                        android.util.Log.d("meidui", "🔀 [推流方式] 总后台 / PC 下发 ${sw.modeName(mode)} → 页内切换")
+                        android.widget.Toast.makeText(context, "推流方式切换为${sw.modeName(mode)}", android.widget.Toast.LENGTH_SHORT).show()
+                        webRTCManager.switchPublishModeInPlace(mode)
                     }
                 }
             }
