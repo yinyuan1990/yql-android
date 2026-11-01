@@ -385,6 +385,11 @@ class WebSocketManager private constructor() {
                     if (config != null) {
                         val ptype = config["ptype"] as? String ?: ""
                         Log.d(TAG, "📥 收到配置更新: ptype=$ptype, config=$config")
+                        // 推流方式切换不是设备配置，不进缓存（推流页处理：退回登录页按新方式自动重登）
+                        if (ptype == "publish_mode") {
+                            onConfigUpdate?.invoke(config)
+                            return
+                        }
                         
                         // 🔥 更新ConfigManager缓存（与iOS一致）
                         try {
@@ -711,6 +716,9 @@ class WebSocketManager private constructor() {
             "streamPushIp" to streamPushIp,
             "connectstype" to connectstype,
             "connectMode" to connectMode,
+            // 支持被 PC / 总后台切推流方式（ptype=publish_mode）；publishMode = 当前方式 srt / srs
+            "publishSwitch" to true,
+            "publishMode" to (if (tokenPrefs?.getBoolean("force_webrtc", true) != false) "srs" else "srt"),
             // ⭐ H265：P2P 实际生效编码（"h264"/"h265"），PC 据此选择解码管线（与 iOS 一致）
             "videoCodec" to H265Support.effectiveCodec,
             // ⭐ §53.4.5「互相监督」：本次链路/编码是**怎么定下来的**（人话），PC 顶栏直接显示

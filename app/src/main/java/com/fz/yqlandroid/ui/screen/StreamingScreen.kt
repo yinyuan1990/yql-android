@@ -223,6 +223,23 @@ fun StreamingScreen(
         // 🔥 监听后端配置下发 → 同步UI数据 + 实际执行控制
         WebSocketManager.instance.onConfigUpdate = { config ->
             val ptype = config["ptype"] as? String ?: ""
+            // 总后台 / PC 切推流方式：和「关闭」一样退回登录页，登录页按新方式自动重登一次
+            if (ptype == "publish_mode") {
+                val sw = com.fz.yqlandroid.manager.PublishModeSwitch
+                val mode = sw.normalize(config["mode"])
+                if (mode != null && mode != sw.currentMode(context)) {
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        if (sw.pendingMode != null) return@post
+                        android.util.Log.d("meidui", "🔀 [推流方式] 总后台 / PC 下发 ${sw.modeName(mode)} → 退回登录页自动重登")
+                        android.widget.Toast.makeText(context, "推流方式切换为${sw.modeName(mode)}，正在重新登录…", android.widget.Toast.LENGTH_SHORT).show()
+                        sw.pendingMode = mode
+                        if (isStreaming) webRTCManager.stopPublish()
+                        keepAliveManager.stop()
+                        WebSocketManager.instance.disconnect()
+                        onLogout()
+                    }
+                }
+            }
             
             // 1️⃣ 同步UI数据（显示用）
             when (ptype) {
@@ -248,7 +265,7 @@ fun StreamingScreen(
             }
             
             // 2️⃣ 实际执行控制（调用WebRTC）
-            webRTCManager.applyRemoteConfig(config)
+            if (ptype != "publish_mode") webRTCManager.applyRemoteConfig(config)
         }
         
         // 🔥 监听特殊消息（RESET_PUBLISH/睡眠/唤醒/试用断开）

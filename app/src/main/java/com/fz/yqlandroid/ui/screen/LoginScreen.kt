@@ -111,6 +111,24 @@ fun LoginScreen(
         }
         // ⭐ 强制更新检查（公共接口，失败放行不拦门）
         forceUpdate = com.fz.yqlandroid.manager.AppUpdateManager.checkForceUpdate(context)
+        // 总后台 / PC 切了推流方式：按新方式自动登录一次；没存密码（本次也没登录过）就提示手动登录
+        val sw = com.fz.yqlandroid.manager.PublishModeSwitch
+        sw.pendingMode?.let { mode ->
+            sw.pendingMode = null
+            if (password.isBlank() && sw.lastPassword.isNotBlank()) {
+                username = sw.lastUsername
+                password = sw.lastPassword
+            }
+            val name = sw.modeName(mode)
+            if (forceUpdate != null) return@let
+            if (username.isBlank() || password.isBlank()) {
+                errorDialog = "推流方式已切换为$name，请输入密码后点「${if (mode == "srs") "老版本登录" else "登录"}」"
+            } else {
+                Toast.makeText(context, "推流方式已切换为$name，正在自动登录…", Toast.LENGTH_SHORT).show()
+                kotlinx.coroutines.delay(500)
+                loginWithMode(mode)
+            }
+        }
     }
     
     // 渐变背景
@@ -392,6 +410,8 @@ fun LoginScreen(
                                         }
                                         putBoolean("remember", rememberPassword)
                                         putString("publish_mode", publishMode)
+                                        com.fz.yqlandroid.manager.PublishModeSwitch.lastUsername = username
+                                        com.fz.yqlandroid.manager.PublishModeSwitch.lastPassword = password
                                         // ⭐ §140：摄像头一栏已移除，清掉老版本记住的选择
                                         remove("selected_camera_mode")
                                         apply()
