@@ -112,6 +112,28 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
     /** §143 SRT直推相关日志：logcat（meidui）+ 总后台「SRT日志」上报 */
     private fun srtLog(msg: String) = com.fz.yqlandroid.manager.srtdirect.SdLog.i(msg)
 
+    /** SRS 的 1920×1440 / 2K / 4K 三档（SrsHdLog 只记这三档） */
+    private fun isSrsHdProfile(p: LadderProfile) =
+        p == LadderProfile.P1440 || p == LadderProfile.SRT2K || p == LadderProfile.SRT4K
+
+    private fun srsHdLog(msg: String) = com.fz.yqlandroid.manager.srtdirect.SrsHdLog.line(msg)
+
+    private fun srsHdTarget(p: LadderProfile): Pair<Int, Int> {
+        val (defW, defH, _) = iosTargets[p] ?: return currentWidth to currentHeight
+        val cfg = LadderConfigStore.entryOf(p)
+        return if (cfg.w > 0 && cfg.h > 0) cfg.w to cfg.h else defW to defH
+    }
+
+    /** 当前摄像头 1920 以上的采集尺寸（≤该尺寸可用帧率），看前置 / 后置到底有没有 1920×1440 / 2K / 4K */
+    private fun srsHdCameraDesc(): String {
+        val sizes = if (isFrontCamera) frontCameraFormats else backCameraFormats
+        val sizeFps = if (isFrontCamera) frontSizeMaxFps else backSizeMaxFps
+        val list = sizes.filter { maxOf(it.width, it.height) >= 1920 }
+            .sortedBy { it.width * it.height }
+            .joinToString(" ") { "${it.width}x${it.height}≤${sizeFps[it] ?: "?"}" }
+        return "${if (isFrontCamera) "前置" else "后置"} 1920以上尺寸[${list.ifEmpty { "无" }}]"
+    }
+
     /** PC 会周期性重发同一个 cjfps/test_brightness：SRT直推下被忽略的键同值只记一次 */
     private val srtIgnoredLogged = java.util.concurrent.ConcurrentHashMap<String, String>()
     private fun srtLogIgnoredOnce(key: String, value: Any?, msg: String) {
@@ -474,10 +496,14 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         LadderProfile.HIGH to Triple(1440, 1080, false),     // 超清   4:3
         LadderProfile.STANDARD to Triple(1024, 768, false),  // 高清   4:3
         LadderProfile.ULTRA to Triple(1280, 720, true),      // 超高帧 16:9
-        LadderProfile.LOW to Triple(640, 480, false)         // 超低网 4:3（§21.28 第5档）
+        LadderProfile.LOW to Triple(640, 480, false),        // 超低网 4:3（§21.28 第5档）
+        // SRT码档 2K / 4K：SRS 也能推（尺寸 / 码率跟 SRT直推同一套 srtParams，见 calculateLadder 的 highResPreset）
+        LadderProfile.SRT2K to Triple(2560, 1440, true),
+        LadderProfile.SRT4K to Triple(3840, 2160, true)
     )
 
-    private fun calculateLadder(front: Boolean) {
+    /** applyDefault=false：只重算档位表、不套默认高清档（切摄像头时由调用方按原档位套一次） */
+    private fun calculateLadder(front: Boolean, applyDefault: Boolean = true) {
         val formats = if (front) frontCameraFormats else backCameraFormats
         val maxFps = if (front) frontMaxFps else backMaxFps
         val sizeMaxFps = if (front) frontSizeMaxFps else backSizeMaxFps
@@ -557,6 +583,25 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 is16x9 = false
             )
         }
+        // SRT码档 2K / 4K（SRS 也能推）：目标尺寸 / 码率取总后台「视频码率档位」的 srt2k / srt4k（没配用内置默认），
+        //   采集就近 16:9（不要求 60fps，4K 一般只有 30）；采集比目标大就 scaleResolutionDownBy 缩到目标
+        fun highResPreset(profile: LadderProfile): LadderPreset {
+            val (defW, defH, _) = iosTargets[profile]!!
+            val cfg = LadderConfigStore.entryOf(profile)
+            val tw = if (cfg.w > 0 && cfg.h > 0) cfg.w else defW
+            val th = if (cfg.w > 0 && cfg.h > 0) cfg.h else defH
+            val cap = findBestResolution(formats, tw, th, tw.toDouble() / th,
+                sizeMaxFps, desiredFps, fpsPriority = false)
+            return LadderPreset(
+                width = cap.width, height = cap.height,
+                fps = fpsFor(cap, profile), maxKbps = cfg.maxKbps, minKbps = cfg.minKbps,
+                maxPushFps = 30, scaleDown = maxOf(1.0, cap.height.toDouble() / th), is16x9 = true
+            ).also {
+                Log.d("meidui", "📐 ${profileName(profile)} SRS 目标${tw}x${th} → 实采${cap.width}x${cap.height}" +
+                        "@${it.fps}fps 缩放/${"%.2f".format(it.scaleDown)} ${it.minKbps}-${it.maxKbps}kbps")
+            }
+        }
+
         Log.d("meidui", "📐 超低网(low)决策: 原生640x480就近=${lowCap.width}x${lowCap.height}@${lowNativeFps}fps, " +
                 "STANDARD采集=${stdCap.width}x${stdCap.height}@${stdFps}fps → " +
                 if (lowPreset.scaleDown > 1.0) "采集${lowPreset.width}x${lowPreset.height}缩放/${"%.2f".format(lowPreset.scaleDown)}到640x480"
@@ -591,11 +636,13 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 width = ultraCap.width, height = ultraCap.height,
                 fps = fpsFor(ultraCap, LadderProfile.ULTRA), maxKbps = cfgUltra.maxKbps, minKbps = cfgUltra.minKbps,
                 maxPushFps = 60, scaleDown = 1.0, is16x9 = true
-            )
+            ),
+            LadderProfile.SRT2K to highResPreset(LadderProfile.SRT2K),
+            LadderProfile.SRT4K to highResPreset(LadderProfile.SRT4K)
         )
         
         // 默认高清档
-        applyProfile(LadderProfile.STANDARD)
+        if (applyDefault) applyProfile(LadderProfile.STANDARD)
         
         val cameraType = if (front) "前置" else "后置"
         Log.d(TAG, "═══════════════════════════════════════════")
@@ -628,6 +675,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             return
         }
         val preset = currentLadder[profile] ?: return
+        val oldProfile = currentProfile
         currentProfile = profile
         
         // 🔥 采集分辨率 = 该档位就近选定的设备分辨率（每档独立，直接采集不缩放，与iOS一致）
@@ -663,6 +711,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         }
         
         Log.d(TAG, "🎯 档位切换: ${profileName(profile)} → 采集${currentWidth}x${currentHeight}@${currentFps}fps, 码率${currentMinBitrateKbps}-${currentBitrateKbps}kbps, scale=${"%.2f".format(preset.scaleDown)}")
+        if (isSrsHdProfile(profile) || isSrsHdProfile(oldProfile)) {
+            val (tw, th) = srsHdTarget(profile)
+            srsHdLog("切档 ${profileName(oldProfile)} → ${profileName(profile)}：目标输出 ${tw}x${th}" +
+                    " 采集 ${currentWidth}x${currentHeight}@${captureFps()} 缩放/${"%.2f".format(preset.scaleDown)}" +
+                    " 码率 ${preset.minKbps}-${preset.maxKbps}kbps ${srsHdCameraDesc()}")
+        }
     }
     
     /**
@@ -988,6 +1042,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         if (srtDirectMode) {
             startSrtPublish()   // 异步：publishStarting 由其 finally 清零
             return
+        }
+        com.fz.yqlandroid.manager.srtdirect.SrsHdLog.sessionBegin(streamKey,
+            (context.getSharedPreferences("token_prefs", Context.MODE_PRIVATE).getString("username", "") ?: "").replace(":", ""))
+        if (isSrsHdProfile(currentProfile)) {
+            srsHdLog("开始推流 档位=${profileName(currentProfile)} ${srsHdCameraDesc()}")
         }
 
         // ⭐ §53.4.1 宽限期：推流那一刻若还没收到任何 PC_PRESENCE（两端登录有先后，刚开机时
@@ -1418,6 +1477,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
 
         // ⭐ P2P诊断日志上报：停流即冲刷剩余并停止采集
         P2PLogReporter.stop()
+        com.fz.yqlandroid.manager.srtdirect.SrsHdLog.sessionEnd()
 
         // ⭐ §129 SRT 模式：关推流器即可（SRT 断开 = SRS 自动 unpublish，无需 deleteStream）
         if (currentConnMode == ConnMode.SRT) {
@@ -2314,6 +2374,17 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                                     //   tgt=WebRTC 给编码器的目标码率、帧=本秒 I/P 帧大小与关键帧请求（延后=被 2s 限频推迟）
                                     "qp=$qpAvg tgt=${(targetBitrateBps / 1000).toInt()}k ${frameWidth}x${frameHeight} " +
                                     "帧=${EncoderFrameGate.snapshotAndReset()}")
+                            if (!srtDirectMode && isSrsHdProfile(currentProfile) &&
+                                com.fz.yqlandroid.manager.srtdirect.SrsHdLog.shouldTick()) {
+                                val (tw, th) = srsHdTarget(currentProfile)
+                                val shrunk = frameWidth > 0 && maxOf(frameWidth, frameHeight) < maxOf(tw, th)
+                                srsHdLog("统计 ${profileName(currentProfile)} 目标输出 ${tw}x${th} 实际发出 ${frameWidth}x${frameHeight}" +
+                                        "${if (shrunk) "（比目标小）" else ""} 采集${currentWidth}x${currentHeight}" +
+                                        " 相机${capFps}fps 编码${encFps}fps 发送${sentFps}fps 码率${kbps}kbps" +
+                                        " 目标码率${(targetBitrateBps / 1000).toInt()}k 区间${currentMinBitrateKbps}-${currentBitrateKbps}" +
+                                        " 清晰度${_currentQualityPercent}% qp=$qpAvg 编码受限=$qualityLimit RTT${rttMs}ms" +
+                                        " 丢包${"%.2f".format(instantLoss * 100)}% NACK+$nackDelta 编码器=$encoderImpl")
+                            }
                             // ⭐ [meidui 诊断] P2P 推送 fps=0 定性：一行说清卡在哪一层
                             if (currentConnMode == ConnMode.P2P && fps == 0) {
                                 val reason = when {
@@ -2393,7 +2464,20 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                 localRenderer?.setMirror(isFront)
                 
                 // 🔥 切换后重新计算档位（前后置能力不同）
-                calculateLadder(isFront)
+                // calculateLadder 末尾会套回高清档：切完按原档位重新套，否则 1920×1440 / 2K / 4K 一切摄像头就掉成高清、PC 还显示原档
+                // 这个回调跑在 WebRTC 相机线程上：在这里连续 changeCaptureFormat 会和相机会话打开互等 → 相机线程死锁、
+                //   0 帧卡死（shiji034p 4K 切前置实锤）。只重算档位表，回主线程按原档位套一次（只换一次采集格式）。
+                val keepProfile = currentProfile
+                calculateLadder(isFront, applyDefault = false)
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    val target = if (currentLadder.containsKey(keepProfile)) keepProfile else LadderProfile.STANDARD
+                    applyProfile(target)
+                    setEncodingParameters()
+                    if (isSrsHdProfile(currentProfile)) {
+                        srsHdLog("切换到${if (isFront) "前置" else "后置"}摄像头 档位=${profileName(currentProfile)}" +
+                                " 采集 ${currentWidth}x${currentHeight}@${captureFps()} ${srsHdCameraDesc()}")
+                    }
+                }
 
                 // §106 新摄像头到不了 <1 倍 → 记忆值回 1.0（切回后置也保持 1.0，与 PC 显示一致）
                 if (_currentZoom < 1f && currentMinZoomRatio() >= 1f) _currentZoom = 1f
@@ -2961,9 +3045,11 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             "type" -> {
                 val type = config["type"] as? String ?: ""
                 val profile = when (type.lowercase()) {
-                    // 10-28 起金凤凰不支持 SRT全码：SRT码档（1920×1440 / 2K / 4K）一律按超高清 1920×1080
-                    //   （要用这几档装 jfhcs / 健康养生）
-                    "srt2k", "srt4k", "p1440", "p4k", "4k" -> LadderProfile.P4K
+                    // SRT码档（1920×1440 / 2K / 4K）SRT直推、SRS 都能推（PC / 后端按 SRT全码 + 流量放开）
+                    "srt2k" -> LadderProfile.SRT2K
+                    "srt4k" -> LadderProfile.SRT4K
+                    "p1440" -> LadderProfile.P1440
+                    "p4k", "4k" -> LadderProfile.P4K
                     "ultra" -> LadderProfile.ULTRA
                     "high" -> LadderProfile.HIGH
                     // §21.28 超低网独立成档（PC 发 type="low"；此前落 else 与高清同档）

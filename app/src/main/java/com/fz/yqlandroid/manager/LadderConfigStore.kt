@@ -42,6 +42,9 @@ object LadderConfigStore {
     const val ULTRA = "ultra"
     const val STANDARD = "standard"
     const val LOW = "low"
+    /** SRT码档 2K / 4K 在 SRS（WebRTC）推流时的码率（SRT直推的在 srtParams 里配） */
+    const val SRT2K = "srt2k"
+    const val SRT4K = "srt4k"
 
     /**
      * 内置默认值（后端没配时用这套）。
@@ -53,7 +56,9 @@ object LadderConfigStore {
         HIGH to Entry(1440, 1080, 0, 5000, 3000),
         ULTRA to Entry(1280, 720, 0, 5000, 3000),
         STANDARD to Entry(1024, 768, 0, 4500, 2700),
-        LOW to Entry(640, 480, 0, 3000, 1800)
+        LOW to Entry(640, 480, 0, 3000, 1800),
+        SRT2K to Entry(2560, 1440, 0, 10000, 6000),
+        SRT4K to Entry(3840, 2160, 0, 16000, 9600)
     )
 
     /** 后端下发值（登录时落盘，进程启动时 load 一次） */
@@ -99,7 +104,7 @@ object LadderConfigStore {
             val root = JSONObject(json)
             remoteCaptureFps = root.optInt("captureFps", 0).coerceIn(0, 240)
             val parsed = mutableMapOf<String, Entry>()
-            for (name in listOf(P1440, P4K, HIGH, ULTRA, STANDARD, LOW)) {
+            for (name in listOf(P1440, P4K, HIGH, ULTRA, STANDARD, LOW, SRT2K, SRT4K)) {
                 val o = root.optJSONObject(name) ?: continue
                 val def = DEFAULTS[name]!!
                 // 逐字段兜底：后端缺项/给 0 就用默认值那一项
@@ -133,7 +138,9 @@ object LadderConfigStore {
 
     fun nameOf(profile: LadderProfile): String = when (profile) {
         LadderProfile.P4K -> P4K
-        LadderProfile.P1440, LadderProfile.SRT2K, LadderProfile.SRT4K -> P1440
+        LadderProfile.P1440 -> P1440
+        LadderProfile.SRT2K -> SRT2K
+        LadderProfile.SRT4K -> SRT4K
         LadderProfile.HIGH -> HIGH
         LadderProfile.ULTRA -> ULTRA
         LadderProfile.STANDARD -> STANDARD
