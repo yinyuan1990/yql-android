@@ -40,6 +40,8 @@ internal class SdH264Encoder(
         val qpPMin: Int,
         val qpPMax: Int,
         val gopSec: Int,
+        /** 码率失控保护触发：不设 QP 上下限，只按码率 */
+        val noQp: Boolean = false,
     )
 
     companion object {
@@ -112,6 +114,7 @@ internal class SdH264Encoder(
     fun start() {
         var lastError: Throwable? = null
         for ((name, opts) in TIERS) {
+            if (cfg.noQp && opts and OPT_QP != 0) continue
             val c = try { MediaCodec.createEncoderByType(MIME) } catch (t: Throwable) {
                 throw IllegalStateException("创建 H.264 编码器失败: ${t.message}", t)
             }
@@ -128,7 +131,7 @@ internal class SdH264Encoder(
                 qpConfigured = opts and OPT_QP != 0
                 SdLog.i("编码器就绪 ${c.name} 降级档[$name] ${cfg.width}x${cfg.height}@${cfg.fps} 目标${cfg.bitrateKbps}kbps" +
                         " ${if (actualBitrateMode == 2) "CBR" else "VBR"}${if (actualBitrateMode != cfg.bitrateMode) "(编码器不支持CBR，退回VBR)" else ""} GOP${cfg.gopSec}s" +
-                        " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个）" else "未设(编码器不认)"}" +
+                        " QP上限 ${if (qpConfigured) "${cfg.qpPMax}（I/P 同一个）" else if (cfg.noQp) "去掉(码率失控保护，只按码率)" else "未设(编码器不认)"}" +
                         " QP下限 ${if (qpConfigured && cbrQpMinEff() > 0) "${cbrQpMinEff()}（CBR）" else "不设"}")
                 return
             } catch (t: Throwable) {
@@ -233,7 +236,7 @@ internal class SdH264Encoder(
      * @return false = 系统版本不支持运行中改 QP（调用方改用降码率）
      */
     fun setPMaxQp(qpMax: Int): Boolean {
-        if (Build.VERSION.SDK_INT < 31) return false
+        if (Build.VERSION.SDK_INT < 31 || cfg.noQp) return false
         val c = codec ?: return false
         handler.post {
             try {
@@ -250,7 +253,7 @@ internal class SdH264Encoder(
 
     /** 运行中改 I 帧 QP 上限（拥塞保护用；同 [setPMaxQp]，Android 12+） */
     fun setIMaxQp(qpMax: Int): Boolean {
-        if (Build.VERSION.SDK_INT < 31) return false
+        if (Build.VERSION.SDK_INT < 31 || cfg.noQp) return false
         val c = codec ?: return false
         handler.post {
             try {

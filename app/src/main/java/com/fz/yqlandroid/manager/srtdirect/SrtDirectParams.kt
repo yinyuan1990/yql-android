@@ -12,6 +12,7 @@ import org.json.JSONObject
  * { presets: { low|standard|high|ultra|p4k: {width,height,fps,bitrateKbps, …可选覆盖任意全局键} },
  *   bitrateMode:1(VBR)/2(CBR), cbrQpMin(只在 CBR 时设的 QP 下限，0/不填=不设), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
  *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization, lockMainLens(默认 true),
+ *   runawayGuard(码率失控保护，默认 true，可按档位 / 按账号关),
  *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }（降噪不再手动设，交给相机硬件；老后台带的 noiseReduction 忽略）
  * ```
  * 档位里可再带 `peakKbps/latencyMs/gopSec/qp*` 等，覆盖全局值（如 4K 档峰值 24000、延迟 1000）。
@@ -73,13 +74,16 @@ object SrtDirectParams {
         val disableStabilization: Boolean,
         /** 逻辑多摄（三星等）1x 时把输出绑在主摄上，HAL 自己切超广角也不影响画面；false = 交给 HAL */
         val lockMainLens: Boolean,
+        /** 码率失控保护：编码器守 QP 不守码率、上行扛不住时临时去掉 QP 上限（见 SrtDirectEngine） */
+        val runawayGuard: Boolean,
     ) {
         fun describe(): String =
             "$profile ${width}x${height}@$fps ${bitrateKbps}kbps ${if (bitrateMode == 2) "CBR" else "VBR"}" +
                     " QP上限$qpPMax${if (bitrateMode == 2 && cbrQpMin > 0) " CBR下限$cbrQpMin" else ""} GOP${gopSec}s 延迟${latencyMs}ms" +
                     " 限速${if (maxBwKbps > 0) "${maxBwKbps}kbps" else "不限"} 峰值${peakKbps}kbps" +
                     " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s)" else "关"}" +
-                    " 关防抖=$disableStabilization" + (if (lockMainLens) "" else " 不锁主摄")
+                    " 关防抖=$disableStabilization" + (if (lockMainLens) "" else " 不锁主摄") +
+                    (if (runawayGuard) "" else " 失控保护关")
     }
 
     @Volatile private var override: JSONObject = JSONObject()
@@ -197,6 +201,7 @@ object SrtDirectParams {
             recoverSec = pc.optInt("recoverSec", 5).coerceIn(1, 120),
             disableStabilization = bool("disableStabilization", true),
             lockMainLens = bool("lockMainLens", true),
+            runawayGuard = bool("runawayGuard", true),
         )
     }
 

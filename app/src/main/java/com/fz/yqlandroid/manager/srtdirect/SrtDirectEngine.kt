@@ -149,6 +149,11 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         post {
             val old = req
             req = r
+            // 换档 / PC 改 QP / 后台关保护：按新参数带 QP 重来
+            if ((old != null && (old.plan.profile != r.plan.profile || old.plan.qpPMax != r.plan.qpPMax)) || !r.plan.runawayGuard) {
+                qpOffProfile = null; runawaySec = 0; qpOffCalmSec = 0
+                if (old != null && old.plan.profile != r.plan.profile) { qpBackSec = QP_BACK_MIN_SEC; qpRestoredAtMs = 0L }
+            }
             if (!cameraRunning) return@post
             val enc = encoder
             val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
@@ -158,7 +163,8 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                     r.fps != enc.config.fps || r.plan.gopSec != enc.config.gopSec ||
                     r.plan.bitrateMode != enc.config.bitrateMode ||
                     r.plan.cbrQpMin != enc.config.cbrQpMin ||
-                    r.plan.qpPMax != enc.config.qpPMax
+                    r.plan.qpPMax != enc.config.qpPMax ||
+                    (qpOffProfile == r.plan.profile) != enc.config.noQp
             if (!need && old == r) return@post   // 同一条指令多处重复落地（切档后又同步码率等），无变化不动
             if (need) {
                 rebuildEncoder(id, r, reason)
@@ -212,6 +218,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             m["qpPMin"] = qc?.qpPMin ?: r.plan.qpPMin
             m["qpPMax"] = qc?.qpPMax ?: r.plan.qpPMax
             m["qpOk"] = enc?.qpConfigured ?: true
+            m["qpOff"] = enc?.config?.noQp == true
             m["qpAvg"] = enc?.statQp ?: -1
             m["qpPMaxNow"] = synchronized(peak) { peak.curPMax }
         }
@@ -253,6 +260,21 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
     private fun qpRuntimeOk(): Boolean =
         android.os.Build.VERSION.SDK_INT >= 31 && encoder?.qpConfigured == true
 
+    // 码率失控保护：有的编码器带 QP 上限时只守 QP 不守码率（荣耀 AAK-AN00 高通 c2.qti：1080P 目标 5000k 实际 36~47M，
+    //   峰值控制降码率 / 运行中抬 QP 都不动），上行扛不住时 PC 一直没画面。
+    //   实际 > 峰值×1.5 且发送缓冲 > 45% 延迟，连续 RUNAWAY_SEC 秒 → 本档去掉 QP 重建；平稳 qpBackSec 秒 → 带回 QP 重建；
+    //   带回后 5 分钟内又失控，下次等待翻倍（≤ QP_BACK_MAX_SEC）。上行扛得住（缓冲不超）时不动，画质和原来一样。
+    private companion object {
+        const val RUNAWAY_SEC = 4
+        const val QP_BACK_MIN_SEC = 60
+        const val QP_BACK_MAX_SEC = 600
+    }
+    @Volatile private var qpOffProfile: String? = null
+    private var runawaySec = 0
+    private var qpOffCalmSec = 0
+    private var qpBackSec = QP_BACK_MIN_SEC
+    private var qpRestoredAtMs = 0L
+
     private fun encConfig(w: Int, h: Int, r: VideoReq) = SdH264Encoder.Config(
         width = w, height = h, fps = r.fps, bitrateKbps = r.kbps,
         bitrateMode = r.plan.bitrateMode,
@@ -260,6 +282,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         qpIMin = r.plan.qpIMin, qpIMax = r.plan.qpIMax,
         qpPMin = r.plan.qpPMin, qpPMax = r.plan.qpPMax,
         gopSec = r.plan.gopSec,
+        noQp = qpOffProfile == r.plan.profile,
     )
 
     /** 首次启动：请求尺寸 → 1080p → 720p 逐个试 */
@@ -289,7 +312,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         onEncoderReady(cameraId, enc, r)
         cam.switchEncoder(enc.inputSurface!!, effectiveControls()) { old?.stop() }
         SdLog.i("换编码器（$reason）$fromDesc → ${size.width}x${size.height}@${r.fps} 目标${r.kbps}kbps" +
-                " GOP${r.plan.gopSec}s QP上限${r.plan.qpPMax}（SRT 不断）")
+                " GOP${r.plan.gopSec}s ${if (enc.config.noQp) "QP去掉(码率失控保护)" else "QP上限${r.plan.qpPMax}"}（SRT 不断）")
     }
 
     private fun onEncoderReady(cameraId: String, enc: SdH264Encoder, r: VideoReq) {
@@ -449,6 +472,51 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 }
                 SdLog.i("峰值控制 $peakMsg")
             }
+        }
+
+        if (enc != null && r != null && s != null && s.connected && encAlive && r.plan.runawayGuard) {
+            val lat = s.currentTarget?.latencyMs ?: r.plan.latencyMs
+            val peakRef = if (r.plan.peakKbps > 0) r.plan.peakKbps else r.kbps
+            val prof = r.plan.profile
+            if (!enc.config.noQp) {
+                qpOffCalmSec = 0
+                val runaway = enc.qpConfigured && encKbps > peakRef * 3 / 2 && s.sndBufMs > lat * 45 / 100
+                runawaySec = if (runaway) runawaySec + 1 else 0
+                if (runawaySec >= RUNAWAY_SEC) {
+                    runawaySec = 0
+                    val again = qpRestoredAtMs > 0 && now - qpRestoredAtMs < 300_000
+                    qpBackSec = if (again) minOf(qpBackSec * 2, QP_BACK_MAX_SEC) else QP_BACK_MIN_SEC
+                    SdLog.w("⚠️ 码率失控保护：实际${encKbps}kbps 连续${RUNAWAY_SEC}s > 峰值${peakRef}×1.5 且发送缓冲${s.sndBufMs}ms>45%延迟" +
+                            "（${enc.codecName} 守 QP 不守码率，上行扛不住）→ 本档 $prof 去掉 QP 上限重建编码器，平稳${qpBackSec}s 后带回" +
+                            (if (again) "（带回后又失控，等待翻倍）" else ""))
+                    post {
+                        val cur = req ?: return@post
+                        if (!cameraRunning || cur.plan.profile != prof || !cur.plan.runawayGuard) return@post
+                        qpOffProfile = prof
+                        val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
+                        rebuildEncoder(id, cur, "码率失控保护")
+                    }
+                }
+            } else {
+                runawaySec = 0
+                val calm = encKbps <= peakRef && s.sndBufMs < lat * 15 / 100
+                qpOffCalmSec = if (calm) qpOffCalmSec + 1 else 0
+                if (qpOffCalmSec >= qpBackSec) {
+                    qpOffCalmSec = 0
+                    SdLog.i("码率失控保护 解除：平稳${qpBackSec}s（实际${encKbps}kbps 发送缓冲${s.sndBufMs}ms）→ 本档 $prof 带回 QP上限${r.plan.qpPMax} 重建编码器")
+                    post {
+                        val cur = req ?: return@post
+                        if (!cameraRunning || qpOffProfile != prof || cur.plan.profile != prof) return@post
+                        qpOffProfile = null
+                        qpRestoredAtMs = System.currentTimeMillis()
+                        val id = camera?.cameraId?.takeIf { it.isNotEmpty() } ?: SdCameraSource.cameraId(context, front) ?: return@post
+                        rebuildEncoder(id, cur, "码率失控保护解除")
+                    }
+                }
+            }
+        } else {
+            runawaySec = 0
+            qpOffCalmSec = 0
         }
 
         val line = buildString {
