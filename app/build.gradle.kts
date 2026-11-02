@@ -12,8 +12,8 @@ android {
         applicationId = "com.fz.yqlandroid"
         minSdk = 24
         targetSdk = 35
-        versionCode = 27
-        versionName = "27.0"
+        versionCode = 28
+        versionName = "28.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
