@@ -72,7 +72,9 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
         @Volatile var currentTypeKey: String = "low"
 
         /** 没有 PC 在线（收不到 PC_PRESENCE）这么久 → 切回超低网，网差时先保证出画面 */
-        private const val NO_PC_LOW_AFTER_MS = 20_000L
+        //   后端随 TryDisconnect 下发 noPcLowAfterSec（总后台 SRT管理可改，缺省 300 秒）；原来写死 20 秒，
+        //   PC 断线重连 / 后端部署 / 电脑短暂休眠都会把手机打回最低档
+        @Volatile var noPcLowAfterMs: Long = 300_000L
 
         /**
          * 金凤凰：登录页「推流方式」选 SRT 才走 SRT直推（登录成功写 token_prefs.force_webrtc=false）；
@@ -2150,12 +2152,12 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                         val reconnectingNow = p2pReconnecting && !pcConnected
                         // ⭐ §53.2：在线台数走 PC_PRESENCE（与画面无关），与上面的 pcConnected(在看) 分开
                         val onlinePcs = WebSocketManager.instance.onlinePcCount()
-                        // 没有 PC 在线 20 秒 → 回超低网（PC 上线后由 PC 手动切高档）。
+                        // 没有 PC 在线 noPcLowAfterMs（缺省 5 分钟）→ 回超低网（PC 上线后由 PC 手动切高档）。
                         //   指令通道(WS)断着时收不到 PC_PRESENCE，不能当成没 PC，不计时
                         if (onlinePcs > 0 || noPcSinceMs == 0L || !WebSocketManager.instance.isConnected) noPcSinceMs = nowMs
                         val dropToLow = onlinePcs == 0 && !usingOtgCamera
                                 && currentProfile != LadderProfile.LOW
-                                && nowMs - noPcSinceMs >= NO_PC_LOW_AFTER_MS
+                                && nowMs - noPcSinceMs >= noPcLowAfterMs
                         if (dropToLow) noPcSinceMs = nowMs
                         withContext(Dispatchers.Main) {
                             onCapFpsUpdate?.invoke(capFpsUi)
@@ -2163,8 +2165,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                             onReconnectingUpdate?.invoke(reconnectingNow)
                             onPcOnlineUpdate?.invoke(onlinePcs)
                             if (dropToLow) {
-                                Log.d(TAG, "📉 没有 PC 在线 ${NO_PC_LOW_AFTER_MS / 1000}s → 切回超低网")
-                                if (srtEngine != null) srtLog("📉 没有 PC 在线 ${NO_PC_LOW_AFTER_MS / 1000}s（指令通道已连着）→ 手机自己切回超低网")
+                                Log.d(TAG, "📉 没有 PC 在线 ${noPcLowAfterMs / 1000}s → 切回超低网")
+                                if (srtEngine != null) srtLog("📉 没有 PC 在线 ${noPcLowAfterMs / 1000}s（指令通道已连着）→ 手机自己切回超低网")
                                 applyRemoteConfig(mapOf("ptype" to "type", "type" to "low"))
                             }
                         }

@@ -615,6 +615,7 @@ class WebSocketManager private constructor() {
             (msgDict["srtTrafficFree"] as? Boolean)?.let { putBoolean("srt_traffic_free", it) }
             // 第 5 级（超超高帧 = 1920×1440 档）名字，总后台可改
             (msgDict["level5Name"] as? String)?.takeIf { it.isNotBlank() }?.let { putString("level5_name", it) }
+            (msgDict["noPcLowAfterSec"] as? Number)?.let { WebRTCManager.noPcLowAfterMs = it.toLong().coerceIn(10L, 3600L) * 1000L }
             (msgDict["srtDailyFreeGb"] as? Number)?.let { putFloat("srt_daily_free_gb", it.toFloat()) }
             (msgDict["srtTrafficRates"] as? Map<*, *>)?.let { putString("srt_traffic_rates", org.json.JSONObject(it).toString()) }
             // 当前档位按清晰度折算后的每小时消耗（档位每小时 × 清晰度 10% 一档）
