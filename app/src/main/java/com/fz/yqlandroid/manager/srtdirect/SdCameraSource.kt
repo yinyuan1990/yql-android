@@ -121,7 +121,14 @@ internal class SdCameraSource(
     private var lockedPhysId: String? = null
     /** 绑主摄的会话配置失败过（换编码器尺寸时再试） */
     @Volatile private var physLockUnsupported = false
-    private var mainPhysCache: Pair<String, String?>? = null
+    /**
+     * 逻辑多摄的主摄：id、长焦起始倍数（焦距 ≥ 主摄 1.5 倍的最近一颗 / 主摄焦距，null = 没有长焦）、
+     * 主摄感光区与最大数码变焦（物理裁切用）、HAL 是否支持给物理镜头单独下 SCALER_CROP_REGION
+     * （支持才能在主摄上做 1x 以上的数码变焦并保持绑主摄）
+     */
+    private class MainPhys(val id: String?, val teleRatio: Float?, val active: android.graphics.Rect?,
+                           val maxZoom: Float, val cropOk: Boolean)
+    private var mainPhysCache: Pair<String, MainPhys>? = null
     @Volatile var previewDesc: String = "-"
         private set
     @Volatile var curExposureNs = 0L
@@ -354,7 +361,7 @@ internal class SdCameraSource(
             params = p
             val lock = wantPhysLock(p)
             if (lock != lockedPhysId && device != null && !closed) {
-                SdLog.i("📷 ${if (lock != null) "绑主摄 $lock" else "解除绑主摄（变焦≠1x 或已关闭）"} → 重建会话")
+                SdLog.i("📷 ${if (lock != null) "绑主摄 $lock（${p.zoom ?: 1f}x）" else "解除绑主摄（${p.zoom ?: 1f}x：广角 / 长焦 / 不支持物理裁切 / 已关闭）"} → 重建会话")
                 createSession()
             } else {
                 submitRepeating()
@@ -366,13 +373,16 @@ internal class SdCameraSource(
      * 逻辑多摄的主摄物理 id：焦距最接近逻辑摄像头标称焦距的那个。
      * 三星等逻辑多摄近距离会自己在主摄 / 超广角之间来回切（4186652825：1.3 秒一次、画面一亮一暗），绑定后输出只来自主摄。
      */
-    private fun mainPhysicalId(): String? {
-        if (android.os.Build.VERSION.SDK_INT < 28) return null
+    private fun mainPhysicalId(): String? = mainPhys().id
+
+    private fun mainPhys(): MainPhys {
+        val none = MainPhys(null, null, null, 1f, false)
+        if (android.os.Build.VERSION.SDK_INT < 28) return none
         mainPhysCache?.let { if (it.first == cameraId) return it.second }
-        val c = chars ?: return null
+        val c = chars ?: return none
         val logical = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
-        val id = if (!logical) null else try {
+        val info = if (!logical) none else try {
             val cm = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val target = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
             val phys = c.physicalCameraIds.toList()
@@ -381,23 +391,58 @@ internal class SdCameraSource(
             }
             val pick = if (target == null) null
                 else phys.filter { focal[it] != null }.minByOrNull { Math.abs(focal[it]!! - target) }
-            (pick ?: phys.firstOrNull()).also {
-                SdLog.i("📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$it")
-            }
+            val main = pick ?: phys.firstOrNull()
+            val mainF = main?.let { focal[it] }
+            val tele = if (mainF == null || mainF <= 0f) null
+                else focal.values.filterNotNull().filter { it >= mainF * 1.5f }.minOrNull()?.let { it / mainF }
+            val cropOk = try {
+                c.availablePhysicalCameraRequestKeys.contains(CaptureRequest.SCALER_CROP_REGION)
+            } catch (_: Throwable) { false }
+            val mc = main?.let { cm.getCameraCharacteristics(it) }
+            val m = MainPhys(main, tele, mc?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
+                mc?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f, cropOk)
+            SdLog.i("📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$main" +
+                    " 长焦起=${tele?.let { r -> "%.1fx".format(r) } ?: "无"}" +
+                    " 物理裁切=${if (cropOk && m.active != null) "支持（主摄放大仍绑主摄）" else "不支持（主摄放大交给 HAL）"}")
+            m
         } catch (t: Throwable) {
             SdLog.w("读物理摄像头失败（不绑主摄）: ${t.message}")
-            null
+            none
         }
-        mainPhysCache = cameraId to id
-        return id
+        mainPhysCache = cameraId to info
+        return info
     }
 
-    /** 绑主摄只在 1x：物理流不吃逻辑摄像头的变焦（0.5x / 放大要交给 HAL 选镜头） */
+    /**
+     * 绑主摄：PC 选的是主摄（≥1x）就绑——1x 直接绑；放大且 HAL 支持物理裁切、还没到长焦倍数时也绑，
+     * 放大由 [applyPhysZoom] 在主摄上裁（物理流不吃逻辑摄像头的 ZOOM_RATIO）。
+     * 0.5x 广角、到了长焦倍数、不支持物理裁切 → 交给 HAL 选镜头（facai1688：主摄 1.2 / 1.3x 解绑后 HAL 在超广角 / 主摄间来回切）。
+     */
     private fun wantPhysLock(p: Camera2ParamApplier.Params): String? {
         if (!p.lockMainLens || physLockUnsupported) return null
         val z = p.zoom ?: 1f
-        if (z < 0.99f || z > 1.01f) return null
-        return mainPhysicalId()
+        if (z < 0.99f) return null
+        val m = mainPhys()
+        if (z <= 1.01f) return m.id
+        if (!m.cropOk || m.active == null) return null
+        if (m.teleRatio != null && z >= m.teleRatio - 0.01f) return null
+        return m.id
+    }
+
+    /** 绑主摄时的变焦：逻辑请求的 ZOOM_RATIO 回 1x（HAL 不因倍数换镜头），倍数改成主摄物理裁切 */
+    private fun applyPhysZoom(req: CaptureRequest.Builder, lock: String, p: Camera2ParamApplier.Params) {
+        val z = p.zoom ?: 1f
+        if (android.os.Build.VERSION.SDK_INT >= 30) req.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+        if (android.os.Build.VERSION.SDK_INT < 28) return
+        if (z <= 1.01f) return
+        val m = mainPhys()
+        val active = m.active ?: return
+        val zc = z.coerceIn(1f, m.maxZoom.coerceAtLeast(1f))
+        val w = (active.width() / zc).toInt()
+        val h = (active.height() / zc).toInt()
+        val x = active.left + (active.width() - w) / 2
+        val y = active.top + (active.height() - h) / 2
+        req.setPhysicalCameraKey(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(x, y, x + w, y + h), lock)
     }
 
     val isRunning: Boolean get() = device != null && session != null
@@ -411,6 +456,7 @@ internal class SdCameraSource(
             targets.forEach { req.addTarget(it) }
             req.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             Camera2ParamApplier.applyToBuilder(req, c, params)
+            lockedPhysId?.let { applyPhysZoom(req, it, params) }
             applySrtExposure(req, c, params)
             s.setRepeatingRequest(req.build(), captureCallback, handler)
         } catch (t: Throwable) {
