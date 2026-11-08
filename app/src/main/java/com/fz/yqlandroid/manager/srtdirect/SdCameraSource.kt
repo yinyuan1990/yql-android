@@ -121,6 +121,9 @@ internal class SdCameraSource(
     private var lockedPhysId: String? = null
     /** 绑主摄的会话配置失败过（换编码器尺寸时再试） */
     @Volatile private var physLockUnsupported = false
+    /** 给主摄下物理裁切失败过：这台以后主摄放大交给 HAL，至少变倍 / 对焦等参数能下去 */
+    @Volatile private var physCropBroken = false
+    private var lastCropZoom = 0f
     /**
      * 逻辑多摄的主摄：id、长焦起始倍数（焦距 ≥ 主摄 1.5 倍的最近一颗 / 主摄焦距，null = 没有长焦）、
      * 主摄感光区与最大数码变焦（物理裁切用）、HAL 是否支持给物理镜头单独下 SCALER_CROP_REGION
@@ -424,7 +427,7 @@ internal class SdCameraSource(
         if (z < 0.99f) return null
         val m = mainPhys()
         if (z <= 1.01f) return m.id
-        if (!m.cropOk || m.active == null) return null
+        if (!m.cropOk || m.active == null || physCropBroken) return null
         if (m.teleRatio != null && z >= m.teleRatio - 0.01f) return null
         return m.id
     }
@@ -443,6 +446,10 @@ internal class SdCameraSource(
         val x = active.left + (active.width() - w) / 2
         val y = active.top + (active.height() - h) / 2
         req.setPhysicalCameraKey(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(x, y, x + w, y + h), lock)
+        if (Math.abs(zc - lastCropZoom) >= 0.05f) {
+            lastCropZoom = zc
+            SdLog.i("📷 主摄 $lock 裁切放大 ${"%.2f".format(zc)}x（裁切区 ${w}x$h）")
+        }
     }
 
     val isRunning: Boolean get() = device != null && session != null
@@ -451,16 +458,26 @@ internal class SdCameraSource(
         val camera = device ?: return
         val s = session ?: return
         val c = chars ?: return
+        val lock = lockedPhysId
         try {
-            val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            // 给物理镜头单独下参数（主摄裁切放大），请求必须带上这颗物理 id 创建，否则 "Physical camera id: N is not valid!"
+            val req = if (lock != null && android.os.Build.VERSION.SDK_INT >= 28)
+                camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(lock))
+            else camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
             targets.forEach { req.addTarget(it) }
             req.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             Camera2ParamApplier.applyToBuilder(req, c, params)
-            lockedPhysId?.let { applyPhysZoom(req, it, params) }
+            lock?.let { applyPhysZoom(req, it, params) }
             applySrtExposure(req, c, params)
             s.setRepeatingRequest(req.build(), captureCallback, handler)
         } catch (t: Throwable) {
-            SdLog.w("下发采集参数失败: ${t.message}")
+            if (lock != null && (params.zoom ?: 1f) > 1.01f && !physCropBroken) {
+                physCropBroken = true
+                SdLog.w("📷 主摄 $lock 裁切放大下参数失败（${t.message}）→ 这台以后主摄放大交给 HAL，重建会话")
+                handler.post { createSession() }
+            } else {
+                SdLog.w("下发采集参数失败: ${t.message}")
+            }
         }
     }
 
