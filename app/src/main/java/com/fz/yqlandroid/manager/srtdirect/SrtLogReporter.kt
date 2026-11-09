@@ -68,6 +68,7 @@ internal object SrtLogReporter {
         configKnown = false
         line("==== 推流开始 流=$newStreamId 账号=$account 机型=${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}" +
                 " Android${android.os.Build.VERSION.RELEASE} App=${com.fz.yqlandroid.BuildConfig.VERSION_NAME} ====")
+        SdCameraSource.lensDesc?.let { line(it) }
         configJob = scope.launch {
             while (isActive && active) {
                 checkConfig()

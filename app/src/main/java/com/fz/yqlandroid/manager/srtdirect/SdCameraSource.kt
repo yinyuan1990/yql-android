@@ -41,6 +41,12 @@ internal class SdCameraSource(
     }
 
     companion object {
+        private const val PREFS = "srt_direct_prefs"
+        private const val KEY_CROP_CAP = "main_crop_cap_"
+
+        /** 最近一次「📷 逻辑多摄」行：相机在推流日志开始前就打开了，推流开始时由 [SrtLogReporter] 补打 */
+        @Volatile var lensDesc: String? = null
+
         /** 指定朝向的第一个摄像头 id（后置一般是逻辑主摄，ZOOM_RATIO 可 <1）；没有就用第一个 */
         fun cameraId(ctx: Context, front: Boolean): String? {
             val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -125,6 +131,14 @@ internal class SdCameraSource(
     @Volatile private var physCropBroken = false
     private var lastCropZoom = 0f
     /**
+     * 自动测出的主摄裁切上限（0 = 没测出）：有的 HAL 对物理主摄的 SCALER_CROP_REGION 有上限、超了悄悄钳住不报错
+     * （4186652825 三星 SM-W9026：请求 3.7x 画面停在约 1.6x）。按摄像头 id 存本机，超过它的放大交给 HAL。
+     */
+    private var learnedCropCap = 0f
+    private var probeZoom = 0f
+    private var probeFrames = 0
+    private var cropResultMissingLogged = false
+    /**
      * 逻辑多摄的主摄：id、长焦起始倍数（焦距 ≥ 主摄 1.5 倍的最近一颗 / 主摄焦距，null = 没有长焦）、
      * 主摄感光区与最大数码变焦（物理裁切用）、HAL 是否支持给物理镜头单独下 SCALER_CROP_REGION
      * （支持才能在主摄上做 1x 以上的数码变焦并保持绑主摄）
@@ -208,6 +222,7 @@ internal class SdCameraSource(
                 }
                 lastPhysId = phys
             }
+            checkPhysCrop(request, result)
             if (n % 150 == 0L) {
                 val durMs = curFrameDurNs / 1_000_000.0
                 SdLog.i("cam exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms frameDur=${"%.1f".format(durMs)}ms" +
@@ -250,6 +265,7 @@ internal class SdCameraSource(
         cameraId = id
         isFront = front
         firstFrameSeen = false
+        learnedCropCap = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat(KEY_CROP_CAP + id, 0f)
         try {
             chars = cm.getCameraCharacteristics(id)
             cm.openCamera(id, object : CameraDevice.StateCallback() {
@@ -364,7 +380,7 @@ internal class SdCameraSource(
             params = p
             val lock = wantPhysLock(p)
             if (lock != lockedPhysId && device != null && !closed) {
-                SdLog.i("📷 ${if (lock != null) "绑主摄 $lock（${p.zoom ?: 1f}x）" else "解除绑主摄（${p.zoom ?: 1f}x：广角 / 长焦 / 不支持物理裁切 / 已关闭）"} → 重建会话")
+                SdLog.i("📷 ${if (lock != null) "绑主摄 $lock（${p.zoom ?: 1f}x）" else "解除绑主摄（${p.zoom ?: 1f}x：广角 / 长焦 / 不支持物理裁切 / 超过主摄裁切上限 / 已关闭）"} → 重建会话")
                 createSession()
             } else {
                 submitRepeating()
@@ -404,9 +420,14 @@ internal class SdCameraSource(
             val mc = main?.let { cm.getCameraCharacteristics(it) }
             val m = MainPhys(main, tele, mc?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
                 mc?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f, cropOk)
-            SdLog.i("📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$main" +
+            val desc = "📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$main" +
                     " 长焦起=${tele?.let { r -> "%.1fx".format(r) } ?: "无"}" +
-                    " 物理裁切=${if (cropOk && m.active != null) "支持（主摄放大仍绑主摄）" else "不支持（主摄放大交给 HAL）"}")
+                    " 物理裁切=${if (cropOk && m.active != null) "支持（主摄放大仍绑主摄）" else "不支持（主摄放大交给 HAL）"}" +
+                    " 主摄感光区=${m.active?.let { "${it.width()}x${it.height()}" } ?: "-"} 主摄最大数码变焦=${"%.1f".format(m.maxZoom)}x" +
+                    " 变焦范围=${zoomRange?.let { "%.2f~%.1fx".format(it.first, it.second) } ?: "-"}" +
+                    " 已测裁切上限=${if (learnedCropCap > 0f) "%.2fx".format(learnedCropCap) else "无"}"
+            SdLog.i(desc)
+            lensDesc = desc
             m
         } catch (t: Throwable) {
             SdLog.w("读物理摄像头失败（不绑主摄）: ${t.message}")
@@ -429,7 +450,52 @@ internal class SdCameraSource(
         if (z <= 1.01f) return m.id
         if (!m.cropOk || m.active == null || physCropBroken) return null
         if (m.teleRatio != null && z >= m.teleRatio - 0.01f) return null
+        if (z > cropCap(p) + 0.01f) return null
         return m.id
+    }
+
+    /** 主摄裁切放大上限：后台 srtParams.mainCropMax >0 固定、<0 不限；0 = 用本机测出的（没测出 = 不限） */
+    private fun cropCap(p: Camera2ParamApplier.Params): Float = when {
+        p.mainCropMax > 0f -> p.mainCropMax.coerceAtLeast(1f)
+        p.mainCropMax < 0f -> Float.MAX_VALUE
+        learnedCropCap > 0f -> learnedCropCap
+        else -> Float.MAX_VALUE
+    }
+
+    /**
+     * 读回相机实际用的主摄裁切区：倍数稳定 6 帧后记「请求 → 实际」；自动模式下实际比请求小 0.1x 以上 =
+     * HAL 钳住了，记下上限（只降不升）存本机，重建会话让超过上限的放大交给 HAL。
+     */
+    private fun checkPhysCrop(request: CaptureRequest, result: TotalCaptureResult) {
+        if (android.os.Build.VERSION.SDK_INT < 28) return
+        val lock = lockedPhysId ?: return
+        val want = request.tag as? Float ?: return
+        if (want != probeZoom) {
+            probeZoom = want
+            probeFrames = 0
+            return
+        }
+        if (++probeFrames != 6) return
+        val active = mainPhys().active ?: return
+        @Suppress("DEPRECATION")
+        val crop = result.physicalCameraResults[lock]?.get(CaptureResult.SCALER_CROP_REGION)
+        if (crop == null || crop.width() <= 0) {
+            if (!cropResultMissingLogged) {
+                cropResultMissingLogged = true
+                SdLog.i("📷 主摄 $lock 实际裁切区相机没回报（看不出是否到顶，需要时用 srtParams.mainCropMax 手动限）")
+            }
+            return
+        }
+        val actual = active.width().toFloat() / crop.width()
+        SdLog.i("📷 主摄 $lock 裁切 请求 ${"%.2f".format(want)}x → 实际 ${"%.2f".format(actual)}x（实际裁切区 ${crop.width()}x${crop.height()}）")
+        if (crop.width() > active.width() + 2 || crop.height() > active.height() + 2) return
+        if (params.mainCropMax != 0f || want - actual < 0.1f) return
+        val cap = (Math.floor(actual * 20.0) / 20.0).toFloat().coerceAtLeast(1f)
+        if (learnedCropCap > 0f && learnedCropCap <= cap) return
+        learnedCropCap = cap
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putFloat(KEY_CROP_CAP + cameraId, cap).apply()
+        SdLog.w("📷 主摄 $lock 裁切到顶 ≈${"%.2f".format(cap)}x（请求 ${"%.2f".format(want)}x）→ 这台超过 ${"%.2f".format(cap)}x 的放大交给 HAL，重建会话")
+        handler.post { if (device != null && !closed && wantPhysLock(params) != lockedPhysId) createSession() }
     }
 
     /** 绑主摄时的变焦：逻辑请求的 ZOOM_RATIO 回 1x（HAL 不因倍数换镜头），倍数改成主摄物理裁切 */
@@ -446,6 +512,7 @@ internal class SdCameraSource(
         val x = active.left + (active.width() - w) / 2
         val y = active.top + (active.height() - h) / 2
         req.setPhysicalCameraKey(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(x, y, x + w, y + h), lock)
+        req.setTag(zc)
         if (Math.abs(zc - lastCropZoom) >= 0.05f) {
             lastCropZoom = zc
             SdLog.i("📷 主摄 $lock 裁切放大 ${"%.2f".format(zc)}x（裁切区 ${w}x$h）")
@@ -540,6 +607,7 @@ internal class SdCameraSource(
         }
         val lock = wantPhysLock(params)
         lockedPhysId = lock
+        probeZoom = 0f
         val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (closed || t !== targets) { s.close(); return }
