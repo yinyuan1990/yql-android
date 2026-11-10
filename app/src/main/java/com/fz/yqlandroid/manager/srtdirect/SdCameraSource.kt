@@ -129,6 +129,10 @@ internal class SdCameraSource(
     @Volatile private var physLockUnsupported = false
     /** 给主摄下物理裁切失败过：这台以后主摄放大交给 HAL，至少变倍 / 对焦等参数能下去 */
     @Volatile private var physCropBroken = false
+    /** 绑主摄时手动对焦 / 手动曝光相机不照做：这台本次推流不再绑主摄 */
+    @Volatile private var physLockBroken = false
+    /** 请求手动对焦 / 手动曝光、相机回报的却不是手动的连续帧数（见 [checkManualApplied]） */
+    private var notAppliedFrames = 0
     private var lastCropZoom = 0f
     /**
      * 自动测出的主摄裁切上限（0 = 没测出）：有的 HAL 对物理主摄的 SCALER_CROP_REGION 有上限、超了悄悄钳住不报错
@@ -223,6 +227,7 @@ internal class SdCameraSource(
                 lastPhysId = phys
             }
             checkPhysCrop(request, result)
+            checkManualApplied(request, result)
             if (n % 150 == 0L) {
                 val durMs = curFrameDurNs / 1_000_000.0
                 SdLog.i("cam exp=${"%.1f".format(curExposureNs / 1_000_000.0)}ms frameDur=${"%.1f".format(durMs)}ms" +
@@ -414,9 +419,8 @@ internal class SdCameraSource(
             val mainF = main?.let { focal[it] }
             val tele = if (mainF == null || mainF <= 0f) null
                 else focal.values.filterNotNull().filter { it >= mainF * 1.5f }.minOrNull()?.let { it / mainF }
-            val cropOk = try {
-                c.availablePhysicalCameraRequestKeys.contains(CaptureRequest.SCALER_CROP_REGION)
-            } catch (_: Throwable) { false }
+            val physKeys = try { c.availablePhysicalCameraRequestKeys } catch (_: Throwable) { null }
+            val cropOk = physKeys?.contains(CaptureRequest.SCALER_CROP_REGION) == true
             val mc = main?.let { cm.getCameraCharacteristics(it) }
             val m = MainPhys(main, tele, mc?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
                 mc?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f, cropOk)
@@ -425,7 +429,9 @@ internal class SdCameraSource(
                     " 物理裁切=${if (cropOk && m.active != null) "支持（主摄放大仍绑主摄）" else "不支持（主摄放大交给 HAL）"}" +
                     " 主摄感光区=${m.active?.let { "${it.width()}x${it.height()}" } ?: "-"} 主摄最大数码变焦=${"%.1f".format(m.maxZoom)}x" +
                     " 变焦范围=${zoomRange?.let { "%.2f~%.1fx".format(it.first, it.second) } ?: "-"}" +
-                    " 已测裁切上限=${if (learnedCropCap > 0f) "%.2fx".format(learnedCropCap) else "无"}"
+                    " 已测裁切上限=${if (learnedCropCap > 0f) "%.2fx".format(learnedCropCap) else "无"}" +
+                    " 物理镜头可单独下参数=${physKeys?.size ?: 0}项（对焦${if (physKeys?.contains(CaptureRequest.CONTROL_AF_MODE) == true) "有" else "无"}" +
+                    " 曝光${if (physKeys?.contains(CaptureRequest.SENSOR_EXPOSURE_TIME) == true) "有" else "无"}）"
             SdLog.i(desc)
             lensDesc = desc
             m
@@ -443,7 +449,7 @@ internal class SdCameraSource(
      * 0.5x 广角、到了长焦倍数、不支持物理裁切 → 交给 HAL 选镜头（facai1688：主摄 1.2 / 1.3x 解绑后 HAL 在超广角 / 主摄间来回切）。
      */
     private fun wantPhysLock(p: Camera2ParamApplier.Params): String? {
-        if (!p.lockMainLens || physLockUnsupported) return null
+        if (!p.lockMainLens || physLockUnsupported || physLockBroken) return null
         val z = p.zoom ?: 1f
         if (z < 0.99f) return null
         val m = mainPhys()
@@ -498,6 +504,62 @@ internal class SdCameraSource(
         handler.post { if (device != null && !closed && wantPhysLock(params) != lockedPhysId) createSession() }
     }
 
+    /**
+     * 兜底：PC 下的是手动对焦 / 手动曝光（请求里 AF / AE 关），相机回报的却还是自动，连续 30 帧 = 没照做。
+     * - 正在用带物理 id 的请求（主摄裁切放大）→ 这台主摄放大交给 HAL；
+     * - 只是绑主摄（1x）→ 这台本次不再绑主摄；
+     * - 都不是 → 只记日志（每 30 秒一行）。
+     * 起因：shiji034p 三星 S25U（SM-S938B）43.0 PC 拉对焦 / 快门全不生效，回报一直 af=3（连续对焦），41.0 正常。
+     */
+    private fun checkManualApplied(request: CaptureRequest, result: TotalCaptureResult) {
+        val reqAf = request.get(CaptureRequest.CONTROL_AF_MODE)
+        val resAf = result.get(CaptureResult.CONTROL_AF_MODE)
+        val reqAe = request.get(CaptureRequest.CONTROL_AE_MODE)
+        val resAe = result.get(CaptureResult.CONTROL_AE_MODE)
+        val afBad = reqAf == CaptureRequest.CONTROL_AF_MODE_OFF && resAf != null && resAf != CaptureRequest.CONTROL_AF_MODE_OFF
+        val aeBad = reqAe == CaptureRequest.CONTROL_AE_MODE_OFF && resAe != null && resAe != CaptureRequest.CONTROL_AE_MODE_OFF
+        if (!afBad && !aeBad) {
+            notAppliedFrames = 0
+            return
+        }
+        if (++notAppliedFrames % 900 != 30) return
+        val what = (if (afBad) "手动对焦（回报 af=$resAf）" else "") + (if (afBad && aeBad) " / " else "") +
+                (if (aeBad) "手动曝光（回报 aeMode=$resAe）" else "")
+        val lock = lockedPhysId
+        when {
+            lock != null && request.tag is Float && !physCropBroken -> {
+                physCropBroken = true
+                SdLog.w("📷 主摄 $lock 裁切放大时相机没照做 $what → 这台以后主摄放大交给 HAL，重建会话")
+                handler.post { if (device != null && !closed) createSession() }
+            }
+            lock != null && !physLockBroken -> {
+                physLockBroken = true
+                SdLog.w("📷 绑主摄 $lock 时相机没照做 $what → 这台本次不再绑主摄，重建会话")
+                handler.post { if (device != null && !closed) createSession() }
+            }
+            else -> SdLog.w("相机没照做 $what（没绑主摄，普通请求）")
+        }
+    }
+
+    /**
+     * 带物理 id 建的请求里，物理镜头有自己的一份参数——建请求时从模板抄的默认值（连续对焦、自动曝光…），
+     * `req.set()` 只改逻辑摄像头那份。有的 HAL（三星 S25U）给物理镜头就按它自己那份走，手动对焦 / 快门 / ISO 全被盖掉。
+     * 所以把逻辑请求里最终的值，逐项抄给物理镜头（只抄 HAL 允许单独下给物理镜头的项；裁切区由 [applyPhysZoom] 单独给）。
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun mirrorToPhysical(req: CaptureRequest.Builder, c: CameraCharacteristics, physId: String) {
+        if (android.os.Build.VERSION.SDK_INT < 28) return
+        val keys = (try { c.availablePhysicalCameraRequestKeys } catch (_: Throwable) { null }) ?: return
+        for (k in keys) {
+            if (k == CaptureRequest.SCALER_CROP_REGION) continue
+            try {
+                val key = k as CaptureRequest.Key<Any>
+                val v = req.get(key) ?: continue
+                req.setPhysicalCameraKey(key, v, physId)
+            } catch (_: Throwable) {}
+        }
+    }
+
     /** 绑主摄时的变焦：逻辑请求的 ZOOM_RATIO 回 1x（HAL 不因倍数换镜头），倍数改成主摄物理裁切 */
     private fun applyPhysZoom(req: CaptureRequest.Builder, lock: String, p: Camera2ParamApplier.Params) {
         val z = p.zoom ?: 1f
@@ -527,15 +589,20 @@ internal class SdCameraSource(
         val c = chars ?: return
         val lock = lockedPhysId
         try {
-            // 给物理镜头单独下参数（主摄裁切放大），请求必须带上这颗物理 id 创建，否则 "Physical camera id: N is not valid!"
-            val req = if (lock != null && android.os.Build.VERSION.SDK_INT >= 28)
-                camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(lock))
+            // 只有真要给物理主摄下裁切（绑主摄且放大 >1x）才带物理 id 建请求（不带会 "Physical camera id: N is not valid!"）。
+            // 1x 不需要给物理镜头下任何东西 → 用普通请求（41.0 及以前的做法，输出照旧绑主摄）：带物理 id 的请求里
+            // 物理镜头另有一份模板默认参数，S25U 按那份走，PC 的手动对焦 / 快门全不生效（43.0 的问题）。
+            val cropLock = if (android.os.Build.VERSION.SDK_INT >= 28 && (params.zoom ?: 1f) > 1.01f) lock else null
+            val req = if (cropLock != null && android.os.Build.VERSION.SDK_INT >= 28)
+                camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(cropLock))
             else camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
             targets.forEach { req.addTarget(it) }
             req.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             Camera2ParamApplier.applyToBuilder(req, c, params)
             lock?.let { applyPhysZoom(req, it, params) }
             applySrtExposure(req, c, params)
+            // 放大时：对焦 / 曝光 / 帧率等最终值同步给物理主摄，不让它用模板默认值
+            cropLock?.let { mirrorToPhysical(req, c, it) }
             s.setRepeatingRequest(req.build(), captureCallback, handler)
         } catch (t: Throwable) {
             if (lock != null && (params.zoom ?: 1f) > 1.01f && !physCropBroken) {
@@ -608,6 +675,7 @@ internal class SdCameraSource(
         val lock = wantPhysLock(params)
         lockedPhysId = lock
         probeZoom = 0f
+        notAppliedFrames = 0
         val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (closed || t !== targets) { s.close(); return }
