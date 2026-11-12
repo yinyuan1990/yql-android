@@ -263,16 +263,25 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
 
     // 码率失控保护：有的编码器带 QP 上限时只守 QP 不守码率（荣耀 AAK-AN00 高通 c2.qti：1080P 目标 5000k 实际 36~47M，
     //   峰值控制降码率 / 运行中抬 QP 都不动），上行扛不住时 PC 一直没画面。
-    //   实际 > 峰值×1.5 且发送缓冲 > 45% 延迟，连续 RUNAWAY_SEC 秒 → 本档去掉 QP 重建；平稳 qpBackSec 秒 → 带回 QP 重建；
-    //   带回后 5 分钟内又失控，下次等待翻倍（≤ QP_BACK_MAX_SEC）。上行扛得住（缓冲不超）时不动，画质和原来一样。
+    //   实际 > 峰值×1.5 且网络顶不住（发送缓冲扣 RTT 基线后 > 45% 延迟 / 有迟到丢包 / 丢包率 ≥ 5%），连续 RUNAWAY_NET_SEC 秒
+    //   → 本档去掉 QP 重建；上行扛得住时不动，画质和原来一样（peakCtrl.runawayNet=true，缺省）。
+    //   peakCtrl.runawayNet=false：不看网络，实际 > 峰值×1.5 连续 RUNAWAY_SEC 秒就去掉 QP（介入早，高 ISO 时画面糙一点）。
+    //   带回 QP：ISO 比触发时降了四成以上且平稳 QP_BACK_ISO_SEC 秒，或平稳 qpBackSec 秒；带回后 5 分钟内又失控，下次等待翻倍（≤ QP_BACK_MAX_SEC）。
+    //   11-12：高通 c2.qti 全系如此（9 个机型，1080 档 32% 的时间超目标 1.5 倍），运行中改 QP 上限不生效，只有重建管用；
+    //   原来只认发送缓冲且 60 秒就带回 → shiji0330 ISO 拉高后 16 秒才介入、zjdezhou1 码流在 6M / 15M 间来回跳。
     private companion object {
         const val RUNAWAY_SEC = 4
-        const val QP_BACK_MIN_SEC = 60
-        const val QP_BACK_MAX_SEC = 600
+        const val RUNAWAY_NET_SEC = 2
+        const val QP_BACK_MIN_SEC = 300
+        const val QP_BACK_MAX_SEC = 1800
+        const val QP_BACK_ISO_SEC = 10
+        const val ISO_RULE_MIN = 800
     }
     @Volatile private var qpOffProfile: String? = null
     private var runawaySec = 0
     private var qpOffCalmSec = 0
+    /** 触发失控保护那一刻的 ISO（0 = 没读到）；ISO 明显降下来才提前带回 QP 上限 */
+    private var qpOffIso = 0
     private var qpBackSec = QP_BACK_MIN_SEC
     private var qpRestoredAtMs = 0L
 
@@ -452,7 +461,7 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
         // 峰值控制器
         var peakMsg = ""
         if (enc != null && r != null && s != null) {
-            val res = synchronized(peak) { peak.tick(encKbps, s.sndBufMs, s.connected) }
+            val res = synchronized(peak) { peak.tick(encKbps, s.sndBufMs, s.rttMs.toInt(), s.connected) }
             if (res != null) {
                 when (val st = res.step) {
                     is SdPeakController.Step.Qp -> {
@@ -479,16 +488,33 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             val lat = s.currentTarget?.latencyMs ?: r.plan.latencyMs
             val peakRef = if (r.plan.peakKbps > 0) r.plan.peakKbps else r.kbps
             val prof = r.plan.profile
+            // 发送缓冲先扣 RTT 基线再比（同峰值控制）
+            val bufEx = synchronized(peak) { peak.bufExcess(s.sndBufMs, lat, r.plan.peakRttComp) }
+            val isoNow = cam?.curIso ?: 0
             if (!enc.config.noQp) {
                 qpOffCalmSec = 0
-                val runaway = enc.qpConfigured && encKbps > peakRef * 3 / 2 && s.sndBufMs > lat * 45 / 100
+                // 网络顶不住的证据：发送缓冲超标 / 这一秒有迟到丢包 / 这一秒丢包率 ≥ 5%
+                //   （zjdezhou1 蜂窝：14.6Mbps 丢包 10%、迟到丢几千包，但缓冲没连续超 4 秒，老条件 16 分钟才触发）
+                val bufOver = bufEx > lat * r.plan.peakBufOverPct / 100
+                val netBad = bufOver || dDrop > 0 || lossRate >= 0.05
+                val needSec = if (r.plan.runawayNet) RUNAWAY_NET_SEC else RUNAWAY_SEC
+                val runaway = enc.qpConfigured && encKbps > peakRef * 3 / 2 && (netBad || !r.plan.runawayNet)
                 runawaySec = if (runaway) runawaySec + 1 else 0
-                if (runawaySec >= RUNAWAY_SEC) {
+                if (runawaySec >= needSec) {
                     runawaySec = 0
                     val again = qpRestoredAtMs > 0 && now - qpRestoredAtMs < 300_000
                     qpBackSec = if (again) minOf(qpBackSec * 2, QP_BACK_MAX_SEC) else QP_BACK_MIN_SEC
-                    SdLog.w("⚠️ 码率失控保护：实际${encKbps}kbps 连续${RUNAWAY_SEC}s > 峰值${peakRef}×1.5 且发送缓冲${s.sndBufMs}ms>45%延迟" +
-                            "（${enc.codecName} 守 QP 不守码率，上行扛不住）→ 本档 $prof 去掉 QP 上限重建编码器，平稳${qpBackSec}s 后带回" +
+                    qpOffIso = isoNow
+                    val netWhy = when {
+                        bufOver -> "发送缓冲${s.sndBufMs}ms(扣RTT后${bufEx}ms)>${r.plan.peakBufOverPct}%延迟"
+                        dDrop > 0 -> "迟到丢${dDrop}包"
+                        lossRate >= 0.05 -> "丢包率${(lossRate * 100).toInt()}%"
+                        else -> "只看码率(runawayNet=false)"
+                    }
+                    SdLog.w("⚠️ 码率失控保护：实际${encKbps}kbps 连续${needSec}s > 峰值${peakRef}×1.5 且$netWhy" +
+                            "（${enc.codecName} 守 QP 不守码率${if (netBad) "，上行扛不住" else ""}）→ 本档 $prof 去掉 QP 上限重建编码器，" +
+                            (if (isoNow >= ISO_RULE_MIN) "ISO 从 $isoNow 降到 ${isoNow * 6 / 10} 以下且平稳${QP_BACK_ISO_SEC}s，或" else "") +
+                            "平稳${qpBackSec}s 后带回" +
                             (if (again) "（带回后又失控，等待翻倍）" else ""))
                     post {
                         val cur = req ?: return@post
@@ -500,11 +526,17 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 }
             } else {
                 runawaySec = 0
-                val calm = encKbps <= peakRef && s.sndBufMs < lat * 15 / 100
+                val calmPct = minOf(r.plan.peakBufCalmPct, r.plan.peakBufOverPct)
+                val calm = encKbps <= peakRef && bufEx < lat * calmPct / 100
                 qpOffCalmSec = if (calm) qpOffCalmSec + 1 else 0
-                if (qpOffCalmSec >= qpBackSec) {
+                // ISO 比触发时降了四成以上（高 ISO 噪点是码率冲高的主因：shiji0330 ISO 1.4 万 → 14~22Mbps、2.48 万 → 28~31Mbps）
+                //   → 平稳 QP_BACK_ISO_SEC 秒就带回；ISO 没降就等 qpBackSec（原来 60 秒就带回，ISO 没变又冲上去，码流来回跳）
+                val isoDropped = qpOffIso >= ISO_RULE_MIN && isoNow in 1..(qpOffIso * 6 / 10)
+                val needCalm = if (isoDropped) QP_BACK_ISO_SEC else qpBackSec
+                if (qpOffCalmSec >= needCalm) {
                     qpOffCalmSec = 0
-                    SdLog.i("码率失控保护 解除：平稳${qpBackSec}s（实际${encKbps}kbps 发送缓冲${s.sndBufMs}ms）→ 本档 $prof 带回 QP上限${r.plan.qpPMax} 重建编码器")
+                    SdLog.i("码率失控保护 解除：平稳${needCalm}s（实际${encKbps}kbps 发送缓冲${s.sndBufMs}ms" +
+                            "${if (isoDropped) "，ISO ${qpOffIso}→${isoNow}" else ""}）→ 本档 $prof 带回 QP上限${r.plan.qpPMax} 重建编码器")
                     post {
                         val cur = req ?: return@post
                         if (!cameraRunning || qpOffProfile != prof || cur.plan.profile != prof) return@post

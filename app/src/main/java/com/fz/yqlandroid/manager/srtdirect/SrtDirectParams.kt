@@ -11,7 +11,11 @@ import org.json.JSONObject
  * ```
  * { presets: { low|standard|high|ultra|p4k: {width,height,fps,bitrateKbps, …可选覆盖任意全局键} },
  *   bitrateMode:1(VBR)/2(CBR), cbrQpMin(只在 CBR 时设的 QP 下限，0/不填=不设), qpIMin, qpIMax, qpPMin, qpPMax, gopSec, latencyMs, maxBwKbps(0=不限),
- *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec}, disableStabilization, lockMainLens(默认 true),
+ *   peakKbps, peakCtrl:{enable,qpStep,qpCeil,holdSec,recoverSec,
+ *     rttComp(判发送缓冲前先扣掉 RTT 基线，缺省 true；false = 老逻辑), bufOverPct(发送缓冲超过延迟的百分之几算超标，缺省 45),
+ *     bufCalmPct(低于百分之几才算平稳，缺省 15),
+ *     runawayNet(码率失控保护要不要等网络顶不住才触发：缺省 true = 画质优先；false = 只看码率超峰值 1.5 倍就触发)},
+ *   disableStabilization, lockMainLens(默认 true),
  *   mainCropMax(锁主摄时主摄裁切放大上限：0/不填=自动测，>0=固定倍数，<0=不限；超过上限交给 HAL 变焦),
  *   runawayGuard(码率失控保护，默认 true，可按档位 / 按账号关),
  *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }（降噪不再手动设，交给相机硬件；老后台带的 noiseReduction 忽略）
@@ -79,15 +83,22 @@ object SrtDirectParams {
         val mainCropMax: Float,
         /** 码率失控保护：编码器守 QP 不守码率、上行扛不住时临时去掉 QP 上限（见 SrtDirectEngine） */
         val runawayGuard: Boolean,
+        /** 峰值控制 / 失控保护判发送缓冲前先扣掉 RTT 基线（本次连接见过的最小 RTT）；false = 老逻辑 */
+        val peakRttComp: Boolean = true,
+        /** 发送缓冲（扣基线后）超过延迟的百分之几算超标 / 低于百分之几才算平稳 */
+        val peakBufOverPct: Int = 45,
+        val peakBufCalmPct: Int = 15,
+        /** 码率失控保护：true = 超峰值 1.5 倍且网络顶不住（缓冲超标 / 迟到丢包 / 丢包率高）才触发（画质优先）；false = 只看码率 */
+        val runawayNet: Boolean = true,
     ) {
         fun describe(): String =
             "$profile ${width}x${height}@$fps ${bitrateKbps}kbps ${if (bitrateMode == 2) "CBR" else "VBR"}" +
                     " QP上限$qpPMax${if (bitrateMode == 2 && cbrQpMin > 0) " CBR下限$cbrQpMin" else ""} GOP${gopSec}s 延迟${latencyMs}ms" +
                     " 限速${if (maxBwKbps > 0) "${maxBwKbps}kbps" else "不限"} 峰值${peakKbps}kbps" +
-                    " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s)" else "关"}" +
+                    " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s${if (peakRttComp) " 扣RTT" else ""})" else "关"}" +
                     " 关防抖=$disableStabilization" + (if (lockMainLens) "" else " 不锁主摄") +
                     (if (mainCropMax > 0f) " 主摄裁切上限${mainCropMax}x" else if (mainCropMax < 0f) " 主摄裁切不限" else "") +
-                    (if (runawayGuard) "" else " 失控保护关")
+                    (if (!runawayGuard) " 失控保护关" else if (!runawayNet) " 失控保护只看码率" else "")
     }
 
     @Volatile private var override: JSONObject = JSONObject()
@@ -208,6 +219,10 @@ object SrtDirectParams {
             mainCropMax = (if (pre.has("mainCropMax")) pre.optDouble("mainCropMax", 0.0)
                 else eff.optDouble("mainCropMax", 0.0)).let { if (it.isNaN()) 0f else it.toFloat().coerceIn(-1f, 10f) },
             runawayGuard = bool("runawayGuard", true),
+            peakRttComp = pc.optBoolean("rttComp", true),
+            peakBufOverPct = pc.optInt("bufOverPct", 45).coerceIn(10, 300),
+            peakBufCalmPct = pc.optInt("bufCalmPct", 15).coerceIn(1, 100),
+            runawayNet = pc.optBoolean("runawayNet", true),
         )
     }
 
