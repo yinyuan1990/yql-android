@@ -49,9 +49,20 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
 
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "sd-engine") }
 
-    /** 引擎线程串行执行；release 之后的迟到回调直接丢弃 */
+    init {
+        SdCrashLog.install(context)
+    }
+
+    /**
+     * 引擎线程串行执行；release 之后的迟到回调直接丢弃。
+     * 这里面抛出的异常原来没人接，直接闪退（相机服务挂掉期间查摄像头 / 换编码器都可能抛）→ 拦住并写进 SRT 日志。
+     */
     private fun post(block: () -> Unit) {
-        try { worker.execute(block) } catch (_: java.util.concurrent.RejectedExecutionException) {}
+        try {
+            worker.execute {
+                try { block() } catch (t: Throwable) { SdCrashLog.caught("引擎线程", t) }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
     private val muxer = SdTsMuxer()
     private val peak = SdPeakController()
@@ -178,6 +189,11 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
                 val target = r.kbps * peak.ratePct / 100
                 enc.setBitrate(target)
                 SdLog.i("改码率 → ${target}kbps（$reason，档位码率×清晰度=${r.kbps}，峰值控制${peak.ratePct}%）")
+                // 绑主摄 / 变焦方式这几项只有相机在用：后台实时下发（按账号覆盖「保存并下发」）时不用换编码器，直接交给相机
+                if (old != null && (old.plan.lockMainLens != r.plan.lockMainLens || old.plan.mainCropMax != r.plan.mainCropMax ||
+                            old.plan.boundZoom != r.plan.boundZoom || old.plan.boundZoomForce != r.plan.boundZoomForce)) {
+                    camera?.setControls(effectiveControls())
+                }
             }
             // 延迟/限速只在连接时生效 → 变了就主动重连（流名不变）
             val tgt = sender?.currentTarget
@@ -255,6 +271,8 @@ internal class SrtDirectEngine(private val context: Context, private val host: H
             disableStabilization = r?.plan?.disableStabilization ?: true,
             lockMainLens = r?.plan?.lockMainLens ?: true,
             mainCropMax = r?.plan?.mainCropMax ?: 0f,
+            boundZoom = r?.plan?.boundZoom ?: 0,
+            boundZoomForce = r?.plan?.boundZoomForce ?: false,
         )
     }
 

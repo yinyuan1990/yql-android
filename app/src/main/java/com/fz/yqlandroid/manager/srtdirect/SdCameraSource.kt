@@ -43,31 +43,48 @@ internal class SdCameraSource(
     companion object {
         private const val PREFS = "srt_direct_prefs"
         private const val KEY_CROP_CAP = "main_crop_cap_"
+        /** 绑主摄把相机 HAL 弄崩过的摄像头 id（存本机，以后这台不再绑主摄） */
+        private const val KEY_LOCK_CRASH = "main_lock_crash_"
+
+        private const val ZOOM_UNBOUND = 0
+        private const val ZOOM_BOUND_1X = 1
+        private const val ZOOM_PHYS_CROP = 2
+        private const val ZOOM_BOUND_LOGICAL = 3
 
         /** 最近一次「📷 逻辑多摄」行：相机在推流日志开始前就打开了，推流开始时由 [SrtLogReporter] 补打 */
         @Volatile var lensDesc: String? = null
 
+        // 下面三个都要问相机服务：相机服务挂掉 / 正在重启时（HAL 崩了之后几秒）会抛异常，
+        // 调用方在引擎 / 相机线程上，原来没人接 = 闪退。这里统一接住，按「查不到」处理。
+
         /** 指定朝向的第一个摄像头 id（后置一般是逻辑主摄，ZOOM_RATIO 可 <1）；没有就用第一个 */
-        fun cameraId(ctx: Context, front: Boolean): String? {
+        fun cameraId(ctx: Context, front: Boolean): String? = try {
             val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val want = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-            return cm.cameraIdList.firstOrNull {
-                cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want
-            } ?: cm.cameraIdList.firstOrNull()
+            val ids = cm.cameraIdList
+            ids.firstOrNull {
+                try { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want } catch (_: Throwable) { false }
+            } ?: ids.firstOrNull()
+        } catch (t: Throwable) {
+            SdLog.w("查摄像头列表失败（相机服务可能在重启）: ${t.message}")
+            null
         }
 
         /** 编码器可用的输出尺寸里与目标最接近的（优先同宽高比） */
-        fun chooseSize(ctx: Context, cameraId: String, w: Int, h: Int): Size {
+        fun chooseSize(ctx: Context, cameraId: String, w: Int, h: Int): Size = try {
             val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val map = cm.getCameraCharacteristics(cameraId)
                 .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val sizes = map?.getOutputSizes(MediaCodec::class.java) ?: return Size(w, h)
-            sizes.firstOrNull { it.width == w && it.height == h }?.let { return it }
+            val sizes: Array<Size> = map?.getOutputSizes(MediaCodec::class.java) ?: emptyArray()
             val ratio = w.toFloat() / h
-            return sizes.sortedWith(compareBy<Size>(
+            if (sizes.isEmpty()) Size(w, h)
+            else sizes.firstOrNull { it.width == w && it.height == h } ?: sizes.sortedWith(compareBy<Size>(
                 { Math.abs(it.width.toFloat() / it.height - ratio) > 0.01f },
                 { Math.abs(it.width * it.height - w * h) },
             )).first()
+        } catch (t: Throwable) {
+            SdLog.w("查摄像头 $cameraId 输出尺寸失败（相机服务可能在重启），按 ${w}x$h: ${t.message}")
+            Size(w, h)
         }
 
         /**
@@ -75,22 +92,33 @@ internal class SdCameraSource(
          * Camera2 规定 SurfaceView 预览最大 1080p，推 1440p/4K 时预览若用推流尺寸会话会配置失败。
          */
         fun choosePreviewSize(ctx: Context, cameraId: String, w: Int, h: Int): Size {
-            val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val map = cm.getCameraCharacteristics(cameraId)
-                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val sizes = map?.getOutputSizes(android.view.SurfaceHolder::class.java)
-                ?.filter { it.width <= 1920 && it.height <= 1080 }
-            if (sizes.isNullOrEmpty()) return Size(minOf(w, 1920), minOf(h, 1080))
-            val ratio = w.toFloat() / h
-            return sizes.sortedWith(compareBy<Size>(
-                { Math.abs(it.width.toFloat() / it.height - ratio) > 0.01f },
-                { -(it.width * it.height) },
-            )).first()
+            val fallback = Size(minOf(w, 1920), minOf(h, 1080))
+            return try {
+                val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val map = cm.getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val sizes: List<Size> = map?.getOutputSizes(android.view.SurfaceHolder::class.java)
+                    ?.filter { it.width <= 1920 && it.height <= 1080 } ?: emptyList()
+                val ratio = w.toFloat() / h
+                if (sizes.isEmpty()) fallback
+                else sizes.sortedWith(compareBy<Size>(
+                    { Math.abs(it.width.toFloat() / it.height - ratio) > 0.01f },
+                    { -(it.width * it.height) },
+                )).first()
+            } catch (t: Throwable) {
+                SdLog.w("查摄像头 $cameraId 预览尺寸失败（相机服务可能在重启）: ${t.message}")
+                fallback
+            }
         }
     }
 
     private val thread = HandlerThread("sd-camera").apply { start() }
-    private val handler = Handler(thread.looper)
+    /** 相机线程：所有相机回调 / 自己 post 的任务都从这里过，抛出的异常拦住写日志，不让整个 App 闪退 */
+    private val handler = object : Handler(thread.looper) {
+        override fun dispatchMessage(msg: android.os.Message) {
+            try { super.dispatchMessage(msg) } catch (t: Throwable) { SdCrashLog.caught("相机线程", t) }
+        }
+    }
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     @Volatile var chars: CameraCharacteristics? = null
@@ -133,6 +161,20 @@ internal class SdCameraSource(
     @Volatile private var physLockBroken = false
     /** 请求手动对焦 / 手动曝光、相机回报的却不是手动的连续帧数（见 [checkManualApplied]） */
     private var notAppliedFrames = 0
+    /**
+     * 绑主摄把相机 HAL 弄崩过（会话配置成功，还没出一帧相机就报 CAMERA_DEVICE / CAMERA_SERVICE）：这台以后不绑主摄，存本机。
+     * cd88888888 vivo V2547A 11-12：每次「绑主摄=物理3」就绪后 0.5~1.5 秒相机报错、连摄像头列表都空了，5 秒自愈重开又绑又崩，
+     * SRT 一帧出不来、App 反复重启；同机 SRS（不绑主摄）正常。原来的兜底只管「会话配置失败」。
+     */
+    @Volatile private var physLockCrashed = false
+    /** 当前会话是绑主摄的，且从它就绪到现在还没出过帧（出帧后清掉） */
+    private var lockSessionNoFrame = false
+    /** 绑主摄 + 逻辑变焦（[Camera2ParamApplier.Params.boundZoom]）读回没生效 / 下参数失败：本次推流主摄放大改回交给 HAL */
+    @Volatile private var boundZoomBroken = false
+    private var boundProbeZoom = 0f
+    private var boundProbeFrames = 0
+    private var lastBoundZoom = 0f
+    private var boundResultMissingLogged = false
     private var lastCropZoom = 0f
     /**
      * 自动测出的主摄裁切上限（0 = 没测出）：有的 HAL 对物理主摄的 SCALER_CROP_REGION 有上限、超了悄悄钳住不报错
@@ -197,6 +239,7 @@ internal class SdCameraSource(
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             val n = frameCount++
+            lockSessionNoFrame = false
             if (!firstFrameSeen) {
                 firstFrameSeen = true
                 try { listener.onCameraFirstFrame() } catch (_: Throwable) {}
@@ -227,6 +270,7 @@ internal class SdCameraSource(
                 lastPhysId = phys
             }
             checkPhysCrop(request, result)
+            checkBoundZoom(request, result)
             checkManualApplied(request, result)
             if (n % 150 == 0L) {
                 val durMs = curFrameDurNs / 1_000_000.0
@@ -270,7 +314,12 @@ internal class SdCameraSource(
         cameraId = id
         isFront = front
         firstFrameSeen = false
-        learnedCropCap = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat(KEY_CROP_CAP + id, 0f)
+        lockSessionNoFrame = false
+        try {
+            val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            learnedCropCap = sp.getFloat(KEY_CROP_CAP + id, 0f)
+            if (sp.getBoolean(KEY_LOCK_CRASH + id, false)) physLockCrashed = true
+        } catch (_: Throwable) {}
         try {
             chars = cm.getCameraCharacteristics(id)
             cm.openCamera(id, object : CameraDevice.StateCallback() {
@@ -289,7 +338,7 @@ internal class SdCameraSource(
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    camera.close()
+                    try { camera.close() } catch (_: Throwable) {}
                     if (device === camera) device = null
                     session = null
                     val name = when (error) {
@@ -300,6 +349,25 @@ internal class SdCameraSource(
                         ERROR_CAMERA_SERVICE -> "CAMERA_SERVICE"
                         else -> error.toString()
                     }
+                    // 绑主摄的会话就绪后一帧没出、相机自己崩了（不是被别的 App 抢 / 被系统禁用）→ 这台以后不绑主摄
+                    val lock = lockedPhysId
+                    if (lock != null && lockSessionNoFrame && !physLockCrashed &&
+                        (error == ERROR_CAMERA_DEVICE || error == ERROR_CAMERA_SERVICE)) {
+                        physLockCrashed = true
+                        try {
+                            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                                .putBoolean(KEY_LOCK_CRASH + id, true).apply()
+                        } catch (_: Throwable) {}
+                        SdLog.w("📷 绑主摄 $lock 的会话还没出画面相机就报 $name → 这台以后不再绑主摄（已记到本机；HAL 自己选镜头），等自愈重开")
+                        lensDesc = lensDesc?.let { "$it 绑主摄=已停用（这台绑主摄把相机弄崩过）" }
+                    } else if (lock != null && curZoomPath == ZOOM_BOUND_LOGICAL && !boundZoomBroken &&
+                        (error == ERROR_CAMERA_DEVICE || error == ERROR_CAMERA_SERVICE)) {
+                        // 绑主摄 + 逻辑变焦期间相机自己崩了：这条路本次推流不再走，免得自愈重开后又崩
+                        boundZoomBroken = true
+                        SdLog.w("📷 绑主摄 $lock 逻辑变焦期间相机报 $name → 本次推流主摄放大改回交给 HAL")
+                    }
+                    lockSessionNoFrame = false
+                    curZoomPath = ZOOM_UNBOUND
                     listener.onCameraError("摄像头错误 $name")
                 }
             }, handler)
@@ -427,6 +495,7 @@ internal class SdCameraSource(
             val desc = "📷 逻辑多摄 id=$cameraId 物理=${phys.joinToString(" ") { p -> "$p(f=${focal[p]})" }} 标称f=$target → 主摄=$main" +
                     " 长焦起=${tele?.let { r -> "%.1fx".format(r) } ?: "无"}" +
                     " 物理裁切=${if (cropOk && m.active != null) "支持（主摄放大仍绑主摄）" else "不支持（主摄放大交给 HAL）"}" +
+                    (if (physLockCrashed) " 绑主摄=已停用（这台绑主摄把相机弄崩过）" else "") +
                     " 主摄感光区=${m.active?.let { "${it.width()}x${it.height()}" } ?: "-"} 主摄最大数码变焦=${"%.1f".format(m.maxZoom)}x" +
                     " 变焦范围=${zoomRange?.let { "%.2f~%.1fx".format(it.first, it.second) } ?: "-"}" +
                     " 已测裁切上限=${if (learnedCropCap > 0f) "%.2fx".format(learnedCropCap) else "无"}" +
@@ -445,19 +514,33 @@ internal class SdCameraSource(
 
     /**
      * 绑主摄：PC 选的是主摄（≥1x）就绑——1x 直接绑；放大且 HAL 支持物理裁切、还没到长焦倍数时也绑，
-     * 放大由 [applyPhysZoom] 在主摄上裁（物理流不吃逻辑摄像头的 ZOOM_RATIO）。
+     * 放大由 [applyPhysZoom] 在主摄上裁（当时按「物理流不吃逻辑摄像头的 ZOOM_RATIO」设计，没实测过；
+     * 11-13 加的 boundZoom 就是在物理裁切用不了的机型上验证这一点，见 [zoomPath]）。
      * 0.5x 广角、到了长焦倍数、不支持物理裁切 → 交给 HAL 选镜头（facai1688：主摄 1.2 / 1.3x 解绑后 HAL 在超广角 / 主摄间来回切）。
      */
-    private fun wantPhysLock(p: Camera2ParamApplier.Params): String? {
-        if (!p.lockMainLens || physLockUnsupported || physLockBroken) return null
+    private fun wantPhysLock(p: Camera2ParamApplier.Params): String? =
+        if (zoomPath(p) == ZOOM_UNBOUND) null else mainPhys().id
+
+    /**
+     * 这组参数下画面怎么出：
+     * - [ZOOM_UNBOUND]：不绑主摄，HAL 自己选镜头（广角 / 长焦 / 关了绑主摄 / 绑不了）；
+     * - [ZOOM_BOUND_1X]：1x，绑主摄，普通请求；
+     * - [ZOOM_PHYS_CROP]：主摄放大，绑主摄，给物理主摄单独下裁切（HAL 支持且没到本机测出的上限）；
+     * - [ZOOM_BOUND_LOGICAL]：主摄放大但物理裁切用不了（三星 S9480 不支持；F9660 / W9026 声明支持但请求 1.10x 实际 1.00x），
+     *   `boundZoom` 开了就保持绑主摄、逻辑变焦下在绑定的流上（[applyBoundZoom]），读回没生效再退回 [ZOOM_UNBOUND]。
+     *   116116116 三星 SM-S9480 11-13：1.1x 解绑后 HAL 每 4 秒在主摄 5 / 超广角 2 间切一次。
+     */
+    private fun zoomPath(p: Camera2ParamApplier.Params): Int {
+        if (!p.lockMainLens || physLockUnsupported || physLockBroken || physLockCrashed) return ZOOM_UNBOUND
         val z = p.zoom ?: 1f
-        if (z < 0.99f) return null
+        if (z < 0.99f) return ZOOM_UNBOUND
         val m = mainPhys()
-        if (z <= 1.01f) return m.id
-        if (!m.cropOk || m.active == null || physCropBroken) return null
-        if (m.teleRatio != null && z >= m.teleRatio - 0.01f) return null
-        if (z > cropCap(p) + 0.01f) return null
-        return m.id
+        if (m.id == null) return ZOOM_UNBOUND
+        if (z <= 1.01f) return ZOOM_BOUND_1X
+        if (m.teleRatio != null && z >= m.teleRatio - 0.01f) return ZOOM_UNBOUND
+        if (m.cropOk && m.active != null && !physCropBroken && z <= cropCap(p) + 0.01f) return ZOOM_PHYS_CROP
+        if (p.boundZoom > 0 && !boundZoomBroken) return ZOOM_BOUND_LOGICAL
+        return ZOOM_UNBOUND
     }
 
     /** 主摄裁切放大上限：后台 srtParams.mainCropMax >0 固定、<0 不限；0 = 用本机测出的（没测出 = 不限） */
@@ -581,31 +664,124 @@ internal class SdCameraSource(
         }
     }
 
+    /** 绑主摄 + 逻辑变焦的请求标记（[checkBoundZoom] 读回用；物理裁切那条路的标记是 Float） */
+    private class BoundZoomTag(val z: Float, val mode: Int)
+
+    /**
+     * 绑主摄 + 逻辑变焦（[ZOOM_BOUND_LOGICAL]）：输出还是只来自主摄，倍数走逻辑摄像头的参数，普通请求、不带物理 id。
+     * 模式 1 = 逻辑 CONTROL_ZOOM_RATIO（Android 11+；更低的系统自动用模式 2）；模式 2 = ZOOM_RATIO 回 1x，改下逻辑 SCALER_CROP_REGION。
+     * 绑定的物理流认不认逻辑变焦各家 HAL 不一样，所以做成后台开关，[checkBoundZoom] 读回验证。
+     */
+    private fun applyBoundZoom(req: CaptureRequest.Builder, c: CameraCharacteristics, lock: String, p: Camera2ParamApplier.Params) {
+        val m = mainPhys()
+        val z = (p.zoom ?: 1f).coerceIn(1f, m.maxZoom.coerceAtLeast(1f))
+        val mode = if (p.boundZoom == 2 || android.os.Build.VERSION.SDK_INT < 30) 2 else 1
+        if (mode == 1) {
+            req.set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
+        } else {
+            if (android.os.Build.VERSION.SDK_INT >= 30) req.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+            val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            if (active != null) {
+                val w = (active.width() / z).toInt()
+                val h = (active.height() / z).toInt()
+                val x = active.left + (active.width() - w) / 2
+                val y = active.top + (active.height() - h) / 2
+                req.set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(x, y, x + w, y + h))
+            }
+        }
+        req.setTag(BoundZoomTag(z, mode))
+        if (Math.abs(z - lastBoundZoom) >= 0.05f) {
+            lastBoundZoom = z
+            SdLog.i("📷 绑主摄 $lock 逻辑变焦 ${"%.2f".format(z)}x（模式$mode ${if (mode == 1) "ZOOM_RATIO" else "逻辑裁切区"}，不解绑）")
+        }
+    }
+
+    /**
+     * 读回绑主摄 + 逻辑变焦到底生效没有：倍数稳定 6 帧后看物理主摄那份回报（zoomRatio × 裁切比例）。
+     * 比请求小 0.08x 以上 = 物理流没跟着放大 → 本次推流主摄放大改回交给 HAL（`boundZoomForce` 开着就只记日志不退回）。
+     * 物理镜头没回报这两项 = 看不出来，保持绑主摄，只记一行。
+     */
+    private fun checkBoundZoom(request: CaptureRequest, result: TotalCaptureResult) {
+        if (android.os.Build.VERSION.SDK_INT < 28) return
+        val lock = lockedPhysId ?: return
+        val tag = request.tag as? BoundZoomTag ?: return
+        if (tag.z != boundProbeZoom) {
+            boundProbeZoom = tag.z
+            boundProbeFrames = 0
+            return
+        }
+        if (++boundProbeFrames != 6) return
+        @Suppress("DEPRECATION")
+        val phys = result.physicalCameraResults[lock]
+        val api30 = android.os.Build.VERSION.SDK_INT >= 30
+        val physZr = if (api30) phys?.get(CaptureResult.CONTROL_ZOOM_RATIO) else null
+        @Suppress("DEPRECATION")
+        val physCrop = phys?.get(CaptureResult.SCALER_CROP_REGION)
+        val logZr = if (api30) result.get(CaptureResult.CONTROL_ZOOM_RATIO) else null
+        val logCrop = result.get(CaptureResult.SCALER_CROP_REGION)
+        val active = mainPhys().active
+        val cropX = if (physCrop != null && physCrop.width() > 0 && active != null && physCrop.width() <= active.width() + 2)
+            active.width().toFloat() / physCrop.width() else null
+        val desc = "物理镜头回报 zoomRatio=${physZr ?: "-"} 裁切区=${physCrop?.let { "${it.width()}x${it.height()}" } ?: "-"}；" +
+                "逻辑回报 zoomRatio=${logZr ?: "-"} 裁切区=${logCrop?.let { "${it.width()}x${it.height()}" } ?: "-"}"
+        val want = "%.2f".format(tag.z)
+        if (physZr == null && cropX == null) {
+            if (!boundResultMissingLogged) {
+                boundResultMissingLogged = true
+                SdLog.i("📷 绑主摄 $lock 逻辑变焦（模式${tag.mode}）请求 ${want}x：物理镜头没回报倍数，看不出是否生效，保持绑主摄（$desc）")
+            }
+            return
+        }
+        val actual = (physZr ?: 1f) * (cropX ?: 1f)
+        SdLog.i("📷 绑主摄 $lock 逻辑变焦（模式${tag.mode}）请求 ${want}x → 物理镜头实际 ≈${"%.2f".format(actual)}x（$desc）")
+        if (tag.z - actual < 0.08f) return
+        if (params.boundZoomForce) {
+            SdLog.w("📷 绑主摄 $lock 逻辑变焦读回没生效，boundZoomForce 开着 → 不退回，继续绑主摄")
+            return
+        }
+        boundZoomBroken = true
+        SdLog.w("📷 绑主摄 $lock 逻辑变焦（模式${tag.mode}）没生效 → 本次推流主摄放大改回交给 HAL，重建会话")
+        handler.post { if (device != null && !closed && wantPhysLock(params) != lockedPhysId) createSession() }
+    }
+
     val isRunning: Boolean get() = device != null && session != null
+
+    /** 当前 repeating request 走的是哪条变焦路（相机线程读写） */
+    private var curZoomPath = ZOOM_UNBOUND
 
     private fun submitRepeating() {
         val camera = device ?: return
         val s = session ?: return
         val c = chars ?: return
         val lock = lockedPhysId
+        val path = if (lock == null) ZOOM_UNBOUND else zoomPath(params)
         try {
             // 只有真要给物理主摄下裁切（绑主摄且放大 >1x）才带物理 id 建请求（不带会 "Physical camera id: N is not valid!"）。
             // 1x 不需要给物理镜头下任何东西 → 用普通请求（41.0 及以前的做法，输出照旧绑主摄）：带物理 id 的请求里
             // 物理镜头另有一份模板默认参数，S25U 按那份走，PC 的手动对焦 / 快门全不生效（43.0 的问题）。
-            val cropLock = if (android.os.Build.VERSION.SDK_INT >= 28 && (params.zoom ?: 1f) > 1.01f) lock else null
+            // 绑主摄 + 逻辑变焦（boundZoom）也是普通请求。
+            val cropLock = if (android.os.Build.VERSION.SDK_INT >= 28 && (params.zoom ?: 1f) > 1.01f &&
+                path != ZOOM_BOUND_LOGICAL) lock else null
             val req = if (cropLock != null && android.os.Build.VERSION.SDK_INT >= 28)
                 camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(cropLock))
             else camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
             targets.forEach { req.addTarget(it) }
             req.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             Camera2ParamApplier.applyToBuilder(req, c, params)
-            lock?.let { applyPhysZoom(req, it, params) }
+            if (lock != null) {
+                if (path == ZOOM_BOUND_LOGICAL) applyBoundZoom(req, c, lock, params) else applyPhysZoom(req, lock, params)
+            }
             applySrtExposure(req, c, params)
             // 放大时：对焦 / 曝光 / 帧率等最终值同步给物理主摄，不让它用模板默认值
             cropLock?.let { mirrorToPhysical(req, c, it) }
             s.setRepeatingRequest(req.build(), captureCallback, handler)
+            curZoomPath = path
         } catch (t: Throwable) {
-            if (lock != null && (params.zoom ?: 1f) > 1.01f && !physCropBroken) {
+            if (path == ZOOM_BOUND_LOGICAL && !boundZoomBroken) {
+                boundZoomBroken = true
+                SdLog.w("📷 绑主摄 $lock 逻辑变焦下参数失败（${t.message}）→ 本次推流主摄放大改回交给 HAL，重建会话")
+                handler.post { createSession() }
+            } else if (lock != null && (params.zoom ?: 1f) > 1.01f && !physCropBroken) {
                 physCropBroken = true
                 SdLog.w("📷 主摄 $lock 裁切放大下参数失败（${t.message}）→ 这台以后主摄放大交给 HAL，重建会话")
                 handler.post { createSession() }
@@ -675,11 +851,17 @@ internal class SdCameraSource(
         val lock = wantPhysLock(params)
         lockedPhysId = lock
         probeZoom = 0f
+        boundProbeZoom = 0f
+        lastBoundZoom = 0f
         notAppliedFrames = 0
+        lockSessionNoFrame = false
+        curZoomPath = ZOOM_UNBOUND
         val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (closed || t !== targets) { s.close(); return }
                     session = s
+                    // 绑主摄的会话：出第一帧前相机就崩的话，onError 里据此判定是绑主摄弄崩的
+                    lockSessionNoFrame = lock != null
                     submitRepeating()
                     SdLog.i("摄像头会话就绪 输出=编码器+$previewDesc" + (lock?.let { " 绑主摄=物理$it" } ?: ""))
                 }

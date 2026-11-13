@@ -17,6 +17,10 @@ import org.json.JSONObject
  *     runawayNet(码率失控保护要不要等网络顶不住才触发：缺省 true = 画质优先；false = 只看码率超峰值 1.5 倍就触发)},
  *   disableStabilization, lockMainLens(默认 true),
  *   mainCropMax(锁主摄时主摄裁切放大上限：0/不填=自动测，>0=固定倍数，<0=不限；超过上限交给 HAL 变焦),
+ *   boundZoom(主摄放大但物理裁切用不了时怎么办：0/不填=解绑交给 HAL（三星 1.x 倍会在主摄 / 超广角间来回切）；
+ *     1=保持绑主摄，逻辑 CONTROL_ZOOM_RATIO 下在绑定的流上；2=保持绑主摄，改下逻辑 SCALER_CROP_REGION；
+ *     读回物理镜头的实际倍数，没生效自动退回 0 的做法；可按档位 / 按账号设),
+ *   boundZoomForce(true=读回显示没生效也不退回，排查用),
  *   runawayGuard(码率失控保护，默认 true，可按档位 / 按账号关),
  *   sharpness(边缘锐化 0~1，可不填 = 相机默认) }（降噪不再手动设，交给相机硬件；老后台带的 noiseReduction 忽略）
  * ```
@@ -90,6 +94,10 @@ object SrtDirectParams {
         val peakBufCalmPct: Int = 15,
         /** 码率失控保护：true = 超峰值 1.5 倍且网络顶不住（缓冲超标 / 迟到丢包 / 丢包率高）才触发（画质优先）；false = 只看码率 */
         val runawayNet: Boolean = true,
+        /** 主摄放大但物理裁切用不了时：0 = 解绑交给 HAL；1 = 保持绑主摄 + 逻辑 ZOOM_RATIO；2 = 保持绑主摄 + 逻辑裁切区（见 SdCameraSource） */
+        val boundZoom: Int = 0,
+        /** 上面的变焦读回显示没生效也不退回（排查用） */
+        val boundZoomForce: Boolean = false,
     ) {
         fun describe(): String =
             "$profile ${width}x${height}@$fps ${bitrateKbps}kbps ${if (bitrateMode == 2) "CBR" else "VBR"}" +
@@ -98,6 +106,7 @@ object SrtDirectParams {
                     " 峰值控制${if (peakEnable) "开(步长$qpStep 封顶$qpCeil 持续${holdSec}s 回落${recoverSec}s${if (peakRttComp) " 扣RTT" else ""})" else "关"}" +
                     " 关防抖=$disableStabilization" + (if (lockMainLens) "" else " 不锁主摄") +
                     (if (mainCropMax > 0f) " 主摄裁切上限${mainCropMax}x" else if (mainCropMax < 0f) " 主摄裁切不限" else "") +
+                    (if (boundZoom > 0) " 绑主摄变焦模式$boundZoom${if (boundZoomForce) "(强制)" else ""}" else "") +
                     (if (!runawayGuard) " 失控保护关" else if (!runawayNet) " 失控保护只看码率" else "")
     }
 
@@ -223,6 +232,8 @@ object SrtDirectParams {
             peakBufOverPct = pc.optInt("bufOverPct", 45).coerceIn(10, 300),
             peakBufCalmPct = pc.optInt("bufCalmPct", 15).coerceIn(1, 100),
             runawayNet = pc.optBoolean("runawayNet", true),
+            boundZoom = int("boundZoom", 0).coerceIn(0, 2),
+            boundZoomForce = bool("boundZoomForce", false),
         )
     }
 

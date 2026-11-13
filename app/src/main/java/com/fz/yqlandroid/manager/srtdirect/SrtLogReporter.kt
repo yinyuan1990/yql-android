@@ -69,6 +69,11 @@ internal object SrtLogReporter {
         line("==== 推流开始 流=$newStreamId 账号=$account 机型=${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}" +
                 " Android${android.os.Build.VERSION.RELEASE} App=${com.fz.yqlandroid.BuildConfig.VERSION_NAME} ====")
         SdCameraSource.lensDesc?.let { line(it) }
+        // 上次 App 闪退留下的堆栈（SdCrashLog）：闪退那次的日志来不及上传，放到这次开头
+        SdCrashLog.takePending()?.let { crash ->
+            line("💥 上次 App 闪退现场（下面是堆栈，最多 40 行）：")
+            crash.lineSequence().filter { it.isNotBlank() }.take(40).forEach { line("💥   ${it.trim()}") }
+        }
         configJob = scope.launch {
             while (isActive && active) {
                 checkConfig()

@@ -60,6 +60,10 @@ object Camera2ParamApplier {
         val lockMainLens: Boolean = false,
         // SRT直推：锁主摄时主摄裁切放大上限（0 自动测 / >0 固定 / <0 不限，只由 SdCameraSource 使用）
         val mainCropMax: Float = 0f,
+        // SRT直推：主摄放大但物理裁切用不了时，保持绑主摄、改用逻辑变焦（0 关 / 1 ZOOM_RATIO / 2 逻辑裁切区，只由 SdCameraSource 使用）
+        val boundZoom: Int = 0,
+        // SRT直推：上面这种变焦读回显示没生效时也不退回（排查用）
+        val boundZoomForce: Boolean = false,
     )
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
