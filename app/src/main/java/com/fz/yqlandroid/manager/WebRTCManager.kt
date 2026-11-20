@@ -3402,6 +3402,8 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
             }
             "shuimian" -> {
                 Log.d(TAG, "💤 收到睡眠指令，停止采集")
+                // 保活（前台服务等）不停，见 StreamingScreen 的 shuimian；这行趁日志上报还开着记下来
+                srtLog("💤 收到睡眠指令：停推流、关摄像头，保活不停（前台服务=${com.fz.yqlandroid.service.StreamingForegroundService.state}）")
                 autoRecoverEnabled = false   // ⭐ 有意停流：禁止 WS 重连健康检查把推流自动拉起来
                 scope.launch {
                     withContext(Dispatchers.Main) {
@@ -3419,6 +3421,7 @@ class WebRTCManager(private val context: Context) : P2PManager.DataSource {
                     withContext(Dispatchers.Main) {
                         if (srsIP.isNotEmpty() && baseStreamKey.isNotEmpty()) {
                             startPublish(srsIP, app, baseStreamKey)  // 🔥 用基础流名，内部重新生成时间戳
+                            srtLog("☀️ 收到唤醒指令，已重新推流（前台服务=${com.fz.yqlandroid.service.StreamingForegroundService.state}）")
                         }
                     }
                 }

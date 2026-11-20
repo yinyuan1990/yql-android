@@ -274,11 +274,14 @@ fun StreamingScreen(
             when (type) {
                 "shuimian" -> {
                     isStreaming = false
-                    keepAliveManager.stop()   // 🔊 睡眠：停止保活
+                    // 🔊 睡眠不停保活，只停推流、关摄像头（WebRTCManager.handleSpecialMessage 里做）：
+                    //   前台服务一停，App 在后台 / 熄屏时被唤醒，系统不让开摄像头（Android 14+ 只认 App 可见时
+                    //   声明的相机前台服务，报 CAMERA_DISABLED），要人把 App 点回前台才恢复；熄屏后进程还可能被冻结、
+                    //   连唤醒指令都收不到。代价：睡眠期间通知栏还挂着「推流中」，WakeLock / WifiLock 不放。
                 }
                 "gongzuo" -> {
                     isStreaming = true
-                    keepAliveManager.start()  // 🔊 唤醒工作：恢复保活
+                    keepAliveManager.start()  // 🔊 唤醒工作：保活本来就在跑时是空操作（幂等）
                 }
                 "TryDisconnect" -> {
                     val needDisconnect = messageDict["needDisconnect"] as? Boolean ?: false

@@ -68,24 +68,78 @@ object Camera2ParamApplier {
 
     // ⭐ [meidui 诊断] 相机硬件层真实状态：每 ~150 帧打一行（30fps 下约 5s 一次）。
     //    exp=实际曝光时间 frameDur=实际帧间隔(33ms=30fps/66ms=15fps) aeRange=生效AE区间 iso=增益。
+    //    af=相机回报的对焦模式/状态（0=手动）焦距=镜头实际屈光度 镜头=0 静止/1 在动 物理=逻辑多摄当前出图的物理镜头。
     private var diagFrameCount = 0L
+    // 对焦读回（WebRTC / SRS 通道）：对焦请求变了以后约 1 秒单独记一行「请求 → 相机回报」，
+    //   看相机有没有照做（三星 SM-S9480 在这条通道上拖对焦画面不变，原来的日志不读对焦，定不了原因）。
+    private var diagLastRequest: CaptureRequest? = null
+    private var diagFocusKey: String? = null
+    private var diagFocusLogAt = -1L
     private val diagCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
-            if (diagFrameCount++ % 150 != 0L) return
+            val n = diagFrameCount++
             try {
+                if (request !== diagLastRequest) {   // 每次注入是一个新请求对象：只在换请求时读一次请求里的对焦
+                    diagLastRequest = request
+                    val key = focusRequestDesc(request)
+                    if (key != diagFocusKey) {
+                        diagFocusKey = key
+                        diagFocusLogAt = n + 30
+                    }
+                }
+                val focusDue = n == diagFocusLogAt
+                if (!focusDue && n % 150 != 0L) return
+                val afMode = result.get(CaptureResult.CONTROL_AF_MODE)
+                val dist = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                val phys = if (Build.VERSION.SDK_INT >= 29)
+                    result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) else null
+                val focusRead = "af=$afMode/${result.get(CaptureResult.CONTROL_AF_STATE)}" +
+                        " 焦距=${dist?.let { "%.2f".format(it) }} 镜头=${result.get(CaptureResult.LENS_STATE)} 物理=${phys ?: "-"}"
+                if (focusDue) {
+                    val reqDist = request.get(CaptureRequest.LENS_FOCUS_DISTANCE)
+                    val verdict = when {
+                        request.get(CaptureRequest.CONTROL_AF_MODE) != CameraMetadata.CONTROL_AF_MODE_OFF -> ""
+                        afMode != CameraMetadata.CONTROL_AF_MODE_OFF -> " ⚠️ 相机没关自动对焦（没照做）"
+                        dist == null || reqDist == null -> " ⚠️ 相机不回报焦距"
+                        kotlin.math.abs(dist - reqDist) <= 0.05f + reqDist * 0.03f -> " ✅ 回报和请求一致"
+                        else -> " ⚠️ 回报和请求差 ${"%.2f".format(dist - reqDist)}（镜头没到位 / 没照做）"
+                    }
+                    Log.d("meidui", "🎯 对焦读回（WebRTC通道）请求 $diagFocusKey → 相机回报 $focusRead$verdict")
+                }
+                if (n % 150 != 0L) return
                 val expMs = (result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: -1L) / 1_000_000.0
                 val durMs = (result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: -1L) / 1_000_000.0
                 val aeRange = request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: -1
                 val aeMode = result.get(CaptureResult.CONTROL_AE_MODE) ?: -1
                 Log.d("meidui", "cam exp=${"%.1f".format(expMs)}ms frameDur=${"%.1f".format(durMs)}ms" +
-                        " (≈${if (durMs > 0) (1000.0 / durMs).toInt() else -1}fps) aeRange=$aeRange iso=$iso aeMode=$aeMode")
+                        " (≈${if (durMs > 0) (1000.0 / durMs).toInt() else -1}fps) aeRange=$aeRange iso=$iso aeMode=$aeMode" +
+                        " $focusRead（请求 $diagFocusKey）")
             } catch (_: Throwable) { /* 诊断绝不影响推流 */ }
         }
+    }
+
+    /** 请求里的对焦：手动带屈光度，自动只带模式号 */
+    private fun focusRequestDesc(request: CaptureRequest): String {
+        val af = request.get(CaptureRequest.CONTROL_AF_MODE)
+        return if (af == CameraMetadata.CONTROL_AF_MODE_OFF)
+            "手动 ${request.get(CaptureRequest.LENS_FOCUS_DISTANCE)?.let { "%.2f".format(it) }} 屈光度"
+        else "自动(af=$af)"
+    }
+
+    // 反射注入失败写进上传的日志（meidui），同一个原因 5 秒内只记一次
+    private var lastInjectFailLog = ""
+    private var lastInjectFailMs = 0L
+    private fun logInjectFail(msg: String) {
+        val now = System.currentTimeMillis()
+        if (msg == lastInjectFailLog && now - lastInjectFailMs < 5000) return
+        lastInjectFailLog = msg
+        lastInjectFailMs = now
+        Log.d("meidui", "⚠️ 相机参数注入失败（WebRTC通道，对焦 / 曝光 / 变焦这次没下到相机）: $msg")
     }
 
     /**
@@ -132,6 +186,7 @@ object Camera2ParamApplier {
             true
         } catch (e: Throwable) {
             Log.w(TAG, "⚠️ 反射注入失败(已忽略，不影响推流): ${e.message}")
+            logInjectFail("${e.javaClass.simpleName} ${e.message?.take(160)}")
             false
         }
     }
@@ -349,6 +404,7 @@ object Camera2ParamApplier {
             }
         } catch (e: Exception) {
             Log.w(TAG, "focus 写入失败: ${e.message}")
+            com.fz.yqlandroid.manager.srtdirect.SdLog.w("对焦写入请求失败: ${e.javaClass.simpleName} ${e.message?.take(160)}")
         }
     }
 
